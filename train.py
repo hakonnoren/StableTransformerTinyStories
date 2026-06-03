@@ -257,8 +257,8 @@ def main():
         help="model architecture / attention discretization",
     )
 
-    # RevFormer (reversible-coupling transformer) options. NOTE: attn/MLP run at
-    # width n_embd//2, so to match a baseline of width D set --n_embd 2*D.
+    # RevFormer (reversible-coupling transformer) options. Attn/MLP run at the
+    # full n_embd width (same as the baseline), so pass the SAME --n_embd to both.
     ap.add_argument("--rev_regime", type=str, default="vpm_scaling",
                     choices=["vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling"],
                     help="reversible volume regime (see revformer/README.md)")
@@ -422,6 +422,20 @@ def main():
     ap.add_argument("--sample_eos_token_id", type=int, default=50256,
                     help="Stop generation once all batch elements emit this token. Use -1 to disable early stop.")
 
+    # Weights & Biases logging
+    ap.add_argument("--wandb", action="store_true", help="log train/val loss to Weights & Biases")
+    ap.add_argument("--wandb_project", type=str, default="sympformer-reversible",
+                    help="W&B project name")
+    ap.add_argument("--wandb_entity", type=str, default="hakon-noren-ntnu",
+                    help="W&B entity (team/user); empty string uses your default entity")
+    ap.add_argument("--wandb_run_name", type=str, default="",
+                    help="W&B run name; defaults to <arch>[_<run_name>]")
+    ap.add_argument("--wandb_mode", type=str, default="online",
+                    choices=["online", "offline", "disabled"],
+                    help="W&B mode. Use 'offline' on compute nodes without internet, then run `wandb sync` later.")
+    ap.add_argument("--wandb_api_key_file", type=str, default="api_key_wnb.txt",
+                    help="File holding your W&B API key (used only if WANDB_API_KEY is unset). Never printed.")
+
     args = ap.parse_args()
 
     presymp_softmax_arches = {"presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler"}
@@ -441,6 +455,25 @@ def main():
     if args.run_name:
         run_dir = os.path.join(args.out_dir, f"{args.arch}_{args.run_name}")
     os.makedirs(run_dir, exist_ok=True)
+
+    # Weights & Biases (optional). Authenticates without echoing the key.
+    wandb_run = None
+    if args.wandb:
+        import wandb
+        _wb_key = os.environ.get("WANDB_API_KEY")
+        if not _wb_key and args.wandb_api_key_file and os.path.exists(args.wandb_api_key_file):
+            with open(args.wandb_api_key_file) as _f:
+                _wb_key = _f.read().strip()
+        if _wb_key:
+            wandb.login(key=_wb_key)
+        wandb_run = wandb.init(
+            entity=(args.wandb_entity or None),
+            project=args.wandb_project,
+            name=(args.wandb_run_name or (f"{args.arch}_{args.run_name}" if args.run_name else args.arch)),
+            dir=run_dir,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
 
     # Seeds
     torch.manual_seed(args.seed)
@@ -923,6 +956,12 @@ def main():
                     f"{getattr(model, 'last_t_end', '')}",
                 ],
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {"train_loss": loss_accum, "lr": lr,
+                     "tokens": toks_cum, "wall_s": wall_cum},
+                    step=step,
+                )
 
         if step % args.eval_interval == 0 and step > 0:
             val_loss = estimate_loss(model, val_it, device, args.eval_batches, amp_dtype, global_step=step)
@@ -958,6 +997,8 @@ def main():
                 ckpt_path = os.path.join(run_dir, f"best_{args.arch}.pt")
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best_val": best_val, "cfg": asdict(mcfg), "args": vars(args)}, ckpt_path)
                 print(f"  saved best checkpoint -> {ckpt_path}")
+            if wandb_run is not None:
+                wandb_run.log({"val_loss": val_loss, "best_val": best_val, "lr": lr}, step=step)
 
     # final checkpoint
     ckpt_path = os.path.join(run_dir, f"final_{args.arch}.pt")
@@ -970,6 +1011,9 @@ def main():
 
     if args.plot:
         plot_metrics_csv(metrics_path, plot_path, title=f"{args.arch} loss")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

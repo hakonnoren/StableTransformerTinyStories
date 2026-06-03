@@ -39,7 +39,7 @@ mkdir -p "${OUTDIR}"
 N_LAYER=4
 N_HEAD=4
 N_EMBD=128
-BLOCK_SIZE=128
+BLOCK_SIZE=512
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
 MAX_STEPS=10000 #1001
@@ -65,6 +65,7 @@ COMMON_ARGS=(
   --max_steps "${MAX_STEPS}" --eval_interval "${EVAL_INTERVAL}" --eval_batches "${EVAL_BATCHES}" --log_interval "${LOG_INTERVAL}"
   --warmup_steps "${WARMUP_STEPS}" --device "${DEVICE}" --plot
   --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
+  --wandb --wandb_project sympformer-reversible
 )
 
 run_train() {
