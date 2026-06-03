@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=03:00:00               
+#SBATCH --time=00:05:00               
 #SBATCH --output=output.txt      # Specifying 'stdout'
 #SBATCH --error=output.err        # Specifying 'stderr'
 
@@ -39,14 +39,14 @@ mkdir -p "${OUTDIR}"
 N_LAYER=4
 N_HEAD=4
 N_EMBD=128
-BLOCK_SIZE=512
+BLOCK_SIZE=128
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
-MAX_STEPS=10000 #1001
-EVAL_INTERVAL=100 #100
+MAX_STEPS=100 #1001
+EVAL_INTERVAL=50 #100
 EVAL_BATCHES=50
-LOG_INTERVAL=200
-WARMUP_STEPS=500 #150
+LOG_INTERVAL=100
+WARMUP_STEPS=150 #150
 MIN_LR_RATIO=0.1
 PEAK_LR=6e-4
 DATASET=tinystories
