@@ -24,7 +24,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=00:05:00
+#SBATCH --time=03:00:00
 #SBATCH --array=0-2                       # 3 tasks: 0=baseline, 1=vpb_baseline, 2=vpm_scaling
 #SBATCH --output=output_%A_%a.txt         # per-task stdout (%A=array job id, %a=task id)
 #SBATCH --error=output_%A_%a.err          # per-task stderr
@@ -56,15 +56,15 @@ mkdir -p "${OUTDIR}"
 # revformer/README.md.
 N_LAYER=6
 N_HEAD=4
-N_EMBD=32 #128
-BLOCK_SIZE=64 #256
+N_EMBD=128
+BLOCK_SIZE=256
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
-MAX_STEPS=200 #5001
+MAX_STEPS=5001
 EVAL_INTERVAL=100 #100
 EVAL_BATCHES=50
 LOG_INTERVAL=50
-WARMUP_STEPS=50 #250
+WARMUP_STEPS=250 #150
 MIN_LR_RATIO=0.1
 PEAK_LR=6e-4
 DATASET=tinystories
