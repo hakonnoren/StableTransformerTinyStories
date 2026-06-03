@@ -213,11 +213,13 @@ def cosine_lr(step: int, warmup_steps: int, total_steps: int, peak: float, min_r
     return peak * (min_ratio + (1.0 - min_ratio) * cosine)
 
 
-def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_lr_mult: float = 10.0):
+def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_lr_mult: float = 10.0,
+                    rev_scale_lr_mult: float = 1.0):
     # Parameter grouping following YuriiFormer Appendix A.3 (AdamW side):
     # - embeddings: weight decay 0.1
     # - norms: weight decay 0
     # - learned scalar update-rule params: weight decay 0, lr multiplier 5x
+    # - reversible alpha/gamma scaling params: weight decay 0, lr multiplier rev_scale_lr_mult
     # - everything else: weight decay 0 (Muon would handle matrix weights in the paper; here we keep AdamW wd=0)
     decay_emb = 0.1
     scalar_mult = scalar_lr_mult
@@ -226,6 +228,7 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
     norm_params = []
     scalar_params = []
     integrator_params = []  # theta_h/theta_xi_raw
+    rev_scale_params = []   # reversible alpha_bias/gamma_bias
     other_params = []
 
     for name, p in model.named_parameters():
@@ -235,6 +238,8 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
             emb_params.append(p)
         elif "theta_h" in name or "theta_hX" in name or "theta_hY" in name or "theta_xi_raw" in name:
             integrator_params.append(p)
+        elif "gamma_bias" in name or "alpha_bias" in name:  # reversible scaling vectors
+            rev_scale_params.append(p)
         elif ".raw" in name:  # ConstrainedScalar raw parameters
             scalar_params.append(p)
         elif "ln_" in name or ".ln" in name or "ln_f" in name or "ln_v" in name or "LayerNorm" in name:
@@ -253,6 +258,8 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
         param_groups.append({"params": scalar_params, "lr": peak_lr * scalar_mult, "weight_decay": 0.0, "lr_mult": scalar_mult})
     if integrator_params:
         param_groups.append({"params": integrator_params, "lr": peak_lr * scalar_mult, "weight_decay": 0.0, "lr_mult": scalar_mult})
+    if rev_scale_params:
+        param_groups.append({"params": rev_scale_params, "lr": peak_lr * rev_scale_lr_mult, "weight_decay": 0.0, "lr_mult": rev_scale_lr_mult})
 
     opt = AdamW(param_groups, betas=betas)
     return opt
@@ -305,6 +312,8 @@ def main():
                     help="initialize gamma/alpha ~ N(0,1)*rev_epsilon instead of zeros")
     ap.add_argument("--rev_tanh", action="store_true",
                     help="squash gamma/alpha through tanh(.)*rev_epsilon")
+    ap.add_argument("--rev_scale_lr_mult", type=float, default=1.0,
+                    help="LR multiplier for the reversible alpha/gamma scaling params (1.0 = same LR as other weights)")
 
     ap.add_argument(
         "--no_mlp",
@@ -899,7 +908,8 @@ def main():
         #     args.presymp_xi_adapt = False
 
 
-    opt = build_optimizer(model, peak_lr=args.peak_lr, betas=tuple(args.betas), scalar_lr_mult=args.scalar_lr_mult)
+    opt = build_optimizer(model, peak_lr=args.peak_lr, betas=tuple(args.betas), scalar_lr_mult=args.scalar_lr_mult,
+                          rev_scale_lr_mult=args.rev_scale_lr_mult)
 
     start_step = 0
     best_val = float("inf")
