@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from data import DataConfig, BlockEpochIterator, load_bin
 from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
 from revformer import RevFormerModel, RevConfig
+from cheap_metrics import CheapMetrics
 
 
 def maybe_get_tokenizer():
@@ -469,6 +470,15 @@ def main():
                     help="W&B mode. Use 'offline' on compute nodes without internet, then run `wandb sync` later.")
     ap.add_argument("--wandb_api_key_file", type=str, default="api_key_wnb.txt",
                     help="File holding your W&B API key (used only if WANDB_API_KEY is unset). Never printed.")
+
+    # Cheap training diagnostics (forward/backward only) -> W&B. See cheap_metrics.py.
+    ap.add_argument("--cheap_metrics", action="store_true",
+                    help="log cheap diagnostics (grad norms, alpha/gamma, attention & representation stats) at each eval")
+    ap.add_argument("--cheap_batch_size", type=int, default=8,
+                    help="size of the fixed eval batch used for attention/representation/accuracy stats")
+    ap.add_argument("--cheap_no_grads", action="store_true", help="disable activation/weight grad-norm tracking (#4/#5)")
+    ap.add_argument("--cheap_no_attn", action="store_true", help="disable attention distribution stats (#6)")
+    ap.add_argument("--cheap_no_repr", action="store_true", help="disable representation geometry + accuracy (#7/#1)")
 
     args = ap.parse_args()
 
@@ -935,6 +945,21 @@ def main():
             # Re-log a fresh cumulative table each time (W&B dedups by step).
             wandb_run.log({"samples": wandb.Table(columns=sample_cols, data=list(sample_rows))}, step=step)
 
+    # Cheap diagnostics (forward/backward only): persistent grad hooks + a fixed
+    # eval batch reused for attention/representation/accuracy stats. Snapshotted
+    # at each eval. See cheap_metrics.py.
+    cheap = None
+    if args.cheap_metrics:
+        fx, fy = next(val_it)
+        nb = max(1, min(int(args.cheap_batch_size), fx.shape[0]))
+        fx, fy = fx[:nb].to(device), fy[:nb].to(device)
+        cheap = CheapMetrics(
+            model, fx, fy, wandb_run=wandb_run,
+            track_grads=not args.cheap_no_grads,
+            track_attn=not args.cheap_no_attn,
+            track_repr=not args.cheap_no_repr,
+        )
+
     # Training loop
     model.train()
     t0_wall = time.time()          # for wall_dt_s
@@ -969,6 +994,10 @@ def main():
             torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
 
         opt.step()
+
+        # Read grad norms (#4/#5) while .grad is still populated (before next zero_grad).
+        if cheap is not None:
+            cheap.on_optim_step()
 
         toks_per_step = args.batch_size * args.block_size * args.grad_accum_steps
         toks_cum = (step + 1) * toks_per_step
@@ -1056,6 +1085,8 @@ def main():
                 print(f"  saved best checkpoint -> {ckpt_path}")
             if wandb_run is not None:
                 wandb_run.log({"val_loss": val_loss, "best_val": best_val, "lr": lr}, step=step)
+            if cheap is not None:
+                cheap.snapshot(step)
 
     # final checkpoint
     ckpt_path = os.path.join(run_dir, f"final_{args.arch}.pt")
@@ -1070,6 +1101,9 @@ def main():
 
     if args.plot:
         plot_metrics_csv(metrics_path, plot_path, title=f"{args.arch} loss")
+
+    if cheap is not None:
+        cheap.close()
 
     if wandb_run is not None:
         wandb_run.finish()

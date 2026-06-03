@@ -90,6 +90,10 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
+        # Optional capture hook for cheap attention-distribution metrics. When set
+        # to a callable, it receives the post-softmax pre-dropout (B, n_head, T, T)
+        # matrix and must not mutate it. Default None => no-op (zero overhead).
+        self._capture_attn = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -104,6 +108,8 @@ class CausalSelfAttention(nn.Module):
         m = causal_mask(T, x.device)
         att = att.masked_fill(m.unsqueeze(0).unsqueeze(0), float("-inf"))
         att = F.softmax(att, dim=-1)
+        if self._capture_attn is not None:
+            self._capture_attn(att)
         att = self.attn_drop(att)
 
         y = att @ v  # (B, nh, T, hd)
