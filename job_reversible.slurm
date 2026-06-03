@@ -38,11 +38,11 @@ mkdir -p "${OUTDIR}"
 # revformer/README.md.
 N_LAYER=4
 N_HEAD=4
-N_EMBD=128
-BLOCK_SIZE=128
+N_EMBD=64
+BLOCK_SIZE=512
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
-MAX_STEPS=100 #1001
+MAX_STEPS=10000
 EVAL_INTERVAL=50 #100
 EVAL_BATCHES=50
 LOG_INTERVAL=100
@@ -66,6 +66,9 @@ COMMON_ARGS=(
   --warmup_steps "${WARMUP_STEPS}" --device "${DEVICE}" --plot
   --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
   --wandb --wandb_project sympformer-reversible
+  # generate a text sample from an eval batch at every eval (-> stdout, samples.txt, W&B table)
+  --sample_interval "${EVAL_INTERVAL}" --sample_prefix_tokens 32 --sample_max_new_tokens 128
+  --sample_temperature 0.8 --sample_top_k 40
 )
 
 run_train() {

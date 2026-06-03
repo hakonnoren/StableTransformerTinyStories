@@ -62,21 +62,23 @@ def build_prompt_tokens(args, dataset_tokens: np.ndarray, enc):
     return torch.from_numpy(toks).unsqueeze(0), "val_prefix"
 
 
+def build_prompt_from_eval(val_it, args):
+    """Draw a prompt from a real validation/eval batch: the first row's first
+    ``sample_prefix_tokens`` tokens. Returns (prompt[1,n], reference_ids, kind),
+    where reference_ids is the ground-truth continuation from that example."""
+    xb, _ = next(val_it)                       # (B, T) int64 CPU
+    row = xb[0]
+    n_pref = max(1, int(args.sample_prefix_tokens))
+    n_pref = min(n_pref, int(row.shape[0]) - 1)
+    prompt = row[:n_pref].unsqueeze(0).long()
+    reference_ids = row[n_pref:].tolist()
+    return prompt, reference_ids, "eval_batch"
+
+
 @torch.no_grad()
-def print_sample(
-    model: nn.Module,
-    dataset_tokens: np.ndarray,
-    device: str,
-    args,
-    global_step: int,
-):
-    if int(args.sample_interval) <= 0:
-        return
-
-    enc = maybe_get_tokenizer()
-    prompt_cpu, prompt_kind = build_prompt_tokens(args, dataset_tokens, enc)
+def generate_sample(model, prompt_cpu, prompt_kind, args, device, enc, global_step, reference_ids=None):
+    """Generate a continuation, print it, and return a dict describing it."""
     prompt = prompt_cpu.to(device)
-
     out = model.generate(
         prompt,
         max_new_tokens=int(args.sample_max_new_tokens),
@@ -88,24 +90,56 @@ def print_sample(
     )
     out_cpu = out[0].detach().cpu().tolist()
     prompt_len = prompt_cpu.shape[1]
+    prompt_ids = out_cpu[:prompt_len]
+    cont_ids = out_cpu[prompt_len:]
 
+    rec = {"step": int(global_step), "source": prompt_kind,
+           "prompt_ids": prompt_ids, "continuation_ids": cont_ids}
     if enc is not None:
-        prompt_text = enc.decode(out_cpu[:prompt_len])
-        gen_text = enc.decode(out_cpu[prompt_len:])
-        full_text = enc.decode(out_cpu)
+        rec["prompt"] = enc.decode(prompt_ids)
+        rec["continuation"] = enc.decode(cont_ids)
+        rec["full"] = enc.decode(out_cpu)
+        if reference_ids:
+            rec["reference"] = enc.decode([t for t in reference_ids if t is not None and t >= 0])
         print(f"[sample][step {global_step}] source={prompt_kind}")
-        print("[sample][prompt]")
-        print(prompt_text)
-        print("[sample][continuation]")
-        print(gen_text)
-        print("[sample][full]")
-        print(full_text)
+        print("[sample][prompt]");       print(rec["prompt"])
+        print("[sample][continuation]"); print(rec["continuation"])
+        print("[sample][full]");         print(rec["full"])
     else:
         print(f"[sample][step {global_step}] source={prompt_kind} (token ids only)")
-        print("[sample][prompt_ids]")
-        print(out_cpu[:prompt_len])
-        print("[sample][continuation_ids]")
-        print(out_cpu[prompt_len:])
+        print("[sample][prompt_ids]");       print(prompt_ids)
+        print("[sample][continuation_ids]"); print(cont_ids)
+    return rec
+
+
+@torch.no_grad()
+def print_sample(model, dataset_tokens, device, args, global_step, enc=None, val_it=None):
+    """Build a prompt (from a real eval batch if ``val_it`` is given, else a
+    validation prefix / explicit --sample_prompt) and generate a sample.
+    Returns the sample dict, or None if sampling is disabled."""
+    if int(args.sample_interval) <= 0:
+        return None
+    if enc is None:
+        enc = maybe_get_tokenizer()
+    reference_ids = None
+    if val_it is not None and not args.sample_prompt:
+        prompt_cpu, reference_ids, kind = build_prompt_from_eval(val_it, args)
+    else:
+        prompt_cpu, kind = build_prompt_tokens(args, dataset_tokens, enc)
+    return generate_sample(model, prompt_cpu, kind, args, device, enc, global_step, reference_ids)
+
+
+def append_sample_log(path, rec):
+    """Append a generated sample to a human-readable samples.txt in the run dir."""
+    with open(path, "a") as f:
+        f.write(f"\n===== step {rec['step']} | source={rec['source']} =====\n")
+        if "prompt" in rec:
+            f.write(f"[prompt]\n{rec['prompt']}\n[continuation]\n{rec['continuation']}\n")
+            if rec.get("reference"):
+                f.write(f"[reference]\n{rec['reference']}\n")
+        else:
+            f.write(f"[prompt_ids] {rec['prompt_ids']}\n"
+                    f"[continuation_ids] {rec['continuation_ids']}\n")
 
 
 
@@ -880,6 +914,27 @@ def main():
     )
     plot_path = os.path.join(run_dir, "loss.png")
 
+    # Text-sample logging (stdout + samples.txt + W&B table). Cache the tokenizer
+    # once; accumulate sample rows so the W&B table grows over training.
+    enc_sample = maybe_get_tokenizer() if args.sample_interval > 0 else None
+    samples_path = os.path.join(run_dir, "samples.txt")
+    sample_cols = ["step", "source", "prompt", "continuation", "reference"]
+    sample_rows = []
+
+    def _record_sample(rec, step):
+        if rec is None:
+            return
+        append_sample_log(samples_path, rec)
+        if wandb_run is not None:
+            sample_rows.append([
+                rec["step"], rec["source"],
+                rec.get("prompt", str(rec["prompt_ids"])),
+                rec.get("continuation", str(rec["continuation_ids"])),
+                rec.get("reference", ""),
+            ])
+            # Re-log a fresh cumulative table each time (W&B dedups by step).
+            wandb_run.log({"samples": wandb.Table(columns=sample_cols, data=list(sample_rows))}, step=step)
+
     # Training loop
     model.train()
     t0_wall = time.time()          # for wall_dt_s
@@ -967,7 +1022,9 @@ def main():
             val_loss = estimate_loss(model, val_it, device, args.eval_batches, amp_dtype, global_step=step)
             print(f"[{args.arch}][eval] step {step:6d} | val_loss {val_loss:.4f}")
             if args.sample_interval > 0 and step % args.sample_interval == 0:
-                print_sample(model, val_tokens, device, args, global_step=step)
+                rec = print_sample(model, val_tokens, device, args, global_step=step,
+                                   enc=enc_sample, val_it=val_it)
+                _record_sample(rec, step)
             append_csv_row(
                 metrics_path,
                 [
@@ -1007,7 +1064,9 @@ def main():
     print(f"[{args.arch}] SUMMARY best_val={best_val:.6f} run_dir={run_dir}")
 
     if args.sample_interval > 0:
-        print_sample(model, val_tokens, device, args, global_step=args.max_steps)
+        rec = print_sample(model, val_tokens, device, args, global_step=args.max_steps,
+                           enc=enc_sample, val_it=val_it)
+        _record_sample(rec, args.max_steps)
 
     if args.plot:
         plot_metrics_csv(metrics_path, plot_path, title=f"{args.arch} loss")
