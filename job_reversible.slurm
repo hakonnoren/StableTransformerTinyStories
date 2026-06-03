@@ -85,9 +85,9 @@ log "OUTDIR: ${OUTDIR}"
 log "Reversible vs vanilla baseline. REV_LAMBDA=${REV_LAMBDA}"
 
 # 1) vanilla baseline (the reference)
-# run_train baseline
+ run_train baseline
 
-# 2) reversible, four volume regimes (increasing freedom)
+# 2) reversible, four volume regimes (increasing freedom
 run_rev vpb_baseline
 #run_rev vpb_scaling
 #run_rev vpm_scaling --rev_lambda "${REV_LAMBDA}"
@@ -95,9 +95,27 @@ run_rev vpb_baseline
 
 # ---- plotting ----
 RUNS=(
-#  "${OUTDIR}/baseline"
+  "${OUTDIR}/baseline"
   "${OUTDIR}/reversible_vpb_baseline"
 #  "${OUTDIR}/reversible_vpb_scaling"
 #  "${OUTDIR}/reversible_vpm_scaling"
 #  "${OUTDIR}/reversible_vf_scaling"
 )
+# Keep LABELS aligned with RUNS: comment/uncomment the same lines in both.
+LABELS=(
+  "Vanilla baseline"
+  "VPB Baseline (gamma=alpha=0)"
+#  "VPB Scaling (per-block log|det|=0)"
+#  "VPM Scaling (across-depth log|det|=-${REV_LAMBDA})"
+#  "VF Scaling (volume free)"
+)
+
+run python3 -u plot_compare.py \
+  --runs "${RUNS[@]}" \
+  --labels "${LABELS[@]}" \
+  --out "${OUTDIR}/compare_loss.png" \
+  --latex_table \
+  --latex_caption "Validation loss on the ${DATASET} data set after ${MAX_STEPS} optimization steps, comparing the vanilla transformer baseline against the reversible-coupling architecture in four volume regimes. Hyperparameters: ${N_LAYER} layers, ${N_HEAD} heads, embedding dimension ${N_EMBD}, block size ${BLOCK_SIZE}, batch size ${BATCH_SIZE}, gradient accumulation steps ${GRAD_ACCUM_STEPS}, evaluation batches ${EVAL_BATCHES}, warmup steps ${WARMUP_STEPS}, minimum learning-rate ratio ${MIN_LR_RATIO}, peak learning rate ${PEAK_LR}."
+
+run python3 -u plot_compare.py --runs "${RUNS[@]}" --labels "${LABELS[@]}" --out "${OUTDIR}/compare_loss_wall.png" --xaxis wall
+run python3 -u plot_compare.py --runs "${RUNS[@]}" --labels "${LABELS[@]}" --out "${OUTDIR}/compare_loss_tokens.png" --xaxis tokens
