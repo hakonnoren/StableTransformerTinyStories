@@ -1,0 +1,103 @@
+#!/bin/bash 
+
+#SBATCH --job-name=reversible_tiny_stories
+#SBATCH --account=share-ie-+        # replace with your IDUN account
+#SBATCH --partition=GPUQ
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --mem=8G
+#SBATCH --time=00:30:00               
+#SBATCH --output=output.txt      # Specifying 'stdout'
+#SBATCH --error=output.err        # Specifying 'stderr'
+
+#SBATCH --mail-user=hakon.noren@ntnu.no
+#SBATCH --mail-type=ALL
+
+
+# ── Conda environment ─────────────────────────────────────────────────────────
+module load Anaconda3/2024.02-1
+conda activate lra_torch
+
+
+# ── Repo and output roots ─────────────────────────────────────────────────────
+
+
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+DEVICE=cuda
+OUTDIR=rev1_${SLURM_JOB_ID}   # avoids mixing old runs
+mkdir -p "${OUTDIR}"
+
+# ---- shared hyperparameters ----
+# NOTE on width matching: RevFormer's Attn/MLP run at width N_EMBD (same as the
+# baseline), and the internal reversible state is 2*N_EMBD wide (two streams).
+# So passing the SAME N_EMBD/N_HEAD to baseline and reversible already gives
+# matching per-block attn+MLP parameter counts -- no manual doubling. See
+# revformer/README.md.
+N_LAYER=4
+N_HEAD=4
+N_EMBD=64
+BLOCK_SIZE=128
+BATCH_SIZE=6
+GRAD_ACCUM_STEPS=12
+MAX_STEPS=20 #1001
+EVAL_INTERVAL=5 #100
+EVAL_BATCHES=20
+LOG_INTERVAL=200
+WARMUP_STEPS=10 #150
+MIN_LR_RATIO=0.4
+PEAK_LR=3e-4
+DATASET=tinystories
+
+# vpm_scaling target across-depth log-volume change: total log|det| = -REV_LAMBDA
+REV_LAMBDA=0.0
+
+log() { echo "[$(date -Is)] $*"; }
+run() { log "RUN: $(printf '%q ' "$@")"; "$@"; }
+
+COMMON_ARGS=(
+  --data_dir data --dataset "${DATASET}"
+  --out_dir "${OUTDIR}"
+  --n_layer "${N_LAYER}" --n_head "${N_HEAD}" --n_embd "${N_EMBD}" --block_size "${BLOCK_SIZE}"
+  --batch_size "${BATCH_SIZE}" --grad_accum_steps "${GRAD_ACCUM_STEPS}"
+  --max_steps "${MAX_STEPS}" --eval_interval "${EVAL_INTERVAL}" --eval_batches "${EVAL_BATCHES}" --log_interval "${LOG_INTERVAL}"
+  --warmup_steps "${WARMUP_STEPS}" --device "${DEVICE}" --plot
+  --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
+)
+
+run_train() {
+  local arch="$1"; shift
+  run python3 -u train.py --arch "${arch}" "${COMMON_ARGS[@]}" "$@"
+}
+
+# reversible run: tag the run by its volume regime so each gets its own run_dir
+# (OUTDIR/reversible_<regime>).
+run_rev() {
+  local regime="$1"; shift
+  run_train reversible --rev_regime "${regime}" --run_name "${regime}" "$@"
+}
+
+log "Job meta: jobid=${SLURM_JOB_ID:-NA} host=$(hostname) pwd=$(pwd)"
+log "Device: ${DEVICE}"
+log "OUTDIR: ${OUTDIR}"
+log "Reversible vs vanilla baseline. REV_LAMBDA=${REV_LAMBDA}"
+
+# 1) vanilla baseline (the reference)
+# run_train baseline
+
+# 2) reversible, four volume regimes (increasing freedom)
+run_rev vpb_baseline
+#run_rev vpb_scaling
+#run_rev vpm_scaling --rev_lambda "${REV_LAMBDA}"
+#run_rev vf_scaling
+
+# ---- plotting ----
+RUNS=(
+#  "${OUTDIR}/baseline"
+  "${OUTDIR}/reversible_vpb_baseline"
+#  "${OUTDIR}/reversible_vpb_scaling"
+#  "${OUTDIR}/reversible_vpm_scaling"
+#  "${OUTDIR}/reversible_vf_scaling"
+)
