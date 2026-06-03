@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
-#SBATCH --time=00:30:00               
+#SBATCH --time=03:00:00               
 #SBATCH --output=output.txt      # Specifying 'stdout'
 #SBATCH --error=output.err        # Specifying 'stderr'
 
@@ -38,17 +38,17 @@ mkdir -p "${OUTDIR}"
 # revformer/README.md.
 N_LAYER=4
 N_HEAD=4
-N_EMBD=64
+N_EMBD=128
 BLOCK_SIZE=128
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
-MAX_STEPS=200 #1001
-EVAL_INTERVAL=5 #100
-EVAL_BATCHES=20
+MAX_STEPS=10000 #1001
+EVAL_INTERVAL=100 #100
+EVAL_BATCHES=50
 LOG_INTERVAL=200
-WARMUP_STEPS=100 #150
-MIN_LR_RATIO=0.4
-PEAK_LR=3e-4
+WARMUP_STEPS=500 #150
+MIN_LR_RATIO=0.1
+PEAK_LR=6e-4
 DATASET=tinystories
 
 # vpm_scaling target across-depth log-volume change: total log|det| = -REV_LAMBDA
