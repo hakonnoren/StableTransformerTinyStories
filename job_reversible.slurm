@@ -1,7 +1,7 @@
 #!/bin/bash 
 
 #SBATCH --job-name=reversible_tiny_stories
-#SBATCH --account=share-ie-+        # replace with your IDUN account
+#SBATCH --account=share-ie-imf        # replace with your IDUN account
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
