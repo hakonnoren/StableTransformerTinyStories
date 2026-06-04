@@ -36,7 +36,28 @@ def main():
     ap.add_argument("--api_key_file", default="api_key_wnb.txt")
     ap.add_argument("--samples", type=int, default=5000, help="max history rows per run")
     ap.add_argument("--csv", action="store_true", help="also dump each run's history to CSV")
+    ap.add_argument("--format", default="png", choices=["png", "pdf", "svg"], help="output image format")
+    ap.add_argument("--filter_config", nargs="*", default=None, metavar="KEY=VAL",
+                    help="keep only runs whose config matches all KEY=VAL (e.g. max_steps=10000 n_layer=6)")
     args = ap.parse_args()
+
+    cfg_filters = {}
+    for kv in (args.filter_config or []):
+        k, _, v = kv.partition("=")
+        cfg_filters[k] = v
+
+    def cfg_match(run):
+        for k, v in cfg_filters.items():
+            cv = run.config.get(k)
+            if str(cv) == v:
+                continue
+            try:
+                if float(cv) == float(v):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return False
+        return True
 
     if not os.environ.get("WANDB_API_KEY") and os.path.exists(args.api_key_file):
         with open(args.api_key_file) as f:
@@ -58,6 +79,8 @@ def main():
         if int(r.summary.get("_step", 0)) < args.min_step:
             continue
         if args.runs and r.name not in args.runs:
+            continue
+        if not cfg_match(r):
             continue
         runs.append(r)
     if not runs:
@@ -123,7 +146,7 @@ def main():
         axes.flat[0].legend(fontsize=8)
         fig.suptitle(title)
         fig.tight_layout()
-        out = os.path.join(args.out_dir, fname)
+        out = os.path.join(args.out_dir, f"{fname}.{args.format}")
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print("wrote", out)
@@ -160,33 +183,33 @@ def main():
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
         fig.tight_layout()
-        out = os.path.join(args.out_dir, fname)
+        out = os.path.join(args.out_dir, f"{fname}.{args.format}")
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print("wrote", out)
 
     # ---- figures ---------------------------------------------------------------
-    line_plot(["val_loss", "train_loss"], "Loss", "loss.png", ylabel="loss")
-    line_plot(["cheap/token_accuracy"], "Token accuracy", "accuracy.png", ylabel="acc")
+    line_plot(["val_loss", "train_loss"], "Loss", "loss", ylabel="loss")
+    line_plot(["cheap/token_accuracy"], "Token accuracy", "accuracy", ylabel="acc")
     line_plot(
         ["cheap/gamma_mean_mean", "cheap/alpha_mean_mean", "cheap/block_logdet_mean"],
-        "Reversible scaling (alpha/gamma & log|det|)", "scaling.png",
+        "Reversible scaling (alpha/gamma & log|det|)", "scaling",
     )
     line_plot(
         ["cheap/actgrad_mean", "cheap/wgrad_mean"],
-        "Gradient norms (mean over layers)", "grad_norms.png", logy=True,
+        "Gradient norms (mean over layers)", "grad_norms", logy=True,
     )
     line_plot(
         ["cheap/act_rms_mean", "cheap/act_erank_mean", "cheap/act_token_sim_mean"],
-        "Representation geometry (mean over layers)", "representation.png",
+        "Representation geometry (mean over layers)", "representation",
     )
     line_plot(
         ["cheap/attn_entropy_norm_mean", "cheap/attn_top1_mean",
          "cheap/attn_k90_mean", "cheap/attn_key_mass_max_mean"],
-        "Attention distribution (mean over layers/heads)", "attention.png",
+        "Attention distribution (mean over layers/heads)", "attention",
     )
     for metric in ("act_erank", "actgrad", "act_token_sim", "attn_entropy_norm", "attn_top1"):
-        depth_profile(metric, f"depth_{metric}.png")
+        depth_profile(metric, f"depth_{metric}")
 
     print(f"\nDone. Plots in {args.out_dir}/")
 

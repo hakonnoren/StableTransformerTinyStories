@@ -229,7 +229,10 @@ def representation_and_accuracy(model, x, y):
     for i, blk in enumerate(blocks):
         def mk(idx):
             def hook(_m, _inp, out):
-                outs[idx] = out.detach()
+                # Blocks may return a tuple (e.g. YuriiFormer returns (x, v));
+                # use the first/position stream for representation stats.
+                o = out[0] if isinstance(out, (tuple, list)) else out
+                outs[idx] = o.detach()
             return hook
         handles.append(blk.register_forward_hook(mk(i)))
     was_training = model.training
