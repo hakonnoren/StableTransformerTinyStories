@@ -25,7 +25,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=tinystories_scale
-#SBATCH --account=share-ie-imf            # replace with your IDUN account
+#SBATCH --account=share-ie-imf
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1

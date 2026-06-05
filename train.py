@@ -82,22 +82,61 @@ def build_prompt_tokens(args, dataset_tokens: np.ndarray, enc):
     return torch.from_numpy(toks).unsqueeze(0), "val_prefix"
 
 
-def build_prompt_from_eval(val_it, args):
-    """Draw a prompt from a real validation/eval batch: the first row's first
-    ``sample_prefix_tokens`` tokens. Returns (prompt[1,n], reference_ids, kind),
-    where reference_ids is the ground-truth continuation from that example."""
-    xb, _ = next(val_it)                       # (B, T) int64 CPU
-    row = xb[0]
+def build_prompt_from_eval(val_it, args, n_prompts=1):
+    """Draw up to ``n_prompts`` prompts from a real validation/eval batch (each is
+    a row's first ``sample_prefix_tokens`` tokens). Returns (prompt[n,n_pref],
+    reference_ids, kind), where reference_ids is row 0's ground-truth continuation
+    (used for display). The extra rows are used only to de-noise the generation
+    metrics. Pulls more eval batches if one isn't wide enough."""
     n_pref = max(1, int(args.sample_prefix_tokens))
-    n_pref = min(n_pref, int(row.shape[0]) - 1)
-    prompt = row[:n_pref].unsqueeze(0).long()
-    reference_ids = row[n_pref:].tolist()
+    rows = []
+    while len(rows) < max(1, n_prompts):
+        xb, _ = next(val_it)                   # (B, T) int64 CPU
+        n_pref = min(n_pref, int(xb.shape[1]) - 1)
+        for i in range(xb.shape[0]):
+            rows.append(xb[i])
+            if len(rows) >= max(1, n_prompts):
+                break
+    rows = rows[: max(1, n_prompts)]
+    prompt = torch.stack([r[:n_pref] for r in rows], dim=0).long()  # (n, n_pref)
+    reference_ids = rows[0][n_pref:].tolist()
     return prompt, reference_ids, "eval_batch"
+
+
+def gen_diversity(ids):
+    """Judge-free generation-quality proxies on the continuation token ids:
+      distinct_1/2 = unique uni/bi-grams / total (higher = more diverse),
+      rep_4        = 1 - unique 4-grams / total (Welleck seq-rep; higher = more
+                     degenerate/repetitive).
+    Token-level (tokenizer-agnostic); single ~128-200 tok sample, so noisy — read
+    the trend over training, not one point."""
+    ids = list(ids)
+    n = len(ids)
+    out = {}
+    if n >= 1:
+        out["distinct_1"] = len(set(ids)) / n
+    if n >= 2:
+        bg = list(zip(ids[:-1], ids[1:]))
+        out["distinct_2"] = len(set(bg)) / len(bg)
+    if n >= 4:
+        fg = list(zip(ids[:-3], ids[1:-2], ids[2:-1], ids[3:]))
+        out["rep_4"] = 1.0 - len(set(fg)) / len(fg)
+    return out
+
+
+def gen_diversity_mean(rows_ids):
+    """Mean of gen_diversity over several continuations (de-noised proxy)."""
+    ds = [gen_diversity(r) for r in rows_ids]
+    keys = set().union(*[d.keys() for d in ds]) if ds else set()
+    return {k: sum(d[k] for d in ds if k in d) / max(1, sum(k in d for d in ds))
+            for k in keys}
 
 
 @torch.no_grad()
 def generate_sample(model, prompt_cpu, prompt_kind, args, device, enc, global_step, reference_ids=None):
-    """Generate a continuation, print it, and return a dict describing it."""
+    """Generate continuation(s), print the first, and return a dict describing it.
+    ``prompt_cpu`` may be a batch (n, T): row 0 is displayed; generation metrics
+    are averaged over all rows to de-noise them (one batched generate call)."""
     prompt = prompt_cpu.to(device)
     out = model.generate(
         prompt,
@@ -108,13 +147,18 @@ def generate_sample(model, prompt_cpu, prompt_kind, args, device, enc, global_st
         eos_token_id=(None if int(args.sample_eos_token_id) < 0 else int(args.sample_eos_token_id)),
         global_step=global_step,
     )
-    out_cpu = out[0].detach().cpu().tolist()
+    out_rows = out.detach().cpu().tolist()      # list of n rows
     prompt_len = prompt_cpu.shape[1]
+    # generation metrics averaged over all prompts (de-noised)
+    diversity = gen_diversity_mean([row[prompt_len:] for row in out_rows])
+    # display / store only row 0
+    out_cpu = out_rows[0]
     prompt_ids = out_cpu[:prompt_len]
     cont_ids = out_cpu[prompt_len:]
 
     rec = {"step": int(global_step), "source": prompt_kind,
-           "prompt_ids": prompt_ids, "continuation_ids": cont_ids}
+           "prompt_ids": prompt_ids, "continuation_ids": cont_ids,
+           "diversity": diversity, "n_gen_prompts": len(out_rows)}
     if enc is not None:
         rec["prompt"] = enc.decode(prompt_ids)
         rec["continuation"] = enc.decode(cont_ids)
@@ -129,6 +173,8 @@ def generate_sample(model, prompt_cpu, prompt_kind, args, device, enc, global_st
         print(f"[sample][step {global_step}] source={prompt_kind} (token ids only)")
         print("[sample][prompt_ids]");       print(prompt_ids)
         print("[sample][continuation_ids]"); print(cont_ids)
+    if rec.get("diversity"):
+        print("[sample][diversity] " + "  ".join(f"{k}={v:.3f}" for k, v in rec["diversity"].items()))
     return rec
 
 
@@ -143,7 +189,8 @@ def print_sample(model, dataset_tokens, device, args, global_step, enc=None, val
         enc = maybe_get_tokenizer(getattr(args, "tokenizer_json", "") or None)
     reference_ids = None
     if val_it is not None and not args.sample_prompt:
-        prompt_cpu, reference_ids, kind = build_prompt_from_eval(val_it, args)
+        prompt_cpu, reference_ids, kind = build_prompt_from_eval(
+            val_it, args, n_prompts=int(getattr(args, "gen_metric_prompts", 1)))
     else:
         prompt_cpu, kind = build_prompt_tokens(args, dataset_tokens, enc)
     return generate_sample(model, prompt_cpu, kind, args, device, enc, global_step, reference_ids)
@@ -160,6 +207,9 @@ def append_sample_log(path, rec):
         else:
             f.write(f"[prompt_ids] {rec['prompt_ids']}\n"
                     f"[continuation_ids] {rec['continuation_ids']}\n")
+        div = rec.get("diversity") or {}
+        if div:
+            f.write("[diversity] " + "  ".join(f"{k}={v:.3f}" for k, v in div.items()) + "\n")
 
 
 
@@ -486,6 +536,8 @@ def main():
                     help="1 = sample from the distribution, 0 = greedy argmax.")
     ap.add_argument("--sample_eos_token_id", type=int, default=50256,
                     help="Stop generation once all batch elements emit this token. Use -1 to disable early stop.")
+    ap.add_argument("--gen_metric_prompts", type=int, default=8,
+                    help="number of eval-batch prompts to average the generation metrics (distinct-1/2, rep-4) over, per eval. 1 = single (noisy).")
 
     # Weights & Biases logging
     ap.add_argument("--wandb", action="store_true", help="log train/val loss to Weights & Biases")
@@ -975,6 +1027,10 @@ def main():
             ])
             # Re-log a fresh cumulative table each time (W&B dedups by step).
             wandb_run.log({"samples": wandb.Table(columns=sample_cols, data=list(sample_rows))}, step=step)
+            # Judge-free generation-quality proxies (distinct-1/2, rep-4).
+            div = rec.get("diversity") or {}
+            if div:
+                wandb_run.log({f"gen/{k}": v for k, v in div.items()}, step=step)
 
     # Cheap diagnostics (forward/backward only): persistent grad hooks + a fixed
     # eval batch reused for attention/representation/accuracy stats. Snapshotted

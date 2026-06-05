@@ -265,6 +265,8 @@ def main():
     line_plot(["val_loss", "train_loss"], "Loss", "loss", ylabel="loss",
               logy=(not args.loss_linear), xmin=(loss_xmin or None))
     line_plot(["cheap/token_accuracy"], "Token accuracy", "accuracy", ylabel="acc")
+    line_plot(["gen/distinct_1", "gen/distinct_2", "gen/rep_4"],
+              "Generation quality (distinct-n up = diverse; rep-4 up = repetitive)", "generation")
     line_plot(
         ["cheap/gamma_mean_mean", "cheap/alpha_mean_mean", "cheap/block_logdet_mean"],
         "Reversible scaling (alpha/gamma & log|det|)", "scaling",
