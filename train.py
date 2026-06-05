@@ -17,7 +17,26 @@ from revformer import RevFormerModel, RevConfig
 from cheap_metrics import CheapMetrics
 
 
-def maybe_get_tokenizer():
+class _HFTokAdapter:
+    """Adapts a HuggingFace tokenizers.Tokenizer to the .encode_ordinary/.decode
+    interface the sampling code expects (used for custom vocabularies, e.g. the
+    10K-BPE TinyStories tokenizer)."""
+    def __init__(self, path):
+        from tokenizers import Tokenizer
+        self.t = Tokenizer.from_file(path)
+    def encode_ordinary(self, text):
+        return self.t.encode(text).ids
+    def decode(self, ids):
+        return self.t.decode(list(ids))
+
+
+def maybe_get_tokenizer(tokenizer_json=None):
+    # Custom tokenizer (e.g. the 10K TinyStories BPE saved by preprocess_tinystories_10k.py).
+    if tokenizer_json:
+        try:
+            return _HFTokAdapter(tokenizer_json)
+        except Exception as e:
+            print(f"[sample] could not load tokenizer_json {tokenizer_json} ({e}); falling back")
     try:
         import tiktoken
     except Exception as e:
@@ -121,7 +140,7 @@ def print_sample(model, dataset_tokens, device, args, global_step, enc=None, val
     if int(args.sample_interval) <= 0:
         return None
     if enc is None:
-        enc = maybe_get_tokenizer()
+        enc = maybe_get_tokenizer(getattr(args, "tokenizer_json", "") or None)
     reference_ids = None
     if val_it is not None and not args.sample_prompt:
         prompt_cpu, reference_ids, kind = build_prompt_from_eval(val_it, args)
@@ -290,7 +309,9 @@ def estimate_loss(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data")
-    ap.add_argument("--dataset", type=str, default="tinystories", choices=["tinystories", "openwebtext"])
+    ap.add_argument("--dataset", type=str, default="tinystories", choices=["tinystories", "tinystories10k", "openwebtext"])
+    ap.add_argument("--tokenizer_json", type=str, default="",
+                    help="path to a HuggingFace tokenizer.json for sample decoding (e.g. the 10K BPE). Empty = GPT-2.")
     ap.add_argument(
         "--arch",
         type=str,
@@ -936,7 +957,7 @@ def main():
 
     # Text-sample logging (stdout + samples.txt + W&B table). Cache the tokenizer
     # once; accumulate sample rows so the W&B table grows over training.
-    enc_sample = maybe_get_tokenizer() if args.sample_interval > 0 else None
+    enc_sample = maybe_get_tokenizer(args.tokenizer_json) if args.sample_interval > 0 else None
     samples_path = os.path.join(run_dir, "samples.txt")
     sample_cols = ["step", "source", "prompt", "continuation", "reference"]
     sample_rows = []
@@ -971,6 +992,8 @@ def main():
         )
 
     # Training loop
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
     model.train()
     t0_wall = time.time()          # for wall_dt_s
     t_start = time.time()          # for wall_cum_s
@@ -1051,11 +1074,14 @@ def main():
                 ],
             )
             if wandb_run is not None:
-                wandb_run.log(
-                    {"train_loss": loss_accum, "lr": lr,
-                     "tokens": toks_cum, "wall_s": wall_cum},
-                    step=step,
-                )
+                payload = {"train_loss": loss_accum, "lr": lr,
+                           "tokens": toks_cum, "wall_s": wall_cum}
+                # Throughput + peak memory: scale/cost diagnostics (per practical-differences study).
+                if dt > 0:
+                    payload["tokens_per_sec"] = toks_per_step * args.log_interval / dt
+                if device.startswith("cuda"):
+                    payload["peak_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+                wandb_run.log(payload, step=step)
 
         if step % args.eval_interval == 0 and step > 0:
             val_loss = estimate_loss(model, val_it, device, args.eval_batches, amp_dtype, global_step=step)

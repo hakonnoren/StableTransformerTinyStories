@@ -1,0 +1,104 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# job_reversible_bench.slurm — small/fast bench to rule out whether any reversible
+# volume regime beats the others. baseline + the 4 regimes, 5001 steps, on the
+# existing GPT-2 TinyStories bins (no preprocessing needed).
+#
+#   ID  run                       regime
+#    0  baseline                  (vanilla transformer)
+#    1  reversible_vpb_baseline   volume_pres        (gamma=alpha=0, frozen)
+#    2  reversible_vpb_scaling    vol_pres_per_block (log|det|=0 per block)
+#    3  reversible_vpm_scaling    default RevConfig() (log|det|=-lambda across depth)
+#    4  reversible_vf_scaling     free_vol           (volume free)
+#
+# In our convention reversible does NOT double n_embd (state is 2*n_embd
+# internally); all five use n_embd=64, so per-block attn+MLP params match.
+#
+# Usage:    sbatch job_reversible_bench.slurm
+# Analyze:  python analyze_wandb.py --filter_config n_embd=64 block_size=256 max_steps=5001 \
+#               --format pdf --out_dir plots/revbench
+# ─────────────────────────────────────────────────────────────────────────────
+
+#SBATCH --job-name=reversible_bench
+#SBATCH --account=share-ie-imf            # replace with your IDUN account
+#SBATCH --partition=GPUQ
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --mem=8G
+#SBATCH --time=02:00:00
+#SBATCH --array=0-4                        # 5 tasks
+#SBATCH --output=output_revbench_%A_%a.txt
+#SBATCH --error=output_revbench_%A_%a.err
+
+#SBATCH --mail-user=hakon.noren@ntnu.no
+#SBATCH --mail-type=ALL
+
+
+# ── Conda environment ─────────────────────────────────────────────────────────
+module load Anaconda3/2024.02-1
+conda activate lra_torch
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+DEVICE=cuda
+OUTDIR=revbench_${SLURM_ARRAY_JOB_ID}
+mkdir -p "${OUTDIR}"
+
+# ---- config (small/fast) ----
+N_LAYER=4
+N_HEAD=4
+N_EMBD=64
+BLOCK_SIZE=256
+BATCH_SIZE=6
+GRAD_ACCUM_STEPS=12
+MAX_STEPS=5001
+EVAL_INTERVAL=100
+EVAL_BATCHES=50
+LOG_INTERVAL=50
+WARMUP_STEPS=150
+MIN_LR_RATIO=0.1
+PEAK_LR=6e-4
+DATASET=tinystories          # existing GPT-2 bins
+
+log() { echo "[$(date -Is)] $*"; }
+run() { log "RUN: $(printf '%q ' "$@")"; "$@"; }
+
+COMMON_ARGS=(
+  --data_dir data --dataset "${DATASET}"
+  --out_dir "${OUTDIR}"
+  --n_layer "${N_LAYER}" --n_head "${N_HEAD}" --n_embd "${N_EMBD}" --block_size "${BLOCK_SIZE}"
+  --batch_size "${BATCH_SIZE}" --grad_accum_steps "${GRAD_ACCUM_STEPS}"
+  --max_steps "${MAX_STEPS}" --eval_interval "${EVAL_INTERVAL}" --eval_batches "${EVAL_BATCHES}" --log_interval "${LOG_INTERVAL}"
+  --warmup_steps "${WARMUP_STEPS}" --device "${DEVICE}" --plot
+  --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
+  --rev_scale_lr_mult 10
+  --wandb --wandb_project sympformer-reversible
+  --sample_interval "${EVAL_INTERVAL}" --sample_prefix_tokens 32 --sample_max_new_tokens 128
+  --sample_temperature 0.8 --sample_top_k 40
+  --cheap_metrics
+)
+
+# ID -> per-task flags (run dir = OUTDIR/<arch>[_<run_name>])
+NAMES=(baseline reversible_vpb_baseline reversible_vpb_scaling reversible_vpm_scaling reversible_vf_scaling)
+TASK_ARGS=(
+  "--arch baseline"
+  "--arch reversible --rev_regime vpb_baseline --run_name vpb_baseline"
+  "--arch reversible --rev_regime vpb_scaling --run_name vpb_scaling"
+  "--arch reversible --rev_regime vpm_scaling --run_name vpm_scaling --rev_lambda 0.0"
+  "--arch reversible --rev_regime vf_scaling --run_name vf_scaling"
+)
+
+ID=${SLURM_ARRAY_TASK_ID}
+if [[ -z "${ID}" || -z "${NAMES[$ID]+x}" ]]; then
+  echo "No experiment for SLURM_ARRAY_TASK_ID='${ID}'. Submit with: sbatch job_reversible_bench.slurm"; exit 1
+fi
+NAME="${NAMES[$ID]}"
+
+log "Job meta: array_job=${SLURM_ARRAY_JOB_ID:-NA} task=${ID} experiment=${NAME} host=$(hostname)"
+log "OUTDIR=${OUTDIR}"
+
+# shellcheck disable=SC2086  (intentional word-splitting of TASK_ARGS)
+run python3 -u train.py "${COMMON_ARGS[@]}" ${TASK_ARGS[$ID]}
+
+log "Task ${ID} (${NAME}) done."
