@@ -264,8 +264,97 @@ def probe_minimal_pairs(models, enc, device):
     return out
 
 
+# ---------------------------------------------------------------- Probe E (E1+E4)
+# Subject-verb NUMBER agreement on a TinyStories-vocabulary template grammar.
+# E1: at which layer does the agreement decision resolve (logit-lens margin per
+#     layer)?  E4: accuracy vs number of opposite-number attractors in between.
+SUBJECTS = [("cat", "cats"), ("dog", "dogs"), ("boy", "boys"),
+            ("girl", "girls"), ("bird", "birds")]
+ATTR_SING = ["tree", "house", "car", "box", "road"]
+ATTR_PLUR = ["trees", "houses", "cars", "boxes", "roads"]
+VERBS = [(" is", " are"), (" was", " were")]  # (singular, plural)
+
+
+def agreement_pairs(n_distractors):
+    """(prompt, correct_verb, foil_verb, number). Attractors take the OPPOSITE
+    number to the head subject (the hard agreement-attractor case)."""
+    pairs = []
+    for i, (s_sing, s_plur) in enumerate(SUBJECTS):
+        for num, subj in (("sing", s_sing), ("plur", s_plur)):
+            attrs = ATTR_PLUR if num == "sing" else ATTR_SING  # opposite number
+            for vs, vp in VERBS:
+                correct, foil = (vs, vp) if num == "sing" else (vp, vs)
+                if n_distractors == 0:
+                    p = f"The {subj}"
+                elif n_distractors == 1:
+                    p = f"The {subj} near the {attrs[i % len(attrs)]}"
+                else:
+                    p = f"The {subj} near the {attrs[i % len(attrs)]} by the {attrs[(i+1) % len(attrs)]}"
+                pairs.append((p, correct, foil, num))
+    return pairs
+
+
+@torch.no_grad()
+def layer_last_logits(model, ids, device):
+    """Per-layer early-exit logits at the LAST position (logit lens). None if the
+    model has no .blocks (e.g. presymp)."""
+    if not hasattr(model, "blocks"):
+        return None
+    caps = [None] * len(model.blocks); hs = []
+    for i, blk in enumerate(model.blocks):
+        def mk(i):
+            def h(_m, _inp, o):
+                caps[i] = (o[0] if isinstance(o, (tuple, list)) else o).detach()
+            return h
+        hs.append(blk.register_forward_hook(mk(i)))
+    model(ids.to(device))
+    for h in hs:
+        h.remove()
+    return [model.lm_head(model.ln_f(c))[0, -1].float().cpu() for c in caps]
+
+
+@torch.no_grad()
+def probe_agreement(models, enc, device, max_d=2):
+    print("\n== E. Subject-verb agreement: accuracy vs #attractors + resolution depth ==")
+    accs = {n: {} for n in models}
+    for d in range(max_d + 1):
+        pairs = agreement_pairs(d)
+        for name, (m, meta) in models.items():
+            c = 0
+            for prompt, cor, foil, _ in pairs:
+                lp = F.log_softmax(_logits(m, torch.tensor([enc.encode_ordinary(prompt)]), device)[0, -1], -1)
+                c += int(lp[enc.encode_ordinary(cor)[0]] > lp[enc.encode_ordinary(foil)[0]])
+            accs[name][d] = c / len(pairs)
+    print("  agreement accuracy vs #attractors (E4):")
+    print("  " + f"{'model':26s}" + "".join(f"{'d='+str(d):>8}" for d in range(max_d + 1)))
+    for name in models:
+        print("  " + f"{name:26s}" + "".join(f"{accs[name][d]:>8.2f}" for d in range(max_d + 1)))
+
+    print("\n  resolution depth — first layer agreement margin>0 and stays (d=0, E1):")
+    pairs0 = agreement_pairs(0)
+    res_depth, margins_by_layer = {}, {}
+    for name, (m, meta) in models.items():
+        if not hasattr(m, "blocks") or not meta["is_causal"]:
+            continue
+        NL = len(m.blocks); accum = np.zeros(NL); depths = []
+        for prompt, cor, foil, _ in pairs0:
+            ci = enc.encode_ordinary(cor)[0]; fi = enc.encode_ordinary(foil)[0]
+            layers = layer_last_logits(m, torch.tensor([enc.encode_ordinary(prompt)]), device)
+            margins = np.array([(F.log_softmax(lg, -1)[ci] - F.log_softmax(lg, -1)[fi]).item() for lg in layers])
+            accum += margins
+            depth = NL
+            for L in range(NL):
+                if np.all(margins[L:] > 0):
+                    depth = L; break
+            depths.append(depth)
+        margins_by_layer[name] = accum / len(pairs0)
+        res_depth[name] = float(np.mean(depths))
+        print(f"    {name:26s} mean_res_depth={res_depth[name]:.2f}/{NL}  final_margin={margins_by_layer[name][-1]:+.3f}")
+    return {"acc": accs, "res_depth": res_depth, "margins_by_layer": margins_by_layer, "max_d": max_d}
+
+
 # ---------------------------------------------------------------- plots
-def make_plots(lens_out, temp_out, pert_out, out_dir, fmt="pdf"):
+def make_plots(lens_out, temp_out, pert_out, agr_out, out_dir, fmt="pdf"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -299,6 +388,28 @@ def make_plots(lens_out, temp_out, pert_out, out_dir, fmt="pdf"):
             ax.set_title(f"Generation {metric} vs temperature"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
             fig.tight_layout(); p = os.path.join(out_dir, f"temp_{metric}.{fmt}"); fig.savefig(p, dpi=140); plt.close(fig)
             print("wrote", p)
+    # agreement: accuracy vs #attractors (E4) + margin vs layer (E1)
+    if agr_out:
+        md = agr_out["max_d"]
+        fig, ax = plt.subplots(figsize=(6.5, 4))
+        for name, byd in agr_out["acc"].items():
+            ax.plot(range(md + 1), [byd[d] for d in range(md + 1)], marker="o", label=name)
+        ax.axhline(0.5, ls="--", c="gray", lw=1)
+        ax.set_xlabel("# opposite-number attractors"); ax.set_ylabel("agreement accuracy")
+        ax.set_ylim(0, 1.02); ax.set_xticks(range(md + 1))
+        ax.set_title("Subject-verb agreement vs attractors (E4)"); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+        fig.tight_layout(); p = os.path.join(out_dir, f"agreement_accuracy.{fmt}"); fig.savefig(p, dpi=140); plt.close(fig)
+        print("wrote", p)
+        if agr_out["margins_by_layer"]:
+            fig, ax = plt.subplots(figsize=(6.5, 4))
+            for name, mg in agr_out["margins_by_layer"].items():
+                ax.plot(range(len(mg)), mg, marker="o", label=name)
+            ax.axhline(0.0, ls="--", c="gray", lw=1)
+            ax.set_xlabel("layer (early-exit readout)"); ax.set_ylabel("agreement margin  logP(correct)-logP(foil)")
+            ax.set_title("Where agreement resolves through depth (E1, 0 attractors)")
+            ax.grid(alpha=0.3); ax.legend(fontsize=8)
+            fig.tight_layout(); p = os.path.join(out_dir, f"agreement_resolution_depth.{fmt}"); fig.savefig(p, dpi=140); plt.close(fig)
+            print("wrote", p)
 
 
 def main():
@@ -328,9 +439,10 @@ def main():
     lens_out = probe_logit_lens(models, enc, args.device)
     temp_out = probe_temperature(models, enc, args.device)
     probe_minimal_pairs(models, enc, args.device)
+    agr_out = probe_agreement(models, enc, args.device)
 
     if not args.no_plots:
-        make_plots(lens_out, temp_out, pert_out, args.out_dir, args.format)
+        make_plots(lens_out, temp_out, pert_out, agr_out, args.out_dir, args.format)
     print("\nDone.")
 
 

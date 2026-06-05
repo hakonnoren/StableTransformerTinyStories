@@ -76,7 +76,9 @@ from model import (  # noqa: E402
 )
 
 
-_VALID_REGIMES = ("vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling")
+_VALID_REGIMES = ("vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling",
+                  "damped", "damped_mem")
+_DAMPED_REGIMES = ("damped", "damped_mem")
 
 
 @dataclass
@@ -88,6 +90,12 @@ class RevConfig:
     epsilon: float = 1.0          # scale of gamma/alpha init (and tanh range if tanh_scale)
     randn_init: bool = False      # init gamma/alpha ~ N(0,1)*epsilon instead of zeros
     tanh_scale: bool = False      # squash gamma/alpha through tanh(.)*epsilon
+    # ---- damped regimes (per-layer contraction budget; see theory/damped_reversible_plan.md) ----
+    # gamma = 0.5*kappa*(1+tanh u), alpha = 0.5*kappa*(1-tanh u), kappa in [kappa_min,kappa_max]>0
+    # => gamma+alpha = kappa > 0: every layer & coord contracts; u routes damping X(+)/Z(-).
+    kappa_min: float = 0.005
+    kappa_max: float = 0.08
+    kappa_mem: float = 0.001      # damped_mem: contraction floor for protected "memory" channels
 
     def __post_init__(self):
         if self.regime not in _VALID_REGIMES:
@@ -126,8 +134,21 @@ class ReversibleBlock(nn.Module):
         self.epsilon = float(rev_cfg.epsilon)
         self.use_tanh = bool(rev_cfg.tanh_scale)
         self.frozen = self.regime == "vpb_baseline"
+        self.damped = self.regime in _DAMPED_REGIMES
+        self.use_mem = self.regime == "damped_mem"
 
-        if self.frozen:
+        if self.damped:
+            # Per-layer contraction budget. rho -> kappa in [kappa_min,kappa_max];
+            # u -> split. Init rho=-2 (sigmoid~0.12 => light kappa), u=0 (symmetric).
+            self.kappa_min = float(rev_cfg.kappa_min)
+            self.kappa_max = float(rev_cfg.kappa_max)
+            self.kappa_mem = float(rev_cfg.kappa_mem)
+            self.rho = nn.Parameter(torch.full((1, 1, d), -2.0))
+            self.u = nn.Parameter(torch.zeros(1, 1, d))
+            # shared memory gate (set by the model for damped_mem); list wrapper so
+            # the shared Parameter is NOT re-registered on every block.
+            self._mem_gate = [None]
+        elif self.frozen:
             # Buffers (follow .to(device) but stay frozen at zero).
             self.register_buffer("gamma_bias", torch.zeros(1, 1, d))
             self.register_buffer("alpha_bias", torch.zeros(1, 1, d))
@@ -136,12 +157,24 @@ class ReversibleBlock(nn.Module):
             self.gamma_bias = nn.Parameter(init(1, 1, d) * self.epsilon)
             self.alpha_bias = nn.Parameter(init(1, 1, d) * self.epsilon)
 
+    def _kappa(self) -> torch.Tensor:
+        """Per-coordinate contraction budget kappa = gamma + alpha > 0."""
+        kd = self.kappa_min + (self.kappa_max - self.kappa_min) * torch.sigmoid(self.rho)
+        if self.use_mem and self._mem_gate[0] is not None:
+            m = torch.sigmoid(self._mem_gate[0])          # protected memory channels
+            kd = (1.0 - m) * kd + m * self.kappa_mem
+        return kd
+
     def get_gamma(self) -> torch.Tensor:
+        if self.damped:
+            return 0.5 * self._kappa() * (1.0 + torch.tanh(self.u))   # X-stream log-damp >= 0
         if self.use_tanh:
             return torch.tanh(self.gamma_bias) * self.epsilon
         return self.gamma_bias
 
     def get_alpha(self) -> torch.Tensor:
+        if self.damped:
+            return 0.5 * self._kappa() * (1.0 - torch.tanh(self.u))   # Z-stream log-damp >= 0
         if self.use_tanh:
             return torch.tanh(self.alpha_bias) * self.epsilon
         return self.alpha_bias
@@ -194,6 +227,14 @@ class RevFormerModel(nn.Module):
 
         # Match GPTModel's initialization exactly for a fair comparison.
         self.apply(self._init_weights)
+
+        # damped_mem: one memory gate shared across all layers (a channel is
+        # "memory" consistently through depth). Owned here; handed to each block
+        # via a list wrapper so it is registered (and optimized) exactly once.
+        if self.rev_cfg.regime == "damped_mem":
+            self.mem_gate = nn.Parameter(torch.full((1, 1, cfg.n_embd), -2.0))  # m~0.12: mostly damping
+            for b in self.blocks:
+                b._mem_gate = [self.mem_gate]
 
     def _init_weights(self, m: nn.Module):
         if isinstance(m, nn.Linear):

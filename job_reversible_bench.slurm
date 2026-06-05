@@ -15,7 +15,7 @@
 # internally); all five use n_embd=64, so per-block attn+MLP params match.
 #
 # Usage:    sbatch job_reversible_bench.slurm
-# Analyze:  python analyze_wandb.py --filter_config n_embd=64 block_size=256 max_steps=5001 \
+# Analyze:  python analyze_wandb.py --filter_config n_embd=64 block_size=256 max_steps=10001 \
 #               --format pdf --out_dir plots/revbench
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-4                        # 5 tasks
+#SBATCH --array=0-3                        # 4 reversible variants: vpb_baseline, vf, damped, damped_mem
 #SBATCH --output=output_revbench_%A_%a.txt
 #SBATCH --error=output_revbench_%A_%a.err
 
@@ -52,7 +52,7 @@ N_EMBD=64
 BLOCK_SIZE=256
 BATCH_SIZE=6
 GRAD_ACCUM_STEPS=12
-MAX_STEPS=5001
+MAX_STEPS=10001
 EVAL_INTERVAL=100
 EVAL_BATCHES=50
 LOG_INTERVAL=50
@@ -79,14 +79,17 @@ COMMON_ARGS=(
   --cheap_metrics
 )
 
-# ID -> per-task flags (run dir = OUTDIR/<arch>[_<run_name>])
-NAMES=(baseline reversible_vpb_baseline reversible_vpb_scaling reversible_vpm_scaling reversible_vf_scaling)
+# ID -> per-task flags (run dir = OUTDIR/<arch>[_<run_name>]). Set --array=0-3.
+#   0 reversible_vpb_baseline (volume-preserving reference)
+#   1 reversible_vf_scaling   (free-volume reference)
+#   2 reversible_damped       (per-layer contraction budget)
+#   3 reversible_damped_mem   (per-layer contraction + memory channels)
+NAMES=(reversible_vpb_baseline reversible_vf_scaling reversible_damped reversible_damped_mem)
 TASK_ARGS=(
-  "--arch baseline"
   "--arch reversible --rev_regime vpb_baseline --run_name vpb_baseline"
-  "--arch reversible --rev_regime vpb_scaling --run_name vpb_scaling"
-  "--arch reversible --rev_regime vpm_scaling --run_name vpm_scaling --rev_lambda 0.0"
   "--arch reversible --rev_regime vf_scaling --run_name vf_scaling"
+  "--arch reversible --rev_regime damped --run_name damped --rev_kappa_min 0.005 --rev_kappa_max 0.08"
+  "--arch reversible --rev_regime damped_mem --run_name damped_mem --rev_kappa_min 0.005 --rev_kappa_max 0.08 --rev_kappa_mem 0.001"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}

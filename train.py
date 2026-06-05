@@ -307,7 +307,9 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
             emb_params.append(p)
         elif "theta_h" in name or "theta_hX" in name or "theta_hY" in name or "theta_xi_raw" in name:
             integrator_params.append(p)
-        elif "gamma_bias" in name or "alpha_bias" in name:  # reversible scaling vectors
+        elif ("gamma_bias" in name or "alpha_bias" in name        # reversible scaling vectors
+              or name.endswith(".rho") or name.endswith(".u")      # damped: kappa / split
+              or "mem_gate" in name):                              # damped_mem: memory gate
             rev_scale_params.append(p)
         elif ".raw" in name:  # ConstrainedScalar raw parameters
             scalar_params.append(p)
@@ -373,7 +375,8 @@ def main():
     # RevFormer (reversible-coupling transformer) options. Attn/MLP run at the
     # full n_embd width (same as the baseline), so pass the SAME --n_embd to both.
     ap.add_argument("--rev_regime", type=str, default="vpm_scaling",
-                    choices=["vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling"],
+                    choices=["vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling",
+                             "damped", "damped_mem"],
                     help="reversible volume regime (see revformer/README.md)")
     ap.add_argument("--rev_lambda", type=float, default=0.0,
                     help="vpm_scaling only: total log|det| of the block stack = -rev_lambda")
@@ -384,7 +387,13 @@ def main():
     ap.add_argument("--rev_tanh", action="store_true",
                     help="squash gamma/alpha through tanh(.)*rev_epsilon")
     ap.add_argument("--rev_scale_lr_mult", type=float, default=1.0,
-                    help="LR multiplier for the reversible alpha/gamma scaling params (1.0 = same LR as other weights)")
+                    help="LR multiplier for the reversible alpha/gamma (and damped rho/u/mem_gate) scaling params (1.0 = same LR as other weights)")
+    ap.add_argument("--rev_kappa_min", type=float, default=0.005,
+                    help="damped regimes: min per-layer contraction budget kappa=gamma+alpha")
+    ap.add_argument("--rev_kappa_max", type=float, default=0.08,
+                    help="damped regimes: max per-layer contraction budget kappa")
+    ap.add_argument("--rev_kappa_mem", type=float, default=0.001,
+                    help="damped_mem: contraction floor for protected memory channels")
 
     ap.add_argument(
         "--no_mlp",
@@ -646,6 +655,9 @@ def main():
             epsilon=args.rev_epsilon,
             randn_init=args.rev_randn_init,
             tanh_scale=args.rev_tanh,
+            kappa_min=args.rev_kappa_min,
+            kappa_max=args.rev_kappa_max,
+            kappa_mem=args.rev_kappa_mem,
         )
         model = RevFormerModel(mcfg, rev_cfg=rev_cfg)
     elif args.arch == "yurii_lt":
