@@ -31,7 +31,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=24G
 #SBATCH --time=18:00:00                     # sized for the large model; small/medium finish sooner
-#SBATCH --array=0-11                        # 12 tasks: scale_idx = ID/4, arch_idx = ID%4
+#SBATCH --array=0-3                        # 4 tasks (large x 4 archs): scale_idx = ID/4, arch_idx = ID%4
 #SBATCH --output=output_scale_%A_%a.txt
 #SBATCH --error=output_scale_%A_%a.err
 
@@ -74,9 +74,10 @@ log() { echo "[$(date -Is)] $*"; }
 run() { log "RUN: $(printf '%q ' "$@")"; "$@"; }
 
 # ---- scale table (d_model ; heads = d_model/64 ; ffn = 4*d_model auto in model) ----
-SCALE_NAMES=(small medium large)
-SCALE_DMODEL=(128 256 512)
-SCALE_HEADS=(2 4 8)
+# large only (small/medium removed). Keep the 3 arrays the SAME length.
+SCALE_NAMES=(large)
+SCALE_DMODEL=(512)
+SCALE_HEADS=(8)
 
 # ---- arch table ----
 ARCH_NAMES=(baseline vpb_baseline vf_scaling yurii_lt)
