@@ -1,18 +1,23 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# job_reversible_bench.slurm — small/fast bench to rule out whether any reversible
-# volume regime beats the others. baseline + the 4 regimes, 5001 steps, on the
-# existing GPT-2 TinyStories bins (no preprocessing needed).
+# job_reversible_bench.slurm — small/fast Muon-vs-AdamW A/B across architectures
+# on the existing GPT-2 TinyStories bins (no preprocessing needed). Three archs
+# x two optimizers, 10001 steps, d=64.
 #
-#   ID  run                       regime
-#    0  baseline                  (vanilla transformer)
-#    1  reversible_vpb_baseline   volume_pres        (gamma=alpha=0, frozen)
-#    2  reversible_vpb_scaling    vol_pres_per_block (log|det|=0 per block)
-#    3  reversible_vpm_scaling    default RevConfig() (log|det|=-lambda across depth)
-#    4  reversible_vf_scaling     free_vol           (volume free)
+#   ID  arch                      optimizer
+#    0  baseline                  adamw     (vanilla transformer, reference)
+#    1  baseline                  muon      (Muon on hidden matrices + AdamW)
+#    2  reversible_vpb_baseline   adamw     (volume-preserving, gamma=alpha=0)
+#    3  reversible_vpb_baseline   muon
+#    4  reversible_vf_scaling     adamw     (free volume)
+#    5  reversible_vf_scaling     muon
+#
+# Muon optimizes the 2D hidden weight matrices (attn/MLP); AdamW handles
+# embeddings, lm_head, norms, biases and the reversible scaling vectors. Recipe
+# from the TinyStories 12L table: muon_lr 0.02, AdamW peak 6e-4, warmup 1000.
 #
 # In our convention reversible does NOT double n_embd (state is 2*n_embd
-# internally); all five use n_embd=64, so per-block attn+MLP params match.
+# internally); all runs use n_embd=64, so per-block attn+MLP params match.
 #
 # Usage:    sbatch job_reversible_bench.slurm
 # Analyze:  python analyze_wandb.py --filter_config n_embd=64 block_size=256 max_steps=10001 \
@@ -26,7 +31,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-3                        # 4 reversible variants: vpb_baseline, vf, damped, damped_mem
+#SBATCH --array=0-5                        # 3 archs x {adamw, muon}: baseline, rev_vpb, rev_vf
 #SBATCH --output=output_revbench_%A_%a.txt
 #SBATCH --error=output_revbench_%A_%a.err
 
@@ -56,7 +61,7 @@ MAX_STEPS=10001
 EVAL_INTERVAL=100
 EVAL_BATCHES=50
 LOG_INTERVAL=50
-WARMUP_STEPS=150
+WARMUP_STEPS=1000           # TinyStories 12L recipe (matters more for Muon)
 MIN_LR_RATIO=0.1
 PEAK_LR=6e-4
 DATASET=tinystories          # existing GPT-2 bins
@@ -79,17 +84,21 @@ COMMON_ARGS=(
   --cheap_metrics
 )
 
-# ID -> per-task flags (run dir = OUTDIR/<arch>[_<run_name>]). Set --array=0-3.
-#   0 reversible_vpb_baseline (volume-preserving reference)
-#   1 reversible_vf_scaling   (free-volume reference)
-#   2 reversible_damped       (per-layer contraction budget)
-#   3 reversible_damped_mem   (per-layer contraction + memory channels)
-NAMES=(reversible_vpb_baseline reversible_vf_scaling reversible_damped reversible_damped_mem)
+# ID -> per-task flags (run dir = OUTDIR/<arch>[_<run_name>]). Set --array=0-5.
+#   0 baseline                + adamw   (vanilla transformer, reference)
+#   1 baseline                + muon
+#   2 reversible_vpb_baseline + adamw   (volume-preserving)
+#   3 reversible_vpb_baseline + muon
+#   4 reversible_vf_scaling   + adamw   (free volume)
+#   5 reversible_vf_scaling   + muon
+NAMES=(baseline_adamw baseline_muon rev_vpb_adamw rev_vpb_muon rev_vf_adamw rev_vf_muon)
 TASK_ARGS=(
-  "--arch reversible --rev_regime vpb_baseline --run_name vpb_baseline"
-  "--arch reversible --rev_regime vf_scaling --run_name vf_scaling"
-  "--arch reversible --rev_regime damped --run_name damped --rev_kappa_min 0.005 --rev_kappa_max 0.08"
-  "--arch reversible --rev_regime damped_mem --run_name damped_mem --rev_kappa_min 0.005 --rev_kappa_max 0.08 --rev_kappa_mem 0.001"
+  "--arch baseline --run_name baseline_adamw --optimizer adamw"
+  "--arch baseline --run_name baseline_muon --optimizer muon"
+  "--arch reversible --rev_regime vpb_baseline --run_name vpb_adamw --optimizer adamw"
+  "--arch reversible --rev_regime vpb_baseline --run_name vpb_muon --optimizer muon"
+  "--arch reversible --rev_regime vf_scaling --run_name vf_adamw --optimizer adamw"
+  "--arch reversible --rev_regime vf_scaling --run_name vf_muon --optimizer muon"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}

@@ -10,6 +10,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+try:
+    from torch.optim import Muon            # built-in, torch >= 2.12
+    _MUON_SOURCE = "torch.optim.Muon"
+except ImportError:
+    from optim import Muon                  # vendored fallback for older torch
+    _MUON_SOURCE = "vendored optim.Muon"
 
 from data import DataConfig, BlockEpochIterator, load_bin
 from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
@@ -282,28 +288,77 @@ def cosine_lr(step: int, warmup_steps: int, total_steps: int, peak: float, min_r
     return peak * (min_ratio + (1.0 - min_ratio) * cosine)
 
 
+class HybridOptimizer:
+    """Presents an AdamW + Muon pair as a single optimizer object.
+
+    Exposes exactly the surface the training loop touches — ``param_groups`` (for
+    the cosine LR schedule), ``zero_grad``, ``step``, and ``state_dict`` /
+    ``load_state_dict`` (back-compatible with old single-AdamW checkpoints).
+    ``muon_param_ids`` lets the loop skip grad-clipping the Muon-managed matrices
+    (their update is already orthonormalized — clipping would fight it)."""
+
+    def __init__(self, adamw, muon):
+        self.adamw = adamw
+        self.muon = muon
+        self.muon_param_ids = {id(p) for g in muon.param_groups for p in g["params"]}
+
+    @property
+    def param_groups(self):
+        return self.adamw.param_groups + self.muon.param_groups
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.adamw.zero_grad(set_to_none=set_to_none)
+        self.muon.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        self.adamw.step()
+        self.muon.step()
+
+    def state_dict(self):
+        return {"adamw": self.adamw.state_dict(), "muon": self.muon.state_dict()}
+
+    def load_state_dict(self, sd):
+        if isinstance(sd, dict) and "adamw" in sd and "muon" in sd:
+            self.adamw.load_state_dict(sd["adamw"])
+            self.muon.load_state_dict(sd["muon"])
+        else:                       # old checkpoint saved a plain AdamW state
+            self.adamw.load_state_dict(sd)
+
+
 def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_lr_mult: float = 10.0,
-                    rev_scale_lr_mult: float = 1.0):
+                    rev_scale_lr_mult: float = 1.0, optimizer: str = "adamw",
+                    muon_lr: float = 0.02, muon_momentum: float = 0.95,
+                    muon_wd: float = 0.1, muon_ns_steps: int = 5,
+                    muon_adjust_lr: str = "original"):
     # Parameter grouping following YuriiFormer Appendix A.3 (AdamW side):
-    # - embeddings: weight decay 0.1
+    # - embeddings (+ tied lm_head): weight decay 0.1
     # - norms: weight decay 0
     # - learned scalar update-rule params: weight decay 0, lr multiplier 5x
     # - reversible alpha/gamma scaling params: weight decay 0, lr multiplier rev_scale_lr_mult
-    # - everything else: weight decay 0 (Muon would handle matrix weights in the paper; here we keep AdamW wd=0)
+    # - everything else: weight decay 0
+    #
+    # When optimizer == "muon", the 2D hidden weight matrices in "other" (attn
+    # q/k/v/proj, MLP fc, etc.) are split out to a Muon optimizer; embeddings, the
+    # LM head, norms, biases and all scalar/reversible vectors stay on AdamW.
+    # Every group carries a "base_lr" the training loop scales by the shared
+    # cosine schedule, so AdamW (peak 6e-4) and Muon (peak muon_lr) keep separate
+    # magnitudes while sharing one warmup/decay shape.
     decay_emb = 0.1
     scalar_mult = scalar_lr_mult
+    use_muon = (optimizer == "muon")
 
     emb_params = []
     norm_params = []
     scalar_params = []
     integrator_params = []  # theta_h/theta_xi_raw
     rev_scale_params = []   # reversible alpha_bias/gamma_bias
-    other_params = []
+    muon_params = []        # 2D hidden weight matrices (only populated when use_muon)
+    other_params = []       # everything AdamW handles outside the named groups
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if ("tok_emb" in name) or ("pos_emb" in name) or ("tok_v0_emb" in name) or ("pos_v0_emb" in name):
+        if ("tok_emb" in name) or ("pos_emb" in name) or ("tok_v0_emb" in name) or ("pos_v0_emb" in name) or ("lm_head" in name):
             emb_params.append(p)
         elif "theta_h" in name or "theta_hX" in name or "theta_hY" in name or "theta_xi_raw" in name:
             integrator_params.append(p)
@@ -315,25 +370,39 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
             scalar_params.append(p)
         elif "ln_" in name or ".ln" in name or "ln_f" in name or "ln_v" in name or "LayerNorm" in name:
             norm_params.append(p)
+        elif use_muon and p.ndim == 2:   # hidden weight matrix -> Muon
+            muon_params.append(p)
         else:
             other_params.append(p)
 
-    param_groups = []
-    if other_params:
-        param_groups.append({"params": other_params, "lr": peak_lr, "weight_decay": 0.0})
-    if emb_params:
-        param_groups.append({"params": emb_params, "lr": peak_lr, "weight_decay": decay_emb})
-    if norm_params:
-        param_groups.append({"params": norm_params, "lr": peak_lr, "weight_decay": 0.0})
-    if scalar_params:
-        param_groups.append({"params": scalar_params, "lr": peak_lr * scalar_mult, "weight_decay": 0.0, "lr_mult": scalar_mult})
-    if integrator_params:
-        param_groups.append({"params": integrator_params, "lr": peak_lr * scalar_mult, "weight_decay": 0.0, "lr_mult": scalar_mult})
-    if rev_scale_params:
-        param_groups.append({"params": rev_scale_params, "lr": peak_lr * rev_scale_lr_mult, "weight_decay": 0.0, "lr_mult": rev_scale_lr_mult})
+    def grp(params, lr, wd, mult=1.0):
+        return {"params": params, "lr": lr, "base_lr": lr, "weight_decay": wd, "lr_mult": mult}
 
-    opt = AdamW(param_groups, betas=betas)
-    return opt
+    adamw_groups = []
+    if other_params:
+        adamw_groups.append(grp(other_params, peak_lr, 0.0))
+    if emb_params:
+        adamw_groups.append(grp(emb_params, peak_lr, decay_emb))
+    if norm_params:
+        adamw_groups.append(grp(norm_params, peak_lr, 0.0))
+    if scalar_params:
+        adamw_groups.append(grp(scalar_params, peak_lr * scalar_mult, 0.0, scalar_mult))
+    if integrator_params:
+        adamw_groups.append(grp(integrator_params, peak_lr * scalar_mult, 0.0, scalar_mult))
+    if rev_scale_params:
+        adamw_groups.append(grp(rev_scale_params, peak_lr * rev_scale_lr_mult, 0.0, rev_scale_lr_mult))
+
+    adamw = AdamW(adamw_groups, betas=betas)
+
+    if use_muon and muon_params:
+        muon = Muon(muon_params, lr=muon_lr, momentum=muon_momentum,
+                    weight_decay=muon_wd, ns_steps=muon_ns_steps,
+                    adjust_lr_fn=muon_adjust_lr)
+        muon.param_groups[0]["base_lr"] = muon_lr
+        print(f"[optimizer] Muon ({_MUON_SOURCE}) on {len(muon_params)} matrices "
+              f"(lr {muon_lr}, adjust_lr_fn={muon_adjust_lr}); AdamW on the rest (peak {peak_lr}).")
+        return HybridOptimizer(adamw, muon)
+    return adamw
 
 
 @torch.no_grad()
@@ -408,6 +477,21 @@ def main():
         help="LR multiplier for learned scalar parameters (ConstrainedScalar .raw, theta_h, theta_xi_raw). "
              "Higher values let the scalars update faster and diverge more across layers. Default: 10.0",
     )
+
+    # ---- optimizer: AdamW (default) or Muon+AdamW hybrid ----
+    ap.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                    help="'adamw' (default) or 'muon': Muon optimizes the 2D hidden weight "
+                         "matrices (attn/MLP), AdamW handles embeddings, lm_head, norms, biases "
+                         "and all scalar/reversible vectors. TinyStories recipe: muon_lr 0.02, AdamW 6e-4.")
+    ap.add_argument("--muon_lr", type=float, default=0.02,
+                    help="Peak LR for the Muon (matrix) group. Shares the cosine warmup/decay shape "
+                         "with AdamW but keeps its own magnitude. Default 0.02 (TinyStories 12L).")
+    ap.add_argument("--muon_momentum", type=float, default=0.95)
+    ap.add_argument("--muon_wd", type=float, default=0.1, help="Decoupled weight decay for Muon matrices.")
+    ap.add_argument("--muon_ns_steps", type=int, default=5, help="Newton-Schulz iterations per Muon step.")
+    ap.add_argument("--muon_adjust_lr", choices=["original", "match_rms_adamw"], default="original",
+                    help="Muon lr scaling. 'original' (Keller) pairs with muon_lr~0.02 (TinyStories recipe); "
+                         "'match_rms_adamw' (Moonlight) scales updates to AdamW RMS and pairs with AdamW-scale lr.")
 
     # ---- learned integrator scalars toggles ----
     ap.add_argument("--learn_h", type=int, default=1,
@@ -994,7 +1078,10 @@ def main():
 
 
     opt = build_optimizer(model, peak_lr=args.peak_lr, betas=tuple(args.betas), scalar_lr_mult=args.scalar_lr_mult,
-                          rev_scale_lr_mult=args.rev_scale_lr_mult)
+                          rev_scale_lr_mult=args.rev_scale_lr_mult, optimizer=args.optimizer,
+                          muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+                          muon_wd=args.muon_wd, muon_ns_steps=args.muon_ns_steps,
+                          muon_adjust_lr=args.muon_adjust_lr)
 
     start_step = 0
     best_val = float("inf")
@@ -1066,11 +1153,13 @@ def main():
     t0_wall = time.time()          # for wall_dt_s
     t_start = time.time()          # for wall_cum_s
     for step in range(start_step, args.max_steps):
-        # update learning rates
-        lr = cosine_lr(step, args.warmup_steps, args.max_steps, args.peak_lr, args.min_lr_ratio)
+        # update learning rates: one shared cosine warmup/decay shape (frac in [0,1]),
+        # scaling each group's own base_lr (AdamW peak vs Muon peak).
+        frac = cosine_lr(step, args.warmup_steps, args.max_steps, 1.0, args.min_lr_ratio)
+        lr = args.peak_lr * frac        # representative AdamW lr, for logging
         for pg in opt.param_groups:
-            mult = pg.get("lr_mult", 1.0)
-            pg["lr"] = lr * mult
+            base = pg.get("base_lr", pg.get("lr", args.peak_lr) / max(frac, 1e-12))
+            pg["lr"] = base * frac
 
         opt.zero_grad(set_to_none=True)
 
@@ -1091,7 +1180,10 @@ def main():
 
         # clip
         if args.grad_clip > 0:
+            muon_ids = getattr(opt, "muon_param_ids", None)
             clip_params = [p for (n,p) in model.named_parameters() if p.requires_grad and ('theta_h' not in n and 'theta_hX' not in n and 'theta_hY' not in n and 'theta_xi_raw' not in n)]
+            if muon_ids:   # Muon orthonormalizes its own update; don't clip those matrices
+                clip_params = [p for p in clip_params if id(p) not in muon_ids]
             torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
 
         opt.step()

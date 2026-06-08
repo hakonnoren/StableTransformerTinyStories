@@ -46,6 +46,18 @@ else
     "${SRC}" "${DST}"
 fi
 
+# Also fetch the tokenizer(s) into ./data/ — 10K-vocab models need their
+# tokenizer.json to encode/decode prompts (analysis & sampling). Harmless if the
+# run used GPT-2 (no such file exists; rsync just copies nothing).
+mkdir -p data
+echo
+echo "Fetching tokenizer(s) from ${REMOTE_REPO}/data/ -> ./data/"
+rsync -avhP \
+  --include='*_tokenizer.json' --exclude='*' \
+  "${USER_HOST}:${REMOTE_REPO}/data/" "data/" || true
+
 echo
 echo "Done. Downloaded best checkpoints:"
 find "${DST}" -name 'best_*.pt' -print 2>/dev/null || true
+echo "Tokenizers in ./data/:"
+ls -1 data/*_tokenizer.json 2>/dev/null || echo "  (none — GPT-2 run, use the default tokenizer)"

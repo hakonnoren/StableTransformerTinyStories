@@ -194,7 +194,7 @@ def probe_logit_lens(models, enc, device):
 
 # ---------------------------------------------------------------- Probe C
 @torch.no_grad()
-def probe_temperature(models, enc, device, temps=(0.3, 0.7, 1.0, 1.3), n_new=120, n_prompts=4):
+def probe_temperature(models, enc, device, eot=EOT, temps=(0.3, 0.7, 1.0, 1.3), n_new=120, n_prompts=4):
     print("\n== C. Generation under temperature (distinct-1/2, rep-4) ==")
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from train import gen_diversity, gen_diversity_mean
@@ -206,7 +206,7 @@ def probe_temperature(models, enc, device, temps=(0.3, 0.7, 1.0, 1.3), n_new=120
             conts = []
             for pr in prompts:
                 g = m.generate(pr.to(device), max_new_tokens=n_new, temperature=tmp,
-                               top_k=0, do_sample=True, eos_token_id=EOT)
+                               top_k=0, do_sample=True, eos_token_id=eot)
                 conts.append(g[0].tolist()[pr.shape[1]:])
             d = gen_diversity_mean(conts)
             out[name][tmp] = d
@@ -419,10 +419,18 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--format", default="pdf")
     ap.add_argument("--no_plots", action="store_true")
+    ap.add_argument("--tokenizer_json", default="",
+                    help="HF tokenizer.json for the model's vocab (e.g. the 10K BPE). Empty = GPT-2.")
+    ap.add_argument("--eot", type=int, default=EOT,
+                    help="end-of-text token id (gpt2=50256; the 10K BPE prints its id, usually 0)")
     args = ap.parse_args()
 
-    import tiktoken
-    enc = tiktoken.get_encoding("gpt2")
+    # tokenizer must match the checkpoint's vocab (10K-vocab models need the BPE,
+    # not gpt2 — otherwise prompts get out-of-range ids).
+    from train import maybe_get_tokenizer
+    enc = maybe_get_tokenizer(args.tokenizer_json or None)
+    if enc is None:
+        raise SystemExit("no tokenizer available (install tiktoken, or pass --tokenizer_json)")
 
     paths = discover(args.ckpt_dir)
     if not paths:
@@ -435,9 +443,17 @@ def main():
         bv = meta.get("best_val")
         print(f"  {name:26s} arch={meta['arch']:16s} best_val={bv if bv is None else round(bv,4)} causal={meta['is_causal']}")
 
+    # fail fast on tokenizer/vocab mismatch (else a cryptic embedding IndexError)
+    _test = enc.encode_ordinary("the cat is happy in the house")
+    _minv = min(m.cfg.vocab_size for m, _ in models.values())
+    if _test and max(_test) >= _minv:
+        raise SystemExit(
+            f"Tokenizer emits ids up to {max(_test)} but model vocab is {_minv}. "
+            f"Pass the matching --tokenizer_json (e.g. --tokenizer_json data/tinystories10k_tokenizer.json --eot 0).")
+
     pert_out = probe_perturbation(models, enc, args.device)
     lens_out = probe_logit_lens(models, enc, args.device)
-    temp_out = probe_temperature(models, enc, args.device)
+    temp_out = probe_temperature(models, enc, args.device, eot=args.eot)
     probe_minimal_pairs(models, enc, args.device)
     agr_out = probe_agreement(models, enc, args.device)
 
