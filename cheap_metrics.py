@@ -102,7 +102,7 @@ def extract_alpha_gamma(model):
     """Per-block effective gamma/alpha for reversible models. Returns dict of
     per-layer lists, or {} if the model has no reversible blocks."""
     blocks = getattr(model, "blocks", [])
-    if not blocks or not hasattr(blocks[0], "_effective_gamma_alpha"):
+    if not blocks:
         return {}
     # Mirror the model's centering: vpm uses a global avg correction; others 0.
     avg = 0.0
@@ -110,6 +110,13 @@ def extract_alpha_gamma(model):
     if rev_cfg is not None and getattr(rev_cfg, "regime", "") == "vpm_scaling":
         # full-block T is irrelevant to per-block gamma/alpha means; use T=1.
         avg = model._avg_corr(1)
+    # Linear-map blocks (lowrank_cayley) have no gamma/alpha; log their volume instead.
+    if hasattr(blocks[0], "mean_logscale"):
+        ell_mean = [float(b.mean_logscale()) for b in blocks]
+        block_logdet = [float(b.linear_map.logdet(avg)) for b in blocks]
+        return {"ell_mean": ell_mean, "block_logdet": block_logdet}
+    if not hasattr(blocks[0], "_effective_gamma_alpha"):
+        return {}
     gamma_mean, alpha_mean, logdet = [], [], []
     for blk in blocks:
         g, a = blk._effective_gamma_alpha(avg)

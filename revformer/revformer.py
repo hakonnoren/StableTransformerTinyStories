@@ -74,6 +74,7 @@ from model import (  # noqa: E402
     LayerNorm,
     _generic_generate,
 )
+from revformer.linear_maps import LowRankCayleyMap  # noqa: E402
 
 
 _VALID_REGIMES = ("vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling",
@@ -96,11 +97,35 @@ class RevConfig:
     kappa_min: float = 0.005
     kappa_max: float = 0.08
     kappa_mem: float = 0.001      # damped_mem: contraction floor for protected "memory" channels
+    # ---- linear-map block (see revformer/linear_maps.py) ----
+    # "diag" (default) keeps the existing ReversibleBlock. "lowrank_cayley" swaps in
+    # LinearMixedReversibleBlock with a controlled-det map L acting on the full
+    # 2*n_embd state: contract r learned directions by e^{-rho}, optional orthogonal
+    # mixing via `rotation`. Composes with vpb_baseline/vpb_scaling/vpm/vf centering.
+    linear_map: str = "diag"           # "diag" | "lowrank_cayley"
+    lowrank_r: int = 4                 # # contracted learned directions
+    cayley_h: float = 1.0              # step size of the Cayley rotation (rotation="cayley")
+    rotation: str = "none"             # "none" | "householder" (WY, cheap+scalable) | "cayley" (dense, small-d only)
+    n_householder: int = 4             # # Householder reflections when rotation="householder"
 
     def __post_init__(self):
         if self.regime not in _VALID_REGIMES:
             raise ValueError(
                 f"RevConfig.regime must be one of {_VALID_REGIMES}; got {self.regime!r}"
+            )
+        if self.linear_map not in ("diag", "lowrank_cayley"):
+            raise ValueError(
+                f"RevConfig.linear_map must be 'diag' or 'lowrank_cayley'; got {self.linear_map!r}"
+            )
+        if self.rotation not in ("none", "householder", "cayley"):
+            raise ValueError(
+                f"RevConfig.rotation must be 'none', 'householder' or 'cayley'; got {self.rotation!r}"
+            )
+        if self.linear_map != "diag" and self.regime in _DAMPED_REGIMES:
+            raise ValueError(
+                f"linear_map={self.linear_map!r} is incompatible with the diagonal-only "
+                f"damped regimes {_DAMPED_REGIMES}; use regime in "
+                "('vpb_baseline','vpb_scaling','vpm_scaling','vf_scaling')."
             )
         if self.regime != "vpm_scaling" and self.lambd != 0.0:
             raise ValueError(
@@ -203,6 +228,64 @@ class ReversibleBlock(nn.Module):
         return torch.cat([x, z], dim=-1)
 
 
+class LinearMixedReversibleBlock(nn.Module):
+    """Reversible block factored as  Y -> S_2 ∘ L ∘ S_1(Y)  (see linear_maps.py):
+
+        x'        = x + Attn(LN_1(z))        # S_1  (shear, det = 1)
+        [x'', z''] = L([x', z], c=avg)       # L    (controlled-det linear map)
+        z'''      = z'' + MLP(LN_2(x''))     # S_2  (shear, det = 1)
+
+    Attn/MLP run at width d = n_embd (matching the baseline and ReversibleBlock);
+    the linear map L acts on the FULL 2*n_embd state. The block's per-token
+    log|det| equals L.logdet(avg) (the shears are det 1). Centering (avg / c) is
+    supplied by RevFormerModel exactly as for the diagonal model.
+    """
+
+    def __init__(self, cfg: ModelConfig, rev_cfg: RevConfig):
+        super().__init__()
+        d = cfg.n_embd
+        m = 2 * cfg.n_embd          # L mixes the concatenated (x, z) state
+
+        self.ln_1 = LayerNorm(d, bias=cfg.bias)
+        self.ln_2 = LayerNorm(d, bias=cfg.bias)
+        self.attn = CausalSelfAttention(cfg)
+        self.mlp = MLP(cfg)
+
+        self.regime = rev_cfg.regime
+        frozen = (rev_cfg.regime == "vpb_baseline")        # ell = 0 -> L volume-preserving
+        vpb = (rev_cfg.regime == "vpb_scaling")            # self-center per block
+        if rev_cfg.linear_map == "lowrank_cayley":
+            self.linear_map = LowRankCayleyMap(
+                m, r=rev_cfg.lowrank_r, h=rev_cfg.cayley_h,
+                vol_pres_per_block=vpb, frozen=frozen,
+                rotation=rev_cfg.rotation, n_householder=rev_cfg.n_householder,
+            )
+        else:
+            raise ValueError(f"LinearMixedReversibleBlock: unsupported linear_map={rev_cfg.linear_map!r}")
+
+    def mean_logscale(self) -> torch.Tensor:
+        """Mean raw log-scale of L; RevFormerModel averages this across blocks to
+        form the global (vpm) volume correction (analogue of (mean gamma+alpha)/2)."""
+        return self.linear_map.mean_logscale()
+
+    def forward(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
+        x, z = torch.split(y, y.shape[-1] // 2, dim=-1)
+        x = x + self.attn(self.ln_1(z))                                  # S_1
+        x, z = torch.split(self.linear_map(torch.cat([x, z], -1), c=avg),
+                           y.shape[-1] // 2, dim=-1)                     # L
+        z = z + self.mlp(self.ln_2(x))                                   # S_2
+        return torch.cat([x, z], dim=-1)
+
+    def inverse(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
+        """Exact algebraic inverse of forward (for reversibility tests)."""
+        x, z = torch.split(y, y.shape[-1] // 2, dim=-1)
+        z = z - self.mlp(self.ln_2(x))                                   # undo S_2
+        x, z = torch.split(self.linear_map.inverse(torch.cat([x, z], -1), c=avg),
+                           y.shape[-1] // 2, dim=-1)                     # undo L
+        x = x - self.attn(self.ln_1(z))                                  # undo S_1
+        return torch.cat([x, z], dim=-1)
+
+
 class RevFormerModel(nn.Module):
     """Reversible-coupling GPT. Drop-in interface match with GPTModel:
     forward(idx, targets, global_step) -> (logits, loss), plus .generate()."""
@@ -218,8 +301,10 @@ class RevFormerModel(nn.Module):
         self.pos_emb = nn.Embedding(cfg.block_size, state_dim)
         self.drop = nn.Dropout(cfg.dropout)
 
+        self.is_linear_map = (self.rev_cfg.linear_map != "diag")
+        block_cls = LinearMixedReversibleBlock if self.is_linear_map else ReversibleBlock
         self.blocks = nn.ModuleList(
-            [ReversibleBlock(cfg, self.rev_cfg) for _ in range(cfg.n_layer)]
+            [block_cls(cfg, self.rev_cfg) for _ in range(cfg.n_layer)]
         )
         self.ln_f = LayerNorm(state_dim, bias=cfg.bias)
         self.lm_head = nn.Linear(state_dim, cfg.vocab_size, bias=False)
@@ -251,6 +336,12 @@ class RevFormerModel(nn.Module):
         (T-independent)."""
         n = len(self.blocks)
         d = self.cfg.n_embd
+        if self.is_linear_map:
+            # ell-based centering: c = ell_avg + lambd/(n*m*T), m = 2*n_embd, so the
+            # total stack log|det| = -lambd (T-independent). Mirrors the diagonal case.
+            m = 2 * d
+            ell_avg = torch.mean(torch.stack([b.mean_logscale() for b in self.blocks]))
+            return ell_avg + self.rev_cfg.lambd / (n * m * T)
         gamma_avg = torch.mean(torch.stack([b.get_gamma().mean() for b in self.blocks]))
         alpha_avg = torch.mean(torch.stack([b.get_alpha().mean() for b in self.blocks]))
         avg = (gamma_avg + alpha_avg) / 2

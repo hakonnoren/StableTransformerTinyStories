@@ -363,9 +363,13 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
         elif "theta_h" in name or "theta_hX" in name or "theta_hY" in name or "theta_xi_raw" in name:
             integrator_params.append(p)
         elif ("gamma_bias" in name or "alpha_bias" in name        # reversible scaling vectors
-              or name.endswith(".rho") or name.endswith(".u")      # damped: kappa / split
+              or name.endswith(".rho") or name.endswith(".u")      # damped: kappa / split; lowrank_cayley: rho
               or "mem_gate" in name):                              # damped_mem: memory gate
             rev_scale_params.append(p)
+        elif name.endswith(".U_param") or name.endswith(".K_param") or name.endswith(".V"):
+            # linear-map orthogonal/bottleneck generators (Householder V, Cayley K,
+            # bottleneck U): keep on AdamW — never hand a structured generator to Muon.
+            other_params.append(p)
         elif ".raw" in name:  # ConstrainedScalar raw parameters
             scalar_params.append(p)
         elif "ln_" in name or ".ln" in name or "ln_f" in name or "ln_v" in name or "LayerNorm" in name:
@@ -463,6 +467,19 @@ def main():
                     help="damped regimes: max per-layer contraction budget kappa")
     ap.add_argument("--rev_kappa_mem", type=float, default=0.001,
                     help="damped_mem: contraction floor for protected memory channels")
+    # ---- linear-map block (controlled-det map L on the full 2*n_embd state) ----
+    ap.add_argument("--rev_linear_map", choices=["diag", "lowrank_cayley"], default="diag",
+                    help="'diag' (default, existing block) or 'lowrank_cayley' (LinearMixed block: "
+                         "contract r learned directions, optional orthogonal mixing). Not for damped regimes.")
+    ap.add_argument("--rev_lowrank_r", type=int, default=4,
+                    help="lowrank_cayley: # contracted learned directions")
+    ap.add_argument("--rev_cayley_h", type=float, default=1.0,
+                    help="lowrank_cayley: Cayley step size (only used when --rev_rotation cayley)")
+    ap.add_argument("--rev_rotation", choices=["none", "householder", "cayley"], default="none",
+                    help="lowrank_cayley mixing: 'none' (cheap rank-r bottleneck), 'householder' "
+                         "(WY-vectorized orthogonal mixing, cheap+scalable), 'cayley' (dense, small-d only)")
+    ap.add_argument("--rev_n_householder", type=int, default=4,
+                    help="lowrank_cayley + rotation=householder: # Householder reflections")
 
     ap.add_argument(
         "--no_mlp",
@@ -742,6 +759,11 @@ def main():
             kappa_min=args.rev_kappa_min,
             kappa_max=args.rev_kappa_max,
             kappa_mem=args.rev_kappa_mem,
+            linear_map=args.rev_linear_map,
+            lowrank_r=args.rev_lowrank_r,
+            cayley_h=args.rev_cayley_h,
+            rotation=args.rev_rotation,
+            n_householder=args.rev_n_householder,
         )
         model = RevFormerModel(mcfg, rev_cfg=rev_cfg)
     elif args.arch == "yurii_lt":

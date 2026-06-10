@@ -11,6 +11,8 @@
 #    3  reversible_vpb_baseline   muon
 #    4  reversible_vf_scaling     adamw     (free volume)
 #    5  reversible_vf_scaling     muon
+#    6  reversible_vf + lowrank_cayley (no rotation)   muon
+#    7  reversible_vf + lowrank_cayley (WY-Householder) muon
 #
 # Muon optimizes the 2D hidden weight matrices (attn/MLP); AdamW handles
 # embeddings, lm_head, norms, biases and the reversible scaling vectors. Recipe
@@ -31,7 +33,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-5                        # 3 archs x {adamw, muon}: baseline, rev_vpb, rev_vf
+#SBATCH --array=0-4                        # 3 archs x {adamw,muon} + 2 lowrank_cayley (muon)
 #SBATCH --output=output_revbench_%A_%a.txt
 #SBATCH --error=output_revbench_%A_%a.err
 
@@ -91,14 +93,21 @@ COMMON_ARGS=(
 #   3 reversible_vpb_baseline + muon
 #   4 reversible_vf_scaling   + adamw   (free volume)
 #   5 reversible_vf_scaling   + muon
-NAMES=(baseline_adamw baseline_muon rev_vpb_adamw rev_vpb_muon rev_vf_adamw rev_vf_muon)
+# IDs 6-7 add the lowrank_cayley linear-map block (vf_scaling, muon) to compare
+# against rev_vf_muon: the map contracts r=4 learned directions; 'hh' adds cheap
+# WY-Householder orthogonal mixing. Isolates the linear-map effect at d=64.
+#NAMES=(baseline_adamw baseline_muon rev_vpb_adamw rev_vpb_muon rev_vf_adamw rev_vf_muon rev_cayley_muon rev_cayleyhh_muon)
+NAMES=(baseline_muon rev_vpb_muon rev_vf_muon cayley_none_muon cayley_hh_muon)
+
 TASK_ARGS=(
-  "--arch baseline --run_name baseline_adamw --optimizer adamw"
+  #"--arch baseline --run_name baseline_adamw --optimizer adamw"
   "--arch baseline --run_name baseline_muon --optimizer muon"
-  "--arch reversible --rev_regime vpb_baseline --run_name vpb_adamw --optimizer adamw"
+  #"--arch reversible --rev_regime vpb_baseline --run_name vpb_adamw --optimizer adamw"
   "--arch reversible --rev_regime vpb_baseline --run_name vpb_muon --optimizer muon"
-  "--arch reversible --rev_regime vf_scaling --run_name vf_adamw --optimizer adamw"
-  "--arch reversible --rev_regime vf_scaling --run_name vf_muon --optimizer muon"
+  #"--arch reversible --rev_regime vf_scaling --run_name vf_adamw --optimizer adamw"
+  #"--arch reversible --rev_regime vf_scaling --run_name vf_muon --optimizer muon"
+  "--arch reversible --rev_regime vf_scaling --rev_linear_map lowrank_cayley --rev_rotation none --rev_lowrank_r 4 --run_name cayley_none_muon --optimizer muon"
+  "--arch reversible --rev_regime vf_scaling --rev_linear_map lowrank_cayley --rev_rotation householder --rev_n_householder 4 --rev_lowrank_r 4 --run_name cayley_hh_muon --optimizer muon"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}
