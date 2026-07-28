@@ -480,6 +480,22 @@ def main():
                          "(WY-vectorized orthogonal mixing, cheap+scalable), 'cayley' (dense, small-d only)")
     ap.add_argument("--rev_n_householder", type=int, default=4,
                     help="lowrank_cayley + rotation=householder: # Householder reflections")
+    # ---- embedding width: param parity against the baseline ----
+    ap.add_argument("--rev_embed", choices=["wide", "narrow"], default="wide",
+                    help="width of the token/pos tables, ln_f and tied lm_head. 'wide' (default, "
+                         "historical) puts them at the full 2*n_embd state, which ~doubles the "
+                         "embedding params (~1.94x total at n_embd=64/vocab=50304). 'narrow' puts "
+                         "them at n_embd -- the baseline's exact shapes -- and bridges to the "
+                         "2*n_embd state with a parameter-free lift/readout, so total params match "
+                         "the baseline to within the 2*n_embd gamma/alpha vectors.")
+    ap.add_argument("--rev_lift", choices=["dup", "zeros"], default="dup",
+                    help="--rev_embed narrow: how the n_embd embedding becomes the 2*n_embd state. "
+                         "'dup' (x=z=emb, recommended) or 'zeros' (x=emb, z=0; note LN(0)=0 leaves "
+                         "block 1's attention contributing nothing at init)")
+    ap.add_argument("--rev_readout", choices=["sum", "x"], default="sum",
+                    help="--rev_embed narrow: how the 2*n_embd state feeds the tied head. 'sum' "
+                         "(x+z, recommended) or 'x' (x only; note the last block's MLP then gets "
+                         "no gradient, since z_final cannot reach the logits)")
 
     ap.add_argument(
         "--no_mlp",
@@ -764,6 +780,9 @@ def main():
             cayley_h=args.rev_cayley_h,
             rotation=args.rev_rotation,
             n_householder=args.rev_n_householder,
+            embed=args.rev_embed,
+            lift=args.rev_lift,
+            readout=args.rev_readout,
         )
         model = RevFormerModel(mcfg, rev_cfg=rev_cfg)
     elif args.arch == "yurii_lt":
@@ -1098,6 +1117,26 @@ def main():
         # if hasattr(args, "presymp_xi_adapt"):
         #     args.presymp_xi_adapt = False
 
+
+    # Parameter census. Counts each tensor once (lm_head is tied to tok_emb), split
+    # embedding vs. block so a reversible-vs-baseline A/B can be checked for param
+    # parity straight from the log / W&B summary instead of by hand.
+    _seen, n_emb, n_blocks, n_rest = set(), 0, 0, 0
+    for n, p in model.named_parameters():
+        if id(p) in _seen:
+            continue
+        _seen.add(id(p))
+        if n.startswith(("tok_emb", "pos_emb", "tok_v0_emb", "pos_v0_emb", "lm_head")):
+            n_emb += p.numel()
+        elif n.startswith("blocks"):
+            n_blocks += p.numel()
+        else:
+            n_rest += p.numel()
+    n_total = n_emb + n_blocks + n_rest
+    print(f"[{args.arch}][params] total {n_total:,} = emb {n_emb:,} + blocks {n_blocks:,} + rest {n_rest:,}")
+    if wandb_run is not None:
+        wandb_run.summary.update({"n_params": n_total, "n_params_emb": n_emb,
+                                  "n_params_blocks": n_blocks, "n_params_rest": n_rest})
 
     opt = build_optimizer(model, peak_lr=args.peak_lr, betas=tuple(args.betas), scalar_lr_mult=args.scalar_lr_mult,
                           rev_scale_lr_mult=args.rev_scale_lr_mult, optimizer=args.optimizer,

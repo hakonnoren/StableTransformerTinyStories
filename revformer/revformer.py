@@ -29,10 +29,38 @@ parameter counts *naively* -- no need to double anything:
     baseline:   --arch baseline   --n_embd D --n_head H
     revformer:  --arch reversible --n_embd D --n_head H
 
-The per-block attn+MLP parameter counts then match the baseline *exactly*. The
-internal state is 2*D wide (two D-wide streams), so the embedding / lm_head /
-final-LayerNorm params are ~2x the baseline's -- inherent to the reversible
-coupling, which carries two streams.
+The per-block attn+MLP parameter counts then match the baseline *exactly*.
+
+Embedding width (RevConfig.embed / --rev_embed)
+----------------------------------------------
+The blocks match, but the *embedding* need not. Two options:
+
+  embed="wide" (default, historical): the token/position tables, ln_f and the
+      tied lm_head all live at the full state width 2*D. Simple and symmetric
+      -- each stream gets its own embedding -- but it doubles the embedding
+      params. At small D that dominates the total: at D=64 / vocab=50304 the
+      embedding is ~94% of the baseline's params, so "wide" makes the whole
+      model ~1.94x the baseline (~1.32x at D=768). A win at those settings is
+      confounded by 2x embedding capacity.
+
+  embed="narrow": the tables, ln_f and the tied lm_head live at width D, i.e.
+      *exactly* the baseline's shapes. The D-wide embedding is lifted to the
+      2*D state on the way in (RevConfig.lift) and the 2*D state is projected
+      back to D on the way out (RevConfig.readout), both parameter-free. Total
+      params then match the baseline to within the 2*D gamma/alpha vectors --
+      the intended setting for isolating the coupling itself.
+
+  lift="dup"    : x = z = emb.  Block 1's attention sees a real input, so its
+                  first sublayer behaves like the baseline's. Recommended.
+  lift="zeros"  : x = emb, z = 0.  Cleaner "second stream starts empty" story,
+                  but LN(0) = 0 => Attn(LN_1(z)) = 0, so block 1's attention
+                  contributes nothing at init (one attention sublayer wasted).
+
+  readout="sum" : logits read x + z.  Both streams reach the loss. Recommended.
+  readout="x"   : logits read x only.  Note z_final then cannot affect the
+                  logits at all, so the *last* block's MLP gets no gradient.
+
+Neither lift nor readout adds parameters, so both keep exact baseline parity.
 
 Volume regimes (RevConfig.regime / --rev_regime)
 ------------------------------------------------
@@ -107,6 +135,13 @@ class RevConfig:
     cayley_h: float = 1.0              # step size of the Cayley rotation (rotation="cayley")
     rotation: str = "none"             # "none" | "householder" (WY, cheap+scalable) | "cayley" (dense, small-d only)
     n_householder: int = 4             # # Householder reflections when rotation="householder"
+    # ---- embedding width (see module docstring) ----
+    # "wide" keeps the historical 2*n_embd token/pos tables, ln_f and tied lm_head.
+    # "narrow" puts them at n_embd -- the baseline's exact shapes -- and lifts /
+    # reads out of the 2*n_embd state parameter-free, giving baseline param parity.
+    embed: str = "wide"                # "wide" | "narrow"
+    lift: str = "dup"                  # narrow only: "dup" (x=z=emb) | "zeros" (x=emb, z=0)
+    readout: str = "sum"               # narrow only: "sum" (x+z) | "x" (x only)
 
     def __post_init__(self):
         if self.regime not in _VALID_REGIMES:
@@ -121,6 +156,22 @@ class RevConfig:
             raise ValueError(
                 f"RevConfig.rotation must be 'none', 'householder' or 'cayley'; got {self.rotation!r}"
             )
+        if self.embed not in ("wide", "narrow"):
+            raise ValueError(f"RevConfig.embed must be 'wide' or 'narrow'; got {self.embed!r}")
+        if self.lift not in ("dup", "zeros"):
+            raise ValueError(f"RevConfig.lift must be 'dup' or 'zeros'; got {self.lift!r}")
+        if self.readout not in ("sum", "x"):
+            raise ValueError(f"RevConfig.readout must be 'sum' or 'x'; got {self.readout!r}")
+        if self.embed == "wide":
+            # lift/readout only exist to bridge a narrow table to the wide state.
+            offenders = [f"{n}={v!r}" for n, v, dflt in (("lift", self.lift, "dup"),
+                                                         ("readout", self.readout, "sum"))
+                         if v != dflt]
+            if offenders:
+                raise ValueError(
+                    "embed='wide' embeds directly at the full 2*n_embd state width, so "
+                    f"these have no effect: {offenders}. Use embed='narrow'."
+                )
         if self.linear_map != "diag" and self.regime in _DAMPED_REGIMES:
             raise ValueError(
                 f"linear_map={self.linear_map!r} is incompatible with the diagonal-only "
@@ -295,10 +346,14 @@ class RevFormerModel(nn.Module):
         self.cfg = cfg
         self.rev_cfg = rev_cfg if rev_cfg is not None else RevConfig()
 
-        # Internal state carries two n_embd-wide streams.
+        # Internal state carries two n_embd-wide streams. The embedding tables /
+        # ln_f / tied lm_head sit either at that full width ("wide") or at the
+        # baseline's n_embd ("narrow"), bridged by a parameter-free lift/readout.
         state_dim = 2 * cfg.n_embd
-        self.tok_emb = nn.Embedding(cfg.vocab_size, state_dim)
-        self.pos_emb = nn.Embedding(cfg.block_size, state_dim)
+        self.narrow_emb = (self.rev_cfg.embed == "narrow")
+        emb_dim = cfg.n_embd if self.narrow_emb else state_dim
+        self.tok_emb = nn.Embedding(cfg.vocab_size, emb_dim)
+        self.pos_emb = nn.Embedding(cfg.block_size, emb_dim)
         self.drop = nn.Dropout(cfg.dropout)
 
         self.is_linear_map = (self.rev_cfg.linear_map != "diag")
@@ -306,8 +361,8 @@ class RevFormerModel(nn.Module):
         self.blocks = nn.ModuleList(
             [block_cls(cfg, self.rev_cfg) for _ in range(cfg.n_layer)]
         )
-        self.ln_f = LayerNorm(state_dim, bias=cfg.bias)
-        self.lm_head = nn.Linear(state_dim, cfg.vocab_size, bias=False)
+        self.ln_f = LayerNorm(emb_dim, bias=cfg.bias)
+        self.lm_head = nn.Linear(emb_dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
         # Match GPTModel's initialization exactly for a fair comparison.
@@ -347,13 +402,28 @@ class RevFormerModel(nn.Module):
         avg = (gamma_avg + alpha_avg) / 2
         return avg - self.rev_cfg.lambd / (2 * n * d * T)
 
+    def _lift(self, e: torch.Tensor) -> torch.Tensor:
+        """n_embd-wide embedding -> 2*n_embd state (narrow embed only, no params)."""
+        if self.rev_cfg.lift == "zeros":
+            return torch.cat([e, torch.zeros_like(e)], dim=-1)
+        return torch.cat([e, e], dim=-1)          # "dup"
+
+    def _readout(self, y: torch.Tensor) -> torch.Tensor:
+        """2*n_embd state -> n_embd for the tied head (narrow embed only, no params)."""
+        x, z = torch.split(y, self.cfg.n_embd, dim=-1)
+        return x if self.rev_cfg.readout == "x" else x + z      # "sum"
+
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
                 global_step: Optional[int] = None):
         B, T = idx.shape
         assert T <= self.cfg.block_size
         pos = torch.arange(0, T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)[None, :, :]
+        # Drop before the lift so "dup" keeps the two streams genuinely identical
+        # (and so the x stream sees the baseline's exact embedding dropout).
         x = self.drop(x)
+        if self.narrow_emb:
+            x = self._lift(x)
 
         # Only the global (vpm) regime needs a cross-block correction; the others
         # either self-center (vpb_scaling), are frozen (vpb_baseline), or apply
@@ -363,6 +433,8 @@ class RevFormerModel(nn.Module):
         for blk in self.blocks:
             x = blk(x, avg)
 
+        if self.narrow_emb:
+            x = self._readout(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
