@@ -11,7 +11,13 @@ def main():
     ap.add_argument("--max_docs_train", type=int, default=0, help="0 = all")
     ap.add_argument("--max_docs_val", type=int, default=0, help="0 = all")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--splits", type=str, default="train,val",
+                    help="comma-separated subset of train,val to write. 'val' alone is enough "
+                         "for the analysis suite and avoids the ~1.9GB train download.")
     args = ap.parse_args()
+    want = {s.strip() for s in args.splits.split(",") if s.strip()}
+    if not want <= {"train", "val"}:
+        raise SystemExit(f"--splits must be a subset of train,val; got {args.splits!r}")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -28,9 +34,13 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
     eot = enc.eot_token  # 50256
 
-    ds = load_dataset("roneneldan/TinyStories")
-    train = ds["train"]
-    val = ds["validation"]
+    # Load only the splits asked for -- the train shard is ~1.9GB and the analysis
+    # suite only ever reads val.
+    splits = {}
+    if "train" in want:
+        splits["train"] = load_dataset("roneneldan/TinyStories", split="train")
+    if "val" in want:
+        splits["val"] = load_dataset("roneneldan/TinyStories", split="validation")
 
     def dump(split, dset, max_docs, out_path):
         n = len(dset) if max_docs == 0 else min(len(dset), max_docs)
@@ -57,8 +67,12 @@ def main():
         arr = np.memmap(out_path, dtype=np.uint16, mode="r")
         print(f"[{split}] tokens={len(arr)}")
 
-    dump("train", train, args.max_docs_train, os.path.join(args.out_dir, "tinystories_train.bin"))
-    dump("val", val, args.max_docs_val, os.path.join(args.out_dir, "tinystories_val.bin"))
+    if "train" in splits:
+        dump("train", splits["train"], args.max_docs_train,
+             os.path.join(args.out_dir, "tinystories_train.bin"))
+    if "val" in splits:
+        dump("val", splits["val"], args.max_docs_val,
+             os.path.join(args.out_dir, "tinystories_val.bin"))
 
 
 if __name__ == "__main__":

@@ -1,21 +1,26 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# job_reversible_parity_regimes_test.slurm — 200-step A/B of memory-efficient
-# reversible backprop, for job_reversible_parity_regimes.slurm. Six arms:
-# {vpb_baseline, vf_scaling} x {eager autograd, --mem_efficient_segment 1, 0}.
+# job_reversible_parity_regimes_test.slurm — 4000-step A/B of memory-efficient
+# reversible backprop, for job_reversible_parity_regimes.slurm. Four arms:
+# {vpb_baseline, vf_scaling} x {eager autograd, --mem_efficient_segment n_layer}.
 #
-# THIS IS NOT AN EXPERIMENT ABOUT ARCHITECTURE. 200 steps at a 20-step warmup is
-# nowhere near convergence and the LR schedule is compressed 50x, so do not
-# compare vpb_baseline vs vf_scaling here. Comparing BACKPROP MODES within one
-# arch is exactly what it is for.
+# THIS IS NOT AN EXPERIMENT ABOUT ARCHITECTURE. 4000 steps of a 10001-step recipe
+# is still short of the paper's val-loss floor (~step 7.6k) and the LR schedule is
+# compressed 2.5x, so do not compare vpb_baseline vs vf_scaling here. Comparing
+# BACKPROP MODES within one arch is exactly what it is for.
 #
 #   ID  run dir                      regime        backprop
 #    0  reversible_vpb_eager         vpb_baseline  ordinary autograd (reference)
-#    1  reversible_vpb_seg1          vpb_baseline  mem_efficient, segment=1
-#    2  reversible_vpb_seg0          vpb_baseline  mem_efficient, segment=0
-#    3  reversible_vf_eager          vf_scaling    ordinary autograd (reference)
-#    4  reversible_vf_seg1           vf_scaling    mem_efficient, segment=1
-#    5  reversible_vf_seg0           vf_scaling    mem_efficient, segment=0
+#    1  reversible_vpb_segL          vpb_baseline  mem_efficient, segment=n_layer
+#    2  reversible_vf_eager          vf_scaling    ordinary autograd (reference)
+#    3  reversible_vf_segL           vf_scaling    mem_efficient, segment=n_layer
+#
+# segment=1 and segment=0 were settled by the 200-step run (array 24979558) and are
+# no longer run here -- see "What the first run answered" below. segment=0 is
+# disqualified in bf16 and segment=1 costs memory that grows with depth, which is
+# the thing this whole line of work is trying to avoid. The only open question is
+# whether segment=n_layer holds up over a long run, so this job is now that single
+# comparison at 20x the horizon rather than a four-way sweep at 200 steps.
 #
 # The question
 # -----------
@@ -38,26 +43,94 @@
 # sampling noise is order 100% relative, ~2 orders of magnitude larger. So this
 # job asks the question the way Reformer did: does the loss curve care?
 #
-# What to read off, per arch (0 vs 1 vs 2, and 3 vs 4 vs 5)
-# ---------------------------------------------------------
-#   * step-0 train_loss   MUST BE IDENTICAL to the last digit across all three
+# What the first run of this job (array 24979558) answered, and why segment=n_layer
+# ---------------------------------------------------------------------------------
+# It cares, but only for vf_scaling, and the bf16 error turned out NOT to be a
+# diffuse quantization floor. It is ONE step. Calibrated against an eager-vs-eager
+# replicate (identical config, seed 1337 -- the run-to-run floor is ~0.13% typical
+# / 0.9% transient, sign-changing, and 0.011 on best_val):
+#
+#   arm        final train_loss vs its eager   character
+#   vpb_seg1   -0.75%                          ~4x floor, at the noise level
+#   vpb_seg0   +1.00%                          ~3x floor, val gap 0.011 = noise
+#   vf_seg1    +0.51%                          ~3x floor
+#   vf_seg0    +3.18%                          13x floor, PERFECTLY monotone, val
+#                                              gap 0.058 = 5x noise -> real bias
+#
+# So additive coupling tolerates bf16 inversion and unconstrained-volume affine
+# does not, exactly as Behrmann et al. (arXiv:2006.09347) predicts. (Also note
+# segment=1 is NOT bit-exact on GPU, only on CPU -- the recompute under enable_grad
+# appears to pick different kernels than the no_grad forward.)
+#
+# Localizing it: every segment > 0 checkpoints at i % segment == 0, hence ALWAYS at
+# i=0, so segment=0 is the only setting that reconstructs the stack input y0. That
+# last inverse subtracts away everything block 0 added in order to recover the
+# embedding, whose magnitude is ~20-30x smaller than any interior activation
+# (measured max|y0| ~ 0.14 vs max|y_l| ~ 3-15 at 12L/768d). Small result from large
+# cancelling operands, in 8 mantissa bits. Relative gradient error vs eager, bf16:
+#
+#   mode                tok/pos emb   block 0    blocks 1..11   ALL params
+#   segment=0             9.35e-2     7.63e-1      5.91e-3       4.31e-1
+#   segment=1             0           0            0             0
+#   segment=n_layer       4.47e-3     5.61e-3      5.91e-3       5.62e-3
+#
+# The whole 4.3e-1 is block 0 being recomputed from a garbage y0 (which also
+# corrupts the embedding gradient). segment=n_layer checkpoints at i=0 only, so it
+# stores exactly ONE tensor -- y0, ~38MB at 12L/768d, and O(1) in depth just like
+# segment=0 -- and that alone drops total gradient error 77x, down to the interior
+# chain's own 5.6e-3.
+#
+# What THIS run asks
+# ------------------
+# Whether that holds up over a long horizon. 4000 steps is 20x the previous run, and
+# the reason to go long is that the failure mode is CUMULATIVE: vf_seg0's bias was
+# invisible for the first ~100 steps and only became unmistakable in the last third,
+# so 200 steps could not distinguish "small residual error that stays small" from
+# "small residual error that compounds". segment=n_layer still leaves the interior
+# chain's 5.9e-3, and vf_scaling's gamma/alpha keep learning -- error amplification
+# through the inverse chain goes like exp(sum_l gamma_l), which vf_scaling does not
+# constrain -- so if segL degrades at all, 4000 steps is where it shows. Watch
+# recon_drift_max over time, not just the loss: that is the mechanism, and at 200
+# steps it was still flat.
+#
+# What to read off, per arch (0 vs 1, and 2 vs 3)
+# -----------------------------------------------
+#   * step-0 train_loss   MUST BE IDENTICAL to the last digit between the two
 #                         modes of one arch. The forward is the same arithmetic in
 #                         the same order -- only the BACKWARD differs -- and this
 #                         was verified bit-identical offline. If step 0 differs at
 #                         all, something is wrong; stop and investigate. This is
 #                         the tripwire that makes the rest interpretable: every
 #                         later divergence is attributable to gradients alone.
-#   * loss curve          segment=1 should track eager essentially exactly
-#                         (bit-exact gradients; expect ~0 divergence, growing only
-#                         through optimizer chaos). segment=0 WILL drift. The
-#                         question is the CHARACTER of the drift: if it plateaus
-#                         and changes sign it is trajectory noise and bf16
-#                         inversion is fine; if it grows monotonically it is bias
-#                         and segment=1 is the answer. For calibration, the
-#                         manual-vs-sdpa A/B plateaued at ~0.4% relative and
-#                         changed sign repeatedly.
-#   * peak_mem_gb         Expect a MODEST drop, roughly 14.4 -> ~11.4 (seg=1) ->
-#                         ~10.6 GB (seg=0) at 'small'. Do NOT expect the 74x from
+#                         (First run: all six arms gave 10.939489275217056. Passed.)
+#   * loss curve          Judge the divergence from the SAME arch's eager arm
+#                         against the run-to-run floor, not against zero: two runs
+#                         with identical config and seed still differ ~0.13%
+#                         typical / 0.9% transient, sign-changing (see the eager
+#                         replicate noted above). Character is what matters -- if
+#                         it plateaus and changes sign it is trajectory noise; if
+#                         it grows monotonically it is bias. First run: seg1 and
+#                         vpb_seg0 sat at 3-4x the floor, vf_seg0 at 13x and
+#                         perfectly monotone. segL should look like seg1, NOT like
+#                         seg0 -- that is the whole hypothesis.
+#                         CAVEAT on the floor at this horizon: the ~0.13% figure was
+#                         measured over 200 steps. Chaotic divergence between two
+#                         numerically-different trajectories generally GROWS with
+#                         horizon, so do not read a larger absolute gap at step 4000
+#                         as bias on its own. The 0.011 best_val spread is the more
+#                         durable yardstick, and vf_seg0's monotone signature is the
+#                         thing to look for. If segL's gap grows but stays
+#                         sign-changing and its best_val lands within ~0.011 of
+#                         eager, that is a pass. Ideally re-measure the floor with an
+#                         eager replicate at 4000 steps before ruling on a close call.
+#   * peak_mem_gb         MEASURED first run at 'small': 13.93 (eager) -> 10.21
+#                         (seg=1) -> 9.30 GB (seg=0). segment=n_layer stores exactly
+#                         one (B,T,2*n_embd) tensor more than seg=0 -- 37.7MB raw at
+#                         12x1024x1536 in bf16 -- so expect ~9.34-9.40 GB. Note the
+#                         seg=1 -> seg=0 gap of 0.91GB is about 2x the 0.45GB of raw
+#                         bytes its 12 checkpoints hold, so allocator overhead and
+#                         transients roughly double the raw figure; treat the
+#                         one-tensor estimate as a floor. Do NOT expect the 74x from
 #                         the offline saved-for-backward measurement: that counted
 #                         bytes stashed inside the STACK, and after --attn_impl
 #                         sdpa the stack is only ~3.9GB of the 14.4GB peak. The
@@ -66,24 +139,51 @@
 #                         log_softmax, ~6-8GB) and params+optimizer (~1.65GB),
 #                         neither of which this touches. The real claim is that
 #                         the stack term is FLAT IN DEPTH -- so the gap widens at
-#                         24L/48L, which is what makes 'medium' viable.
-#   * tokens_per_sec      seg=0 and seg=1 are SLOWER: one inverse plus one
-#                         recomputed forward per block on top of the gradient,
-#                         ~1.6x on the stack. This trade only makes sense when
+#                         24L/48L, which is what makes 'medium' viable. This
+#                         metric is highly reproducible (the eager replicate pair
+#                         agreed to 8 significant figures), so trust it.
+#   * tokens_per_sec      segL is SLOWER: one inverse plus one recomputed forward
+#                         per block on top of the gradient, ~1.6x on the stack.
+#                         Measured 1.25x (seg=1) and 1.46x (seg=0) end to end; segL
+#                         inverts as much as seg=0, so expect ~1.46x. CAVEAT: the
+#                         eager replicate pair differed by 22% in tokens_per_sec on
+#                         identical config, so there is a large node-to-node
+#                         confound here -- trust the ORDERING across arms, not the
+#                         ratio to 3 digits. This trade only makes sense when
 #                         memory is the binding constraint.
-#   * recon_drift_max     logged at every eval by --track_recon_drift. This is the
-#                         interesting scientific output: vpb_baseline freezes
-#                         gamma=alpha=0, so its drift should be CONSTANT, while
-#                         vf_scaling's gamma/alpha learn, so its drift should
+#   * recon_drift_max     logged at every eval by --track_recon_drift, now the max
+#     + recon_drift_input over the INTERIOR layers l1..l_n only. l0 -- the stack
+#                         input -- is reported separately as recon_drift_input
+#                         because it is a different quantity, ~1000x larger, and
+#                         reconstructed only when segment=0 (see the localization
+#                         table above). Folding them into one max just yields an l0
+#                         readout: in the first run recon_drift_max was ENTIRELY l0
+#                         (3-11) while the interior sat at 5e-4..9e-3. Note segL
+#                         never reconstructs y0 during TRAINING, but the drift probe
+#                         is independent of the backprop mode and always inverts the
+#                         whole stack, so recon_drift_input is still logged and still
+#                         large on every arm. That is expected and is not a fault --
+#                         it measures the inverse map's conditioning, not what the
+#                         backward actually did. Read recon_drift_max for segL.
+#                         The interesting scientific hypothesis is that vpb_baseline
+#                         freezes gamma=alpha=0 so its drift should be CONSTANT,
+#                         while vf_scaling's gamma/alpha learn so its drift should
 #                         EVOLVE -- error amplification through the inverse chain
 #                         goes like exp(sum_l gamma_l), and vf_scaling constrains
-#                         that sum not at all. A one-off measurement at init is
-#                         not representative; this is why it is logged over time.
+#                         that sum not at all. At 200 steps this did NOT materialize:
+#                         with l0 excluded the interior drift was flat and
+#                         indistinguishable across all six arms, including the eager
+#                         ones (drift is a property of the weights, so that part is
+#                         expected). 4000 steps is the point of this run: gamma/alpha
+#                         have 20x longer to move, so if the drift is going to
+#                         diverge between vpb and vf, it happens here. This is the
+#                         mechanism behind any loss bias segL shows, so plot the two
+#                         together.
 #
 # NOTE: --cheap_metrics forces the manual attention path for one forward per eval
 # on the small cheap_batch (the fused kernel never builds the attention matrix
 # those diagnostics need), so peak_mem_gb includes one such forward at
-# cheap_batch_size=8. All six arms use --attn_impl sdpa otherwise.
+# cheap_batch_size=8. All four arms use --attn_impl sdpa otherwise.
 #
 # Parameter parity
 # ----------------
@@ -123,18 +223,37 @@
 # suites, whose CUDA-only checks cannot run on a laptop:
 #           python -m test_attn_impl          # asserts a FUSED sdpa backend exists
 #
-# Then compare within each arch (0/1/2 and 3/4/5): step-0 loss identical, then
-# loss curve, peak_mem_gb, tokens_per_sec, recon_drift_max. See the checklist at
-# the top.
+# Then compare within each arch (0 vs 1, and 2 vs 3): step-0 loss identical, then
+# loss curve, peak_mem_gb, tokens_per_sec, recon_drift_max + recon_drift_input. See
+# the checklist at the top.
 #
-# Outcome -> action:
-#   seg=0 tracks eager  ->  use --mem_efficient --mem_efficient_segment 0 in the
-#                           real job for O(1)-in-depth stack memory; this is what
-#                           makes 'medium' (24L) and deeper studies viable.
-#   seg=0 drifts, seg=1 clean -> use segment=1 (bit-exact, smaller win).
+# Outcome -> action. seg=0 and seg=1 are already decided (see the first-run summary
+# above); the only question left is whether segL survives a long horizon:
+#   segL tracks eager for BOTH regimes  ->  use --mem_efficient
+#                           --mem_efficient_segment <n_layer> in the real job. Best
+#                           of both: seg=0's O(1)-in-depth stack memory (one stored
+#                           tensor, regardless of depth) with seg=1's accuracy.
+#                           This is what makes 'medium' (24L) and deeper viable.
+#   segL tracks eager for vpb but drifts monotonically for vf -> the interior chain's
+#                           5.9e-3, amplified by vf's unconstrained gamma/alpha, is a
+#                           second failure mode independent of the y0 step. Options,
+#                           cheapest first: a mid-sized segment (say n_layer/4, so 4
+#                           stored tensors -- still far below seg=1's n_layer) to cap
+#                           the chain length; or constrain the volume change
+#                           (vpb_scaling / vpm_scaling with REV_LAMBDA); or fall back
+#                           to segment=1 for vf only.
+#   segL drifts for BOTH -> the y0 fix was not the whole story; fall back to
+#                           segment=1 (bit-exact, but memory grows with depth, so
+#                           re-check the 24L/48L budget) and re-examine whether the
+#                           bf16 sublayer recompute is a floor after all.
 #   step-0 loss differs at all -> a bug; do not use either.
 # Either way, do not MIX modes within one comparison: train.py logs mem_efficient
 # and mem_efficient_segment to the W&B config, so filter on them.
+#
+# If the call is close, the missing control is an eager REPLICATE at 4000 steps (same
+# config, same seed, different run) to re-measure the noise floor at this horizon --
+# the 0.13%/0.011 figures came from a 200-step pair. Cheapest way to get it: rerun
+# ID 0 or 2 and diff the two eager runs.
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=revparityreg_test
@@ -144,15 +263,28 @@
 # These three must match the DEFAULT MODEL_SIZE below ('small'), since sbatch reads
 # them from the file before the script runs. To submit at another size, pass the
 # matching --mem/--gres on the sbatch command line (they override these).
-# --time is per TASK, not for the whole array (the six tasks are independent jobs).
-# With --attn_impl sdpa the real job measured 3.05-3.47 s/step, so 200 steps is
-# ~12 min eager. The mem_efficient arms add one inverse plus one recomputed forward
-# per block (~1.6x on the stack) and one drift pass per eval, so budget ~25 min.
-# 1h leaves room for startup, data loading and a slower node.
+# --time is per TASK, not for the whole array (the four tasks are independent jobs).
+#
+# --time budget for MAX_STEPS=4000, from the first run's MEASURED tokens_per_sec at
+# 'small' (491,520 tokens/step):
+#   eager  125,418 tok/s (vpb) .. 116,398 (vf)  ->  3.92-4.22 s/step  ->  4.4-4.7 h
+#   seg=0   85,701 tok/s (vpb) ..  79,291 (vf)  ->  5.74-6.20 s/step  ->  6.4-6.9 h
+# segL inverts as much as seg=0, so budget from the seg=0 column: 6.9 h worst arm,
+# x1.22 for the node-to-node spread the eager replicate pair showed = 8.4 h, plus 20
+# evals at ~60s each (eval + drift + cheap_metrics + sampling) = 0.3 h, plus ~0.25 h
+# startup and data loading => ~9 h worst case. 12 h leaves ~33% margin.
+# The eager arms need only ~6 h of that but share the directive; over-requesting
+# --time only costs queue priority, and a timeout would lose the run's tail.
+#
+# --mem is HOST RAM and does NOT scale with step count -- it is set by the dataset
+# (data.load_bin copies the whole token file into RAM for train and val both, ~950MB
+# each for TinyStories), so 32G was already sufficient and still is. Raised to 48G
+# purely as headroom for the longer run's accumulated W&B history/media and the
+# ~1.5GB transient of each checkpoint save; nothing here measured against it.
 #SBATCH --gres=gpu:a100:1
-#SBATCH --mem=32G
-#SBATCH --time=01:00:00
-#SBATCH --array=0-5                        # {vpb_baseline, vf_scaling} x {eager, seg1, seg0}
+#SBATCH --mem=48G
+#SBATCH --time=12:00:00
+#SBATCH --array=0-3                        # {vpb_baseline, vf_scaling} x {eager, segL}
 #SBATCH --output=output_revparityregtest_%A_%a.txt
 #SBATCH --error=output_revparityregtest_%A_%a.err
 
@@ -179,9 +311,12 @@ mkdir -p "${OUTDIR}"
 # file before this script runs), so they are sized for the DEFAULT below. When
 # submitting at another size, pass the matching resources on the command line --
 # sbatch CLI args override the in-file directives:
+# At MAX_STEPS=4000 (see TEST OVERRIDES), sized for the segL arms:
 #   tiny    --mem=8G  --time=02:00:00 --gres=gpu:1
-#   small   --mem=32G --time=24:00:00 --gres=gpu:a100:1     (the default)
+#   small   --mem=48G --time=12:00:00 --gres=gpu:a100:1     (the default)
 #   medium  --mem=48G --time=24:00:00 --gres=gpu:a100:1
+# 'medium' is 24L at 122,880 tokens/step; it was never timed with mem_efficient, so
+# 24h is a guess -- probe it before trusting it.
 #
 # --mem is HOST RAM, not GPU, and is dataset-driven rather than model-driven:
 # data.load_bin() copies the whole token file into RAM for train and val both
@@ -241,15 +376,18 @@ esac
 # touched: geometry, BATCH_SIZE, GRAD_ACCUM_STEPS, PEAK_LR and MUON_LR are left
 # exactly as the real job has them, so peak_mem_gb and tokens_per_sec measured
 # here carry over unchanged.
-MAX_STEPS=200
+MAX_STEPS=4000
 # Warmup scaled to keep the same 10% fraction as the real run, so the test walks
 # through warmup AND into cosine decay rather than sitting in a linear ramp the
-# whole time. Note this compresses the schedule 50x -- another reason the losses
-# here are not comparable to the real run's.
-WARMUP_STEPS=20
-EVAL_INTERVAL=50             # evals at 50/100/150 (+ the post-loop final eval)
+# whole time. At 4000 steps this compresses the real job's schedule only 2.5x (it
+# was 50x at 200 steps), so the trajectory is much closer to the real run's --
+# though still not identical, since cosine decays to MIN_LR_RATIO over 4000 rather
+# than 10001 steps. Losses here are therefore comparable BETWEEN ARMS but still not
+# against the real sweep.
+WARMUP_STEPS=400
+EVAL_INTERVAL=200            # 19 evals at 200..3800 (+ the post-loop final eval)
 EVAL_BATCHES=20              # cheaper than the real job's 50; still ~245k val tokens
-LOG_INTERVAL=10              # 20 log points, so tokens_per_sec/peak_mem_gb settle
+LOG_INTERVAL=50              # 80 log points, so tokens_per_sec/peak_mem_gb settle
 
 MIN_LR_RATIO=0.1
 DATASET=tinystories          # existing GPT-2 bins
@@ -270,9 +408,11 @@ COMMON_ARGS=(
   --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
   --rev_scale_lr_mult 10
   --optimizer muon --muon_lr "${MUON_LR}"
-  # Separate project: 200-step runs must not land in the analysis filter of the
-  # real sweep, and they share n_embd/block_size with it so a config filter alone
-  # would not exclude them.
+  # Separate project: these runs must not land in the analysis filter of the real
+  # sweep, and they share n_embd/block_size with it so a config filter alone would
+  # not exclude them. This matters MORE at 4000 steps than it did at 200 -- a
+  # 4000-step run is long enough to be mistaken for a real one at a glance, where a
+  # 200-step run was obviously a probe.
   --wandb --wandb_project sympformer-reversible-test
   # sdpa for every arm: this A/B is about the BACKWARD pass, so the attention
   # kernel must be held fixed (it was settled by the previous version of this job).
@@ -296,9 +436,9 @@ COMMON_ARGS=(
 #   readout=x   -> z_final can't reach the logits, so the last MLP gets no grad
 NARROW="--rev_embed narrow --rev_lift dup --rev_readout sum"
 
-# Each regime runs three times -- eager / segment=1 / segment=0 -- on the same
-# init, seed and batch order, so the A/B is strictly within-arch. --attn_impl sdpa
-# and --track_recon_drift are in COMMON_ARGS, so every arm shares them (drift is a
+# Each regime runs twice -- eager / segment=n_layer -- on the same init, seed and
+# batch order, so the A/B is strictly within-arch. --attn_impl sdpa and
+# --track_recon_drift are in COMMON_ARGS, so both arms share them (drift is a
 # property of the weights, measurable on the eager arms too).
 #
 # vpb_baseline and vf_scaling are the two ends of the conditioning question:
@@ -307,26 +447,29 @@ NARROW="--rev_embed narrow --rev_lift dup --rev_readout sum"
 # constant. vf_scaling is AFFINE with the volume change unconstrained, which
 # Behrmann et al. (arXiv:2006.09347) show has only local bounds and can develop
 # arbitrarily large inverse-Jacobian singular values. If bf16 inversion is going
-# to fail anywhere, it fails on vf_scaling first.
+# to fail anywhere, it fails on vf_scaling first. The first run confirmed exactly
+# that: vf_seg0 developed a monotone +3.18% loss bias, vpb_seg0 stayed at noise.
+#
+# segL passes segment=${N_LAYER}, i.e. the layer count of whatever MODEL_SIZE
+# selected -- NOT a hardcoded 12. rev_backprop checkpoints at i % segment == 0, so
+# segment=n_layer checkpoints at i=0 alone: exactly one stored tensor (y0), which is
+# O(1) in depth like segment=0, but the one inverse that cancels catastrophically
+# never runs. It is the accuracy of seg=1 at the memory of seg=0, in principle.
 #
 # Keep --array (top) in sync with this.
 NAMES=(
   reversible_vpb_eager
-  reversible_vpb_seg1
-  reversible_vpb_seg0
+  reversible_vpb_segL
   reversible_vf_eager
-  reversible_vf_seg1
-  reversible_vf_seg0
+  reversible_vf_segL
 )
 VPB="--rev_regime vpb_baseline ${NARROW}"
 VF="--rev_regime vf_scaling ${NARROW}"
 TASK_ARGS=(
   "--arch reversible ${VPB} --run_name vpb_eager"
-  "--arch reversible ${VPB} --mem_efficient --mem_efficient_segment 1 --run_name vpb_seg1"
-  "--arch reversible ${VPB} --mem_efficient --mem_efficient_segment 0 --run_name vpb_seg0"
+  "--arch reversible ${VPB} --mem_efficient --mem_efficient_segment ${N_LAYER} --run_name vpb_segL"
   "--arch reversible ${VF}  --run_name vf_eager"
-  "--arch reversible ${VF}  --mem_efficient --mem_efficient_segment 1 --run_name vf_seg1"
-  "--arch reversible ${VF}  --mem_efficient --mem_efficient_segment 0 --run_name vf_seg0"
+  "--arch reversible ${VF}  --mem_efficient --mem_efficient_segment ${N_LAYER} --run_name vf_segL"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}

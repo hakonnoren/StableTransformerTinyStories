@@ -424,7 +424,7 @@ def estimate_loss(
         xb, yb = next(it)
         xb = xb.to(device)
         yb = yb.to(device)
-        with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(device.startswith("cuda"))):
+        with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
             _, loss = model(xb, yb, global_step=global_step)
         losses.append(loss.item())
     model.train()
@@ -485,20 +485,28 @@ def main():
                     help="run the reversible block stack under no_grad and reconstruct "
                          "activations in backward, making stack activation memory O(1) in "
                          "depth for ~1.6x the stack's forward compute. Reversible archs "
-                         "only; falls back silently otherwise. See --mem_efficient_segment: "
-                         "under bf16 autocast the algebraic inverse is NOT accurate enough "
-                         "(measured 1-7% gradient error), so use segment=1 there.")
+                         "only; falls back silently otherwise. Under bf16 autocast do NOT "
+                         "leave --mem_efficient_segment at 0; set it to n_layer (see there).")
     ap.add_argument("--mem_efficient_segment", type=int, default=0,
-                    help="0 = fully reversible, store nothing (accurate in fp32: ~2e-5 "
-                         "relative gradient error; NOT in bf16). k>0 = store the stack "
-                         "activation every k blocks and invert only within a segment. "
-                         "k=1 stores every block and never inverts, i.e. plain gradient "
-                         "checkpointing: bit-exact in any precision, ~9x less saved memory "
-                         "at 24 layers. Use 1 for bf16 runs.")
+                    help="store the stack activation every k blocks and invert only within a "
+                         "segment; memory is ceil(n_layer/k) tensors of (B,T,2*n_embd). "
+                         "0 = fully reversible, store nothing -- but in bf16 this is the ONE "
+                         "bad setting: it is the only k that reconstructs the stack input y0, "
+                         "and that last inverse cancels catastrophically against the "
+                         "small-magnitude embedding (measured 7.6e-1 relative gradient error "
+                         "on block 0, 4.3e-1 overall, vs 5.9e-3 for blocks 1..11). "
+                         "k=n_layer checkpoints at i=0 only, so it stores exactly ONE tensor "
+                         "(~38MB at 12L/768d, and O(1) in depth like k=0) while removing that "
+                         "step: 4.3e-1 -> 5.6e-3 overall, i.e. down to the interior chain's "
+                         "own error. This is the recommended bf16 setting. k=1 stores every "
+                         "block and never inverts, i.e. plain gradient checkpointing: "
+                         "bit-exact, but memory grows with depth. fp32 is forgiving "
+                         "throughout (k=0 gives ~2.7e-4).")
     ap.add_argument("--track_recon_drift", action="store_true",
                     help="log forward-then-invert reconstruction error per block "
-                         "(recon_drift, recon_drift_max) on the cheap-metrics cadence -- a "
-                         "direct measurement of the inverse map's conditioning through depth")
+                         "(recon_drift/l*, plus recon_drift_max over the interior l1..l_n and "
+                         "recon_drift_input for l0) on the cheap-metrics cadence -- a direct "
+                         "measurement of the inverse map's conditioning through depth")
 
     # ---- embedding width: param parity against the baseline ----
     ap.add_argument("--rev_embed", choices=["wide", "narrow"], default="wide",
@@ -646,6 +654,11 @@ def main():
     ap.add_argument("--max_steps", type=int, default=10_000)
     ap.add_argument("--warmup_steps", type=int, default=1_000)
     ap.add_argument("--peak_lr", type=float, default=6e-4)
+    ap.add_argument("--amp_dtype", choices=["auto", "fp32", "bf16"], default="auto",
+                    help="autocast dtype. 'auto' (default) = bf16 on CUDA, fp32 on CPU, i.e. "
+                         "the historical behaviour. Setting it explicitly lets a CPU run "
+                         "reproduce the CUDA precision, which matters for anything sensitive "
+                         "to mantissa width -- e.g. --mem_efficient's reconstruction.")
     ap.add_argument("--attn_impl", choices=["manual", "sdpa"], default="manual",
                     help="softmax-attention kernel for the baseline/reversible blocks. "
                          "'manual' (default) materializes the explicit (B,nh,T,T) matrix; "
@@ -764,7 +777,15 @@ def main():
     device = args.device
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("CUDA requested but not available.")
-    amp_dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    # 'auto' reproduces the historical behaviour exactly: bf16 on CUDA, fp32 on CPU.
+    # Autocast is then enabled iff the dtype is not fp32, so forcing bf16 on CPU
+    # actually takes effect (needed to reproduce CUDA numerics without a GPU).
+    amp_dtype = ({"fp32": torch.float32, "bf16": torch.bfloat16}[args.amp_dtype]
+                 if args.amp_dtype != "auto"
+                 else (torch.bfloat16 if device.startswith("cuda") else torch.float32))
+    amp_enabled = amp_dtype != torch.float32
+    print(f"[{args.arch}][amp] device={device} autocast={'on' if amp_enabled else 'off'} "
+          f"dtype={str(amp_dtype).replace('torch.', '')}")
 
     # Load data
     train_path = os.path.join(args.data_dir, f"{args.dataset}_train.bin")
@@ -1146,11 +1167,30 @@ def main():
         print(f"[{args.arch}][mem_efficient] on, segment={model.mem_efficient_segment}, "
               f"stack eligible={eligible}"
               + ("" if eligible else " -> falling back to the eager autograd loop"))
-        if eligible and model.mem_efficient_segment != 1 and amp_dtype == torch.bfloat16:
-            print(f"[{args.arch}][mem_efficient] WARNING: segment="
-                  f"{model.mem_efficient_segment} with bf16 autocast. The algebraic "
-                  "inverse loses too much precision in bf16 (measured 1-7% relative "
-                  "gradient error); --mem_efficient_segment 1 is bit-exact.")
+        # Only segment=0 is a problem in bf16, and not because the inverse is
+        # broadly imprecise: every segment > 0 checkpoints at i % segment == 0,
+        # hence always at i=0, so segment=0 is the ONLY setting that reconstructs
+        # the stack input y0. That last inverse subtracts away everything block 0
+        # added to recover the embedding, whose magnitude is ~20-30x smaller than
+        # any interior activation -- catastrophic cancellation, and with bf16's 8
+        # mantissa bits it wrecks block 0's gradients specifically. So the fix is
+        # not a smaller segment, it is any segment at all.
+        seg = model.mem_efficient_segment
+        n_blocks = len(model.blocks)
+        if eligible and seg == 0 and amp_dtype == torch.bfloat16:
+            print(f"[{args.arch}][mem_efficient] WARNING: segment=0 with bf16 autocast "
+                  "reconstructs the stack input y0, which cancels catastrophically "
+                  "against the embedding: measured 7.6e-1 relative gradient error on "
+                  "block 0 and 4.3e-1 overall, against 5.9e-3 for blocks 1..11.")
+            print(f"[{args.arch}][mem_efficient]          use --mem_efficient_segment "
+                  f"{n_blocks} (= n_layer): it checkpoints at i=0 only, so it stores "
+                  "exactly one tensor and stays O(1) in depth, but drops overall "
+                  "gradient error to 5.6e-3. segment=1 is bit-exact if you can afford "
+                  "memory growing with depth.")
+        elif eligible and seg > 1 and amp_dtype == torch.bfloat16:
+            print(f"[{args.arch}][mem_efficient] segment={seg} in bf16: y0 is "
+                  f"checkpointed (exact), {min(seg, n_blocks) - 1} chained inverses per "
+                  "segment leave ~1e-2 relative reconstruction error in the interior.")
 
     # Optionally freeze learned integrator scalars (h, xi) so they stay fixed.
     if args.learn_h == 0:
@@ -1297,7 +1337,7 @@ def main():
             xb = xb.to(device)
             yb = yb.to(device)
 
-            with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(device.startswith("cuda"))):
+            with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
                 _, loss = model(xb, yb, global_step=step)
                 loss = loss / args.grad_accum_steps
             loss.backward()
@@ -1417,12 +1457,19 @@ def main():
             # inside the same autocast context training uses, and under no_grad.
             if args.track_recon_drift and drift_fn is not None:
                 with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype,
-                                    enabled=device.startswith("cuda")):
+                                    enabled=(amp_dtype != torch.float32)):
                     d = drift_fn(model, drift_idx)
+                # 'max' is over the interior l1..l_n; 'input' is l0 (the stack
+                # input) on its own. They are different quantities -- l0 is a
+                # cancellation term ~1000x larger, and is reconstructed only when
+                # segment=0 -- so folding them into one max makes the scalar an l0
+                # readout. See reconstruction_drift's docstring.
                 print(f"[{args.arch}][drift] step {step:6d} | max {d['recon_drift_max']:.3e} "
+                      f"| input(l0) {d['recon_drift_input']:.3e} "
                       f"| per-layer {[f'{v:.1e}' for v in d['recon_drift'][:4]]}...")
                 if wandb_run is not None:
                     wandb_run.log({"recon_drift_max": d["recon_drift_max"],
+                                   "recon_drift_input": d["recon_drift_input"],
                                    **{f"recon_drift/l{i}": float(v)
                                       for i, v in enumerate(d["recon_drift"])}}, step=step)
 

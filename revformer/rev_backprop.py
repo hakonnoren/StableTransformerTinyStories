@@ -278,9 +278,39 @@ def reconstruction_drift(model, idx):
     Runs under whatever autocast context the caller established, so call it inside
     the same one training uses to get a representative number.
 
-    Returns {'recon_drift': (n_layer+1,) ndarray, 'recon_drift_max': float} where
-    entry l is max|y_hat_l - y_l| / max|y_l| for the activation entering block l;
-    entry n_layer is the stack output, exact by construction (0.0).
+    Returns
+    -------
+    'recon_drift' : (n_layer+1,) ndarray
+        Entry l is max|y_hat_l - y_l| / max|y_l| for the activation entering block
+        l; entry n_layer is the stack output, exact by construction (0.0).
+    'recon_drift_max' : float
+        Max over the INTERIOR entries l1..l_n only -- deliberately excluding l0.
+    'recon_drift_input' : float
+        Entry l0 on its own, i.e. the reconstruction of the stack input.
+
+    Why l0 is reported separately rather than folded into the max
+    -------------------------------------------------------------
+    l0 is not the same quantity as the rest and is ~1000x larger, so a plain max
+    over all entries is just an l0 readout and tells you nothing about the stack.
+    Two effects compound there, and only at the last inverse step:
+
+      * the numerator jumps ~8x, because recovering y0 means subtracting away
+        everything block 0 added, and
+      * the denominator collapses ~20-30x, because y0 is the *embedding* (measured
+        max|y0| ~ 0.14 at 12L/768d) while every interior activation has already
+        grown to max|y_l| ~ 3-15.
+
+    Small result from large cancelling operands is catastrophic cancellation, and
+    with bf16's 8 mantissa bits it lands at >100% relative error on y0 while the
+    interior chain sits at ~1e-2. Measured gradient error vs eager, bf16, 12L/768d:
+    block 0's params 7.6e-1 and the embedding 9.3e-2, against 5.9e-3 for blocks
+    1..11 -- the whole 4.3e-1 total is that one step.
+
+    Any segment > 0 checkpoints at i % segment == 0, hence always at i=0, so it
+    reconstructs y0 never and this term is structurally absent; it is specific to
+    segment=0. Note 'recon_drift_max' is therefore comparable across runs logged
+    before this split, since the per-layer 'recon_drift/l*' series it is taken over
+    are unchanged -- only the scalar's definition narrowed.
     """
     blocks = list(model.blocks)
     if not stack_supported(blocks):
@@ -299,5 +329,10 @@ def reconstruction_drift(model, idx):
         scale = float(ref.float().abs().max()) + 1e-12
         errs.append(float((y - ref).float().abs().max()) / scale)
     errs.reverse()                                 # index l -> input of block l
+    # errs[1:] is l1..l_n: the chained-inverse error that actually feeds blocks
+    # 1..n-1's gradients. l0 is the cancellation term, kept out of the max and
+    # reported on its own -- see the docstring. A 1-block stack has no interior
+    # reconstruction at all, so the max is over the exact top entry alone (0.0).
     return {"recon_drift": np.array(errs, dtype=np.float64),
-            "recon_drift_max": float(max(errs))}
+            "recon_drift_max": float(max(errs[1:])),
+            "recon_drift_input": float(errs[0])}
