@@ -42,9 +42,20 @@
 # 123.6M for small (12L/12H/768d) and 353.6M for medium (24L/16H/1024d).
 #
 # Muon optimizes the 2D hidden weight matrices (attn/MLP); AdamW handles
-# embeddings, lm_head, norms, biases and the reversible scaling vectors. Recipe
-# from the TinyStories 12L table: muon_lr 0.02, AdamW peak 6e-4, warmup 1000 --
-# which is exactly the 'small' size, the default here.
+# embeddings, lm_head, norms, biases and the reversible scaling vectors.
+#
+# The 'small' size (the default) matches the paper's TinyStories 12L recipe
+# exactly: 491,520 tokens/step (12x40x1024, same effective batch as the paper's
+# 30x16), 10k steps = 4.92B tokens = 10.4 epochs, warmup 1k, Muon 0.02, AdamW
+# 6e-4, min LR 0.1x peak, cosine + linear warmup, betas (0.9, 0.95), Muon
+# momentum 0.95, grad clip 1.0, bf16 -- all of which are train.py's defaults
+# except the ones set below.
+#
+# That match buys a free correctness check: arm 0 (baseline) IS the paper's
+# GD+Euler / GD+Lie-Trotter, which reach best val 1.107 / 1.106 on this budget.
+# If arm 0 lands near 1.11, the data order, optimizer grouping, schedule and eval
+# are all validated before anyone reads the reversible arms. If it doesn't,
+# something in the pipeline is off and the comparison is not yet trustworthy.
 #
 # Usage:    sbatch job_reversible_parity_regimes.slurm             # default: small
 #           sbatch --export=ALL,MODEL_SIZE=tiny --mem=8G --time=02:00:00 \
@@ -63,7 +74,7 @@
 # matching --mem/--time/--gres on the sbatch command line (they override these).
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --array=0-4                        # baseline + 4 regimes, all narrow
 #SBATCH --output=output_revparityreg_%A_%a.txt
 #SBATCH --error=output_revparityreg_%A_%a.err
@@ -92,17 +103,25 @@ mkdir -p "${OUTDIR}"
 # submitting at another size, pass the matching resources on the command line --
 # sbatch CLI args override the in-file directives:
 #   tiny    --mem=8G  --time=02:00:00 --gres=gpu:1
-#   small   --mem=32G --time=12:00:00 --gres=gpu:a100:1     (the default)
+#   small   --mem=32G --time=24:00:00 --gres=gpu:a100:1     (the default)
 #   medium  --mem=48G --time=24:00:00 --gres=gpu:a100:1
 #
-# batch_size x grad_accum_steps x block_size = tokens/step is held at ~123k for
-# small and medium so the two are comparable. If a reversible arm OOMs where the
-# baseline fits (the residual stream is 2*n_embd wide), halve BATCH_SIZE and
-# double GRAD_ACCUM_STEPS -- tokens/step is unchanged.
+# --mem is HOST RAM, not GPU, and is dataset-driven rather than model-driven:
+# data.load_bin() copies the whole token file into RAM for train and val both
+# (~950MB for TinyStories). Batch size barely touches it. For OpenWebText (~17GB
+# of bins) raise it to 48G+ regardless of model size.
 #
-# --mem is HOST RAM, not GPU: data.load_bin() copies the whole token file into
-# RAM for train and val both (~950MB for TinyStories). For OpenWebText (~17GB of
-# bins) raise it to 48G+ regardless of model size.
+# GPU memory instead scales with BATCH_SIZE (the micro-batch), NOT with
+# GRAD_ACCUM_STEPS -- each micro-step's activations are freed after its backward,
+# so raising accumulation costs wall-clock, not memory. Measured ~25 GB peak at
+# small/BATCH_SIZE=12 with --cheap_metrics (the attention-capture hook
+# materializes the full B x n_head x T x T tensor and gives up flash attention;
+# drop --cheap_metrics if you need the headroom). train.py logs peak_mem_gb to
+# W&B each log interval, so a short probe measures this rather than guessing.
+#
+# If a reversible arm OOMs where the baseline fits (its residual stream is
+# 2*n_embd wide, ~15-20% more block activations), halve BATCH_SIZE and double
+# GRAD_ACCUM_STEPS -- the gradient is unchanged.
 MODEL_SIZE=${MODEL_SIZE:-small}
 
 case "${MODEL_SIZE}" in
@@ -112,13 +131,24 @@ case "${MODEL_SIZE}" in
     MAX_STEPS=10001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
     EVAL_INTERVAL=100; EVAL_BATCHES=50; LOG_INTERVAL=50
     ;;
-  small)    # 123.6M non-positional params -- the TinyStories 12L recipe
+  small)    # 123.6M non-positional params -- paper TS 12L recipe, matched exactly
     N_LAYER=12; N_HEAD=12; N_EMBD=768;  BLOCK_SIZE=1024
-    BATCH_SIZE=12; GRAD_ACCUM_STEPS=10          # 122,880 tokens/step
-    MAX_STEPS=20001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
-    EVAL_INTERVAL=250; EVAL_BATCHES=50; LOG_INTERVAL=50
+    # 12x40 = 480 sequences = 491,520 tokens/step, identical to the paper's 30x16:
+    # accumulation is loss-scaled (train.py), so the micro-batch/accum split is a
+    # pure memory-vs-speed choice and does not change the gradient. Micro-batch 12
+    # measures ~25 GB peak; micro-batch 30 would not fit a 40GB card.
+    BATCH_SIZE=12; GRAD_ACCUM_STEPS=40          # 491,520 tokens/step
+    # 10001 steps x 491,520 = 4.92B tokens = 10.4 TinyStories epochs (~960 steps
+    # per epoch). Paper's val loss bottoms out near step 7.6k and overfits after,
+    # so report BOTH best and final val -- train.py tracks best_val already.
+    MAX_STEPS=10001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
+    EVAL_INTERVAL=200; EVAL_BATCHES=50; LOG_INTERVAL=50
     ;;
-  medium)   # 353.6M non-positional params -- LR/warmup scaled down but UNTUNED
+  medium)   # 353.6M non-positional params
+    # WARNING: off-paper. The paper trains 24L/16H/1024d on OpenWebText only, at
+    # muon_lr 0.006 / adamw 6e-4 / 30k steps / 3k warmup -- never on TinyStories
+    # (354M params over 471.6M tokens overfits hard). The values below are a
+    # scaled-down guess and are NOT the paper's recipe; fix before relying on them.
     N_LAYER=24; N_HEAD=16; N_EMBD=1024; BLOCK_SIZE=1024
     BATCH_SIZE=6;  GRAD_ACCUM_STEPS=20          # 122,880 tokens/step
     MAX_STEPS=20001; WARMUP_STEPS=2000; PEAK_LR=3e-4; MUON_LR=0.02
