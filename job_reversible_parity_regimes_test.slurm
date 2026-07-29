@@ -1,34 +1,57 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# job_reversible_parity_regimes_test.slurm — 200-step SMOKE TEST of
-# job_reversible_parity_regimes.slurm. Two arms, ~1/50th of the wall clock.
+# job_reversible_parity_regimes_test.slurm — 200-step SMOKE TEST + attention
+# A/B for job_reversible_parity_regimes.slurm. Four arms, ~1/50th of the wall
+# clock each: {baseline, reversible vf_scaling} x {--attn_impl manual, sdpa}.
 #
 # THIS IS NOT AN EXPERIMENT. 200 steps at a 20-step warmup is nowhere near
-# convergence and the LR schedule is compressed 50x, so the losses here mean
-# nothing about the architectures. Do not compare arms on this output. What it
-# DOES verify, cheaply, before you commit ~20 GPU-hours to the real sweep:
+# convergence and the LR schedule is compressed 50x, so the losses here say
+# nothing about the architectures. Do not compare BASELINE vs REVERSIBLE on this
+# output. Comparing MANUAL vs SDPA within one arch is exactly what it is for.
 #
-#   * the job lands on a GPU that can actually run this (an A100/H100, not the
-#     16GB P100s that pre-Ampere nodes in GPUQ will hand you) -- see the GPU
-#     sanity check near the bottom
-#   * peak_mem_gb at the REAL micro-batch and accumulation (12 x 40), so the
-#     memory probe is representative -- this is why the batching is NOT reduced
-#   * tokens_per_sec, so you can extrapolate the real run's wall clock and check
-#     the 24h limit on the full job is enough
-#   * both arms build, train, eval, sample and log to W&B
-#   * the param census prints matching totals: baseline vs vf_scaling/narrow
-#     should differ by exactly +18,432 at 'small' (the 2*n_embd*n_layer
-#     gamma/alpha vectors) -- if that number is wrong, parity is broken
+#   ID  run dir                          arch        --attn_impl
+#    0  baseline_baseline_manual         baseline    manual   (current default)
+#    1  baseline_baseline_sdpa           baseline    sdpa     (fused/flash)
+#    2  reversible_vf_narrow_manual      vf_scaling  manual
+#    3  reversible_vf_narrow_sdpa        vf_scaling  sdpa
 #
-#   ID  run dir                   regime        notes
-#    0  baseline                  —             vanilla transformer (reference)
-#    1  reversible_vf_scaling     vf_scaling    no centering, volume free
+# What to read off, per arch (compare 0 vs 1, and 2 vs 3):
 #
-# Arm 1 is vf_scaling rather than vpb_baseline deliberately: its gamma/alpha are
-# trainable, so it exercises strictly more code than the frozen regime -- the
-# rev_scale_params optimizer group, the --rev_scale_lr_mult path, and the
-# cheap_metrics gamma/alpha/log|det| logging. It is the arm most likely to break.
-# To smoke-test a different regime instead, edit TASK_ARGS below.
+#   * peak_mem_gb      sdpa should be MUCH lower. Manual measured ~25GB at
+#                      'small'; the three live (B,nh,T,T) bf16 tensors it builds
+#                      per layer are ~906MB each at B=12/T=1024, ~10GB over 12
+#                      layers. If sdpa is not clearly below manual, the fused
+#                      backend silently fell back to the math kernel -- run
+#                      `python -m test_attn_impl` on the node, which asserts a
+#                      fused backend is actually reachable at these shapes.
+#   * tokens_per_sec   sdpa should be higher. Manual measured ~62k tok/s
+#                      (7.95 s/step baseline, 8.35 s/step reversible). Expect
+#                      roughly 1.3-1.8x; attention is only ~13% of total FLOPs,
+#                      so the win is memory traffic, not arithmetic.
+#   * loss curve       manual and sdpa must track each other CLOSELY but not
+#                      exactly (same function, different reduction order). Same
+#                      seed and same deterministic batch order, so early steps
+#                      should agree to ~1e-3 and drift slowly. A visible gap
+#                      means the two paths are NOT computing the same thing --
+#                      stop and investigate before trusting either.
+#   * [params] lines   must be IDENTICAL between manual and sdpa (attn_impl adds
+#                      no parameters), and baseline vs vf_scaling/narrow must
+#                      differ by exactly +18,432 at 'small' (the 2*n_embd*n_layer
+#                      gamma/alpha vectors). If not, parity is broken.
+#   * GPU preflight    the job must land on Ampere or newer -- pre-sm80 cards
+#                      have no native bf16 and no flash SDPA, so 'sdpa' there is
+#                      correct but pointless. See the preflight near the bottom.
+#
+# The reversible arm is vf_scaling rather than vpb_baseline deliberately: its
+# gamma/alpha are trainable, so it exercises strictly more code than the frozen
+# regime -- the rev_scale_params optimizer group, the --rev_scale_lr_mult path,
+# and the cheap_metrics gamma/alpha/log|det| logging. It is the arm most likely
+# to break. To smoke-test a different regime, edit TASK_ARGS below.
+#
+# NOTE: --cheap_metrics forces the MANUAL path for one forward per eval on the
+# small cheap_batch (the fused kernel never builds the attention matrix those
+# diagnostics need). That is by design and costs little, but it means peak_mem_gb
+# for the sdpa arms still includes one manual forward at cheap_batch_size=8.
 #
 # Parameter parity
 # ----------------
@@ -64,9 +87,16 @@
 #           sbatch --export=ALL,MODEL_SIZE=tiny --mem=8G --gres=gpu:1 \
 #                  job_reversible_parity_regimes_test.slurm
 #
-# Then read the two task outputs for: the GPU name (must be Ampere or newer),
-# peak_mem_gb, tokens_per_sec, and the two [params] lines. If all four look
-# right, submit job_reversible_parity_regimes.slurm for real.
+# Also worth running on the node first (seconds, no queue): the equivalence suite,
+# whose CUDA-only check asserts a FUSED backend is actually reachable at these
+# shapes. If it reports no fused backend, the sdpa arms here will show no gain.
+#           python -m test_attn_impl
+#
+# Compare the four task outputs pairwise (0 vs 1, 2 vs 3) on peak_mem_gb,
+# tokens_per_sec, loss curve and [params]; see the checklist at the top. If sdpa
+# wins on both memory and speed with a matching loss curve, switch the real job to
+# --attn_impl sdpa -- and RERUN ALL FIVE ARMS there, never mixing kernels within
+# one comparison.
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=revparityreg_test
@@ -76,12 +106,14 @@
 # These three must match the DEFAULT MODEL_SIZE below ('small'), since sbatch reads
 # them from the file before the script runs. To submit at another size, pass the
 # matching --mem/--gres on the sbatch command line (they override these).
-# --time is 1h rather than the real job's 24h: 200 steps x 40 accum = 8,000
+# --time is 1h rather than the real job's 48h: 200 steps x 40 accum = 8,000
 # micro-steps, ~1/50th of the full run's 400,040, plus startup and data loading.
+# At the measured 7.95-8.35 s/step that is ~27 min per task; the four tasks run as
+# independent array jobs, so 1h is per task, not for all four.
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
-#SBATCH --array=0-1                        # baseline + vf_scaling, both narrow
+#SBATCH --array=0-3                        # {baseline, vf_scaling} x {manual, sdpa}
 #SBATCH --output=output_revparityregtest_%A_%a.txt
 #SBATCH --error=output_revparityregtest_%A_%a.err
 
@@ -219,16 +251,22 @@ COMMON_ARGS=(
 #   readout=x   -> z_final can't reach the logits, so the last MLP gets no grad
 NARROW="--rev_embed narrow --rev_lift dup --rev_readout sum"
 
-# Two arms only. To smoke-test a different regime, swap vf_scaling below for
-# vpb_baseline / vpb_scaling / vpm_scaling (vpm additionally needs
-# --rev_lambda ${REV_LAMBDA}). Keep --array (top) in sync with this.
+# Each arch runs twice, once per attention kernel, so the A/B is within-arch:
+# manual vs sdpa on the same weights init, same seed, same batch order. To
+# smoke-test a different regime, swap vf_scaling below for vpb_baseline /
+# vpb_scaling / vpm_scaling (vpm additionally needs --rev_lambda ${REV_LAMBDA}).
+# Keep --array (top) in sync with this.
 NAMES=(
-  baseline
-  reversible_vf_scaling
+  baseline_manual
+  baseline_sdpa
+  reversible_vf_manual
+  reversible_vf_sdpa
 )
 TASK_ARGS=(
-  "--arch baseline --run_name baseline"
-  "--arch reversible --rev_regime vf_scaling   ${NARROW} --run_name vf_scaling_narrow"
+  "--arch baseline --attn_impl manual --run_name baseline_manual"
+  "--arch baseline --attn_impl sdpa   --run_name baseline_sdpa"
+  "--arch reversible --rev_regime vf_scaling ${NARROW} --attn_impl manual --run_name vf_narrow_manual"
+  "--arch reversible --rev_regime vf_scaling ${NARROW} --attn_impl sdpa   --run_name vf_narrow_sdpa"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}
