@@ -44,6 +44,27 @@
 # Muon optimizes the 2D hidden weight matrices (attn/MLP); AdamW handles
 # embeddings, lm_head, norms, biases and the reversible scaling vectors.
 #
+# Attention kernel
+# ----------------
+# All five arms run --attn_impl sdpa (fused/flash, F.scaled_dot_product_attention).
+# job_reversible_parity_regimes_test.slurm A/B'd it against the explicit 'manual'
+# path at 'small' for both archs, 200 steps, same seed and batch order:
+#
+#   peak_mem_gb      24.4 -> 13.5 (baseline)      25.3 -> 14.4 (reversible vf)
+#   tokens_per_sec   59.9k -> 160.9k (2.69x)      51.3k -> 141.8k (2.77x)
+#
+# The two kernels compute the same function: train_loss at step 0 agrees to
+# 3.8e-05 absolute / 3.5e-06 relative, i.e. bf16 reduction order and nothing else.
+# Divergence stays at ~1e-5 through step 10, jumps two orders of magnitude exactly
+# at the end of warmup when the LR peaks (Muon's Newton-Schulz amplifies small
+# perturbations), then PLATEAUS at ~1e-2 absolute / ~0.4% relative rather than
+# growing. On the reversible pair the gap also changes sign repeatedly and shrinks
+# back to 6e-05 at one point, so it is trajectory noise, not a kernel bias.
+#
+# That 0.4% is the same order as some of the regime differences this sweep exists
+# to detect, so NEVER mix kernels within one comparison. train.py logs attn_impl
+# to the W&B config; filter earlier manual runs out of any analysis with it.
+#
 # The 'small' size (the default) matches the paper's TinyStories 12L recipe
 # exactly: 491,520 tokens/step (12x40x1024, same effective batch as the paper's
 # 30x16), 10k steps = 4.92B tokens = 10.4 epochs, warmup 1k, Muon 0.02, AdamW
@@ -62,7 +83,9 @@
 #                  --gres=gpu:1 job_reversible_parity_regimes.slurm
 #           (see the MODEL_SIZE switch below for the per-size resources)
 # Analyze:  python analyze_wandb.py --filter_config n_embd=768 block_size=1024 \
-#               --format pdf --out_dir plots/revparity_regimes
+#               attn_impl=sdpa --format pdf --out_dir plots/revparity_regimes
+#           (attn_impl=sdpa excludes earlier manual-kernel runs at this geometry --
+#            see the "Attention kernel" note below for why that matters)
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=reversible_parity_regimes
@@ -74,7 +97,13 @@
 # matching --mem/--time/--gres on the sbatch command line (they override these).
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+# Was 48h when this ran the manual kernel at 7.95 s/step. With --attn_impl sdpa
+# the smoke test measured 3.05 s/step (baseline) and 3.47 s/step (reversible vf)
+# at 'small', evals included, so 10,001 steps is ~8.5h / ~9.7h -- and those rates
+# amortize startup over only 200 steps, so they are pessimistic here. 16h leaves
+# ~1.6x headroom over the slowest arm, and a shorter wall queues sooner on GPUQ.
+# Check the partition allows it: sinfo -p GPUQ -o "%P %l"
+#SBATCH --time=16:00:00
 #SBATCH --array=0-4                        # baseline + 4 regimes, all narrow
 #SBATCH --output=output_revparityreg_%A_%a.txt
 #SBATCH --error=output_revparityreg_%A_%a.err
@@ -103,8 +132,11 @@ mkdir -p "${OUTDIR}"
 # submitting at another size, pass the matching resources on the command line --
 # sbatch CLI args override the in-file directives:
 #   tiny    --mem=8G  --time=02:00:00 --gres=gpu:1
-#   small   --mem=32G --time=24:00:00 --gres=gpu:a100:1     (the default)
+#   small   --mem=32G --time=16:00:00 --gres=gpu:a100:1     (the default)
 #   medium  --mem=48G --time=24:00:00 --gres=gpu:a100:1
+#
+# 'medium' keeps its 6x20 split: sdpa frees memory there too, but nothing has been
+# measured at that geometry, and it is off-paper anyway (see its case below).
 #
 # --mem is HOST RAM, not GPU, and is dataset-driven rather than model-driven:
 # data.load_bin() copies the whole token file into RAM for train and val both
@@ -113,15 +145,28 @@ mkdir -p "${OUTDIR}"
 #
 # GPU memory instead scales with BATCH_SIZE (the micro-batch), NOT with
 # GRAD_ACCUM_STEPS -- each micro-step's activations are freed after its backward,
-# so raising accumulation costs wall-clock, not memory. Measured ~25 GB peak at
-# small/BATCH_SIZE=12 with --cheap_metrics (the attention-capture hook
-# materializes the full B x n_head x T x T tensor and gives up flash attention;
-# drop --cheap_metrics if you need the headroom). train.py logs peak_mem_gb to
-# W&B each log interval, so a short probe measures this rather than guessing.
+# so raising accumulation costs wall-clock, not memory. Measured at 'small' with
+# --cheap_metrics and --attn_impl sdpa: 13.5 GB peak (baseline) / 14.4 GB
+# (reversible vf) at BATCH_SIZE=12. The manual kernel needed 24.4 / 25.3 GB for
+# that same batch, because it materializes three live (B, n_head, T, T) bf16
+# tensors per layer (~906 MB each at B=12/T=1024, ~10 GB over 12 layers).
+#
+# BATCH_SIZE below is 24, spending that freed memory on a larger micro-batch. Even
+# under the deliberately pessimistic assumption that ALL of the 14.4 GB scales
+# linearly with B, 24 lands at ~28.8 GB, inside a 40 GB card. It is not linear
+# (params, optimizer state and the cheap_metrics forward are fixed), so the real
+# figure is lower. train.py logs peak_mem_gb every log interval -- read it off the
+# first few log lines rather than trusting this estimate.
+#
+# --cheap_metrics still forces ONE manual forward per eval on the small
+# cheap_batch (the fused kernel never builds the attention matrix those
+# diagnostics need). That puts a fixed floor under peak_mem_gb which no batch
+# change removes; drop --cheap_metrics if you need the headroom.
 #
 # If a reversible arm OOMs where the baseline fits (its residual stream is
 # 2*n_embd wide, ~15-20% more block activations), halve BATCH_SIZE and double
-# GRAD_ACCUM_STEPS -- the gradient is unchanged.
+# GRAD_ACCUM_STEPS -- the gradient is unchanged. Back to 12x40 is the first thing
+# to try, and it is the exact split the numbers above were measured at.
 MODEL_SIZE=${MODEL_SIZE:-small}
 
 case "${MODEL_SIZE}" in
@@ -133,11 +178,15 @@ case "${MODEL_SIZE}" in
     ;;
   small)    # 123.6M non-positional params -- paper TS 12L recipe, matched exactly
     N_LAYER=12; N_HEAD=12; N_EMBD=768;  BLOCK_SIZE=1024
-    # 12x40 = 480 sequences = 491,520 tokens/step, identical to the paper's 30x16:
+    # 24x20 = 480 sequences = 491,520 tokens/step, identical to the paper's 30x16:
     # accumulation is loss-scaled (train.py), so the micro-batch/accum split is a
-    # pure memory-vs-speed choice and does not change the gradient. Micro-batch 12
-    # measures ~25 GB peak; micro-batch 30 would not fit a 40GB card.
-    BATCH_SIZE=12; GRAD_ACCUM_STEPS=40          # 491,520 tokens/step
+    # pure memory-vs-speed choice and does not change the gradient. Raised from
+    # 12x40 to spend the memory sdpa freed (see the block above) -- but expect only
+    # a few percent from it, NOT another 2x: halving the micro-step count amortizes
+    # per-micro-step host overhead and nothing else, since the FLOPs per optimizer
+    # step are identical either way. If it measures no faster, revert to 12x40 for
+    # the headroom; the gradient does not care.
+    BATCH_SIZE=24; GRAD_ACCUM_STEPS=20          # 491,520 tokens/step
     # 10001 steps x 491,520 = 4.92B tokens = 10.4 TinyStories epochs (~960 steps
     # per epoch). Paper's val loss bottoms out near step 7.6k and overfits after,
     # so report BOTH best and final val -- train.py tracks best_val already.
@@ -178,6 +227,9 @@ COMMON_ARGS=(
   --min_lr_ratio "${MIN_LR_RATIO}" --peak_lr "${PEAK_LR}"
   --rev_scale_lr_mult 10
   --optimizer muon --muon_lr "${MUON_LR}"
+  # Fused attention. See the "Attention kernel" note in the header for the A/B
+  # that justifies this; do not flip it for a subset of the arms.
+  --attn_impl sdpa
   --wandb --wandb_project sympformer-reversible
   --sample_interval "${EVAL_INTERVAL}" --sample_prefix_tokens 32 --sample_max_new_tokens 128
   --sample_temperature 0.8 --sample_top_k 40
@@ -219,6 +271,18 @@ NAME="${NAMES[$ID]}"
 log "Job meta: array_job=${SLURM_ARRAY_JOB_ID:-NA} task=${ID} experiment=${NAME} host=$(hostname)"
 log "Model size '${MODEL_SIZE}': ${N_LAYER}L/${N_HEAD}H/${N_EMBD}d block=${BLOCK_SIZE} batch=${BATCH_SIZE}x${GRAD_ACCUM_STEPS}"
 log "OUTDIR=${OUTDIR}"
+
+# ── GPU sanity check ──────────────────────────────────────────────────────────
+# A CUDA OOM at model.to(device) means the card was already full BEFORE we
+# allocated anything (a 124M model needs only ~0.5GB), i.e. GPU contention, not a
+# batch-size problem. Log which device we were given and what is already resident
+# so the task output answers that question instead of leaving it to guesswork.
+# memory.free here should be within a few hundred MB of memory.total; if it is
+# not, another process owns the card and this task will fail regardless of config.
+log "GPU alloc: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv 2>&1 || log "nvidia-smi unavailable"
+# Processes already holding memory on the visible device(s), if any:
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 || true
 
 # shellcheck disable=SC2086  (intentional word-splitting of TASK_ARGS)
 run python3 -u train.py "${COMMON_ARGS[@]}" ${TASK_ARGS[$ID]}

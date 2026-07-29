@@ -278,6 +278,32 @@ class ReversibleBlock(nn.Module):
             z = torch.exp(-alpha) * z + self.mlp(self.ln_2(x))
         return torch.cat([x, z], dim=-1)
 
+    def inverse(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
+        """Exact algebraic inverse of forward -- no fixed-point iteration. This is
+        what makes memory-efficient reversible backprop possible; see
+        revformer/rev_backprop.py.
+
+        Read x' straight off the output, use it to recover z, then use z to
+        recover x. Note forward's z-update already consumes the *updated* x, so
+        mlp(ln_2(x')) below is exactly the term forward added:
+
+            x' = e^-gamma * (x + Attn(LN_1(z)))  =>  x = e^gamma * x' - Attn(LN_1(z))
+            z' = e^-alpha * z + MLP(LN_2(x'))    =>  z = e^alpha * (z' - MLP(LN_2(x')))
+
+        Any active dropout inside attn/mlp must draw the SAME masks the forward
+        drew, or this returns a different tensor than it should -- rev_backprop
+        refuses to run when that cannot be guaranteed.
+        """
+        x, z = torch.split(y, y.shape[-1] // 2, dim=-1)      # x is x', z is z'
+        if self.frozen:
+            z = z - self.mlp(self.ln_2(x))
+            x = x - self.attn(self.ln_1(z))
+        else:
+            gamma, alpha = self._effective_gamma_alpha(avg)
+            z = torch.exp(alpha) * (z - self.mlp(self.ln_2(x)))
+            x = torch.exp(gamma) * x - self.attn(self.ln_1(z))
+        return torch.cat([x, z], dim=-1)
+
 
 class LinearMixedReversibleBlock(nn.Module):
     """Reversible block factored as  Y -> S_2 ∘ L ∘ S_1(Y)  (see linear_maps.py):
@@ -365,6 +391,16 @@ class RevFormerModel(nn.Module):
         self.lm_head = nn.Linear(emb_dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
+        # Memory-efficient reversible backprop (revformer/rev_backprop.py). Plain
+        # attributes rather than RevConfig fields on purpose: toggling them changes
+        # only how gradients are computed, never the function or the parameters, so
+        # checkpoints stay interchangeable between settings.
+        #   mem_efficient_segment: 0 = fully reversible (store nothing); k > 0 =
+        #   store the stack activation every k blocks and invert only within a
+        #   segment, which caps how far reconstruction error can compound.
+        self.mem_efficient = False
+        self.mem_efficient_segment = 0
+
         # Match GPTModel's initialization exactly for a fair comparison.
         self.apply(self._init_weights)
 
@@ -402,6 +438,18 @@ class RevFormerModel(nn.Module):
         avg = (gamma_avg + alpha_avg) / 2
         return avg - self.rev_cfg.lambd / (2 * n * d * T)
 
+    def _mem_efficient_active(self) -> bool:
+        """Whether this forward should run the O(1)-in-depth reversible backprop.
+
+        Requires all three: the flag on, gradients actually being taken (there is
+        nothing to save under no_grad / eval, and the eager path is cheaper), and a
+        stack of invertible blocks. Anything else falls back SILENTLY to the eager
+        loop -- an unsupported block type is not an error, just not eligible."""
+        if not self.mem_efficient or not torch.is_grad_enabled():
+            return False
+        from revformer.rev_backprop import stack_supported             # noqa: PLC0415
+        return stack_supported(self.blocks)
+
     def _lift(self, e: torch.Tensor) -> torch.Tensor:
         """n_embd-wide embedding -> 2*n_embd state (narrow embed only, no params)."""
         if self.rev_cfg.lift == "zeros":
@@ -413,9 +461,12 @@ class RevFormerModel(nn.Module):
         x, z = torch.split(y, self.cfg.n_embd, dim=-1)
         return x if self.rev_cfg.readout == "x" else x + z      # "sum"
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
-                global_step: Optional[int] = None):
-        B, T = idx.shape
+    def stack_input(self, idx: torch.Tensor):
+        """(y0, avg) for the block stack: the embedded+lifted input and the volume
+        correction every block receives. Factored out of forward so the
+        reconstruction-drift diagnostic in rev_backprop.py measures the *same*
+        stack the forward pass runs, rather than a re-derived copy of it."""
+        T = idx.shape[1]
         assert T <= self.cfg.block_size
         pos = torch.arange(0, T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)[None, :, :]
@@ -424,14 +475,23 @@ class RevFormerModel(nn.Module):
         x = self.drop(x)
         if self.narrow_emb:
             x = self._lift(x)
-
         # Only the global (vpm) regime needs a cross-block correction; the others
         # either self-center (vpb_scaling), are frozen (vpb_baseline), or apply
         # gamma/alpha directly (vf_scaling).
         avg = self._avg_corr(T) if self.rev_cfg.regime == "vpm_scaling" else 0.0
+        return x, avg
 
-        for blk in self.blocks:
-            x = blk(x, avg)
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
+                global_step: Optional[int] = None):
+        x, avg = self.stack_input(idx)
+
+        if self._mem_efficient_active():
+            from revformer.rev_backprop import run_reversible_stack   # noqa: PLC0415
+            x = run_reversible_stack(self.blocks, x, avg,
+                                     segment=self.mem_efficient_segment)
+        else:
+            for blk in self.blocks:
+                x = blk(x, avg)
 
         if self.narrow_emb:
             x = self._readout(x)

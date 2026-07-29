@@ -480,6 +480,26 @@ def main():
                          "(WY-vectorized orthogonal mixing, cheap+scalable), 'cayley' (dense, small-d only)")
     ap.add_argument("--rev_n_householder", type=int, default=4,
                     help="lowrank_cayley + rotation=householder: # Householder reflections")
+    # ---- memory-efficient reversible backprop (revformer/rev_backprop.py) ----
+    ap.add_argument("--mem_efficient", action="store_true",
+                    help="run the reversible block stack under no_grad and reconstruct "
+                         "activations in backward, making stack activation memory O(1) in "
+                         "depth for ~1.6x the stack's forward compute. Reversible archs "
+                         "only; falls back silently otherwise. See --mem_efficient_segment: "
+                         "under bf16 autocast the algebraic inverse is NOT accurate enough "
+                         "(measured 1-7% gradient error), so use segment=1 there.")
+    ap.add_argument("--mem_efficient_segment", type=int, default=0,
+                    help="0 = fully reversible, store nothing (accurate in fp32: ~2e-5 "
+                         "relative gradient error; NOT in bf16). k>0 = store the stack "
+                         "activation every k blocks and invert only within a segment. "
+                         "k=1 stores every block and never inverts, i.e. plain gradient "
+                         "checkpointing: bit-exact in any precision, ~9x less saved memory "
+                         "at 24 layers. Use 1 for bf16 runs.")
+    ap.add_argument("--track_recon_drift", action="store_true",
+                    help="log forward-then-invert reconstruction error per block "
+                         "(recon_drift, recon_drift_max) on the cheap-metrics cadence -- a "
+                         "direct measurement of the inverse map's conditioning through depth")
+
     # ---- embedding width: param parity against the baseline ----
     ap.add_argument("--rev_embed", choices=["wide", "narrow"], default="wide",
                     help="width of the token/pos tables, ln_f and tied lm_head. 'wide' (default, "
@@ -1112,6 +1132,26 @@ def main():
             raise ValueError(f"Unknown arch: {args.arch}")
 
     model.to(device)
+
+    # Memory-efficient reversible backprop: model attributes, not config fields, so
+    # toggling them cannot invalidate a checkpoint. Only RevFormerModel honours them;
+    # the model decides eligibility per forward and falls back silently.
+    if args.mem_efficient:
+        if not hasattr(model, "mem_efficient"):
+            raise SystemExit(f"--mem_efficient needs --arch reversible; got {args.arch}")
+        model.mem_efficient = True
+        model.mem_efficient_segment = int(args.mem_efficient_segment)
+        from revformer.rev_backprop import stack_supported
+        eligible = stack_supported(model.blocks)
+        print(f"[{args.arch}][mem_efficient] on, segment={model.mem_efficient_segment}, "
+              f"stack eligible={eligible}"
+              + ("" if eligible else " -> falling back to the eager autograd loop"))
+        if eligible and model.mem_efficient_segment != 1 and amp_dtype == torch.bfloat16:
+            print(f"[{args.arch}][mem_efficient] WARNING: segment="
+                  f"{model.mem_efficient_segment} with bf16 autocast. The algebraic "
+                  "inverse loses too much precision in bf16 (measured 1-7% relative "
+                  "gradient error); --mem_efficient_segment 1 is bit-exact.")
+
     # Optionally freeze learned integrator scalars (h, xi) so they stay fixed.
     if args.learn_h == 0:
         for n, p in model.named_parameters():
