@@ -35,6 +35,14 @@ class ModelConfig:
     dropout: float = 0.0
     bias: bool = False
 
+    # Softmax-attention kernel for CausalSelfAttention (baseline + reversible):
+    # "manual" materializes the explicit (B, nh, T, T) matrix; "sdpa" routes through
+    # F.scaled_dot_product_attention (fused/flash where the backend allows). The two
+    # are mathematically identical but differ in reduction order, so results are not
+    # bit-identical across them -- never mix impls within one comparison. Default is
+    # "manual" so existing runs are unaffected until switched deliberately.
+    attn_impl: str = "manual"
+
     # Presymp Variant A: use attention-induced velocity for MLP lookahead
     presymp_mlp_use_attn_vel: bool = False
 
@@ -90,9 +98,18 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
+        # See ModelConfig.attn_impl. getattr keeps configs built before this field
+        # existed working (they get the "manual" default).
+        self.attn_impl = getattr(cfg, "attn_impl", "manual")
+        if self.attn_impl not in ("manual", "sdpa"):
+            raise ValueError(f"attn_impl must be 'manual' or 'sdpa'; got {self.attn_impl!r}")
+        # SDPA applies dropout internally, so it needs the rate, not the module.
+        self.attn_dropout_p = float(cfg.dropout)
         # Optional capture hook for cheap attention-distribution metrics. When set
         # to a callable, it receives the post-softmax pre-dropout (B, n_head, T, T)
         # matrix and must not mutate it. Default None => no-op (zero overhead).
+        # NOTE: a fused kernel never builds that matrix, so attaching this hook
+        # forces the manual path for the duration (see forward).
         self._capture_attn = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -104,15 +121,30 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
-        m = causal_mask(T, x.device)
-        att = att.masked_fill(m.unsqueeze(0).unsqueeze(0), float("-inf"))
-        att = F.softmax(att, dim=-1)
-        if self._capture_attn is not None:
-            self._capture_attn(att)
-        att = self.attn_drop(att)
+        # Fast path: fused kernel, no (B, nh, T, T) tensor. Bypassed whenever a
+        # capture hook is attached, since cheap_metrics needs that explicit matrix
+        # -- that costs one manual forward per eval on the small cheap_batch, while
+        # every training step stays fused. `scale` is passed explicitly (rather than
+        # relying on SDPA's 1/sqrt(E) default) so the two paths are provably equal.
+        if self.attn_impl == "sdpa" and self._capture_attn is None:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=(self.attn_dropout_p if self.training else 0.0),
+                is_causal=True,
+                scale=self.scale,
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
+            m = causal_mask(T, x.device)
+            att = att.masked_fill(m.unsqueeze(0).unsqueeze(0), float("-inf"))
+            att = F.softmax(att, dim=-1)
+            if self._capture_attn is not None:
+                self._capture_attn(att)
+            att = self.attn_drop(att)
 
-        y = att @ v  # (B, nh, T, hd)
+            y = att @ v  # (B, nh, T, hd)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_drop(self.c_proj(y))
         return y

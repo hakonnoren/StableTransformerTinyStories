@@ -626,6 +626,13 @@ def main():
     ap.add_argument("--max_steps", type=int, default=10_000)
     ap.add_argument("--warmup_steps", type=int, default=1_000)
     ap.add_argument("--peak_lr", type=float, default=6e-4)
+    ap.add_argument("--attn_impl", choices=["manual", "sdpa"], default="manual",
+                    help="softmax-attention kernel for the baseline/reversible blocks. "
+                         "'manual' (default) materializes the explicit (B,nh,T,T) matrix; "
+                         "'sdpa' uses F.scaled_dot_product_attention (fused/flash), which "
+                         "is much lighter on memory at long context. Mathematically "
+                         "identical but not bit-identical (different reduction order), so "
+                         "never mix the two within one comparison -- rerun every arm.")
     ap.add_argument("--min_lr_ratio", type=float, default=0.1)
     ap.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -761,6 +768,7 @@ def main():
         n_embd=args.n_embd,
         dropout=args.dropout,
         bias=args.bias,
+        attn_impl=args.attn_impl,
     )
 
     if args.arch == "baseline":
