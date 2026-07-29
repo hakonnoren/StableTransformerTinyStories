@@ -1,57 +1,89 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# job_reversible_parity_regimes_test.slurm — 200-step SMOKE TEST + attention
-# A/B for job_reversible_parity_regimes.slurm. Four arms, ~1/50th of the wall
-# clock each: {baseline, reversible vf_scaling} x {--attn_impl manual, sdpa}.
+# job_reversible_parity_regimes_test.slurm — 200-step A/B of memory-efficient
+# reversible backprop, for job_reversible_parity_regimes.slurm. Six arms:
+# {vpb_baseline, vf_scaling} x {eager autograd, --mem_efficient_segment 1, 0}.
 #
-# THIS IS NOT AN EXPERIMENT. 200 steps at a 20-step warmup is nowhere near
-# convergence and the LR schedule is compressed 50x, so the losses here say
-# nothing about the architectures. Do not compare BASELINE vs REVERSIBLE on this
-# output. Comparing MANUAL vs SDPA within one arch is exactly what it is for.
+# THIS IS NOT AN EXPERIMENT ABOUT ARCHITECTURE. 200 steps at a 20-step warmup is
+# nowhere near convergence and the LR schedule is compressed 50x, so do not
+# compare vpb_baseline vs vf_scaling here. Comparing BACKPROP MODES within one
+# arch is exactly what it is for.
 #
-#   ID  run dir                          arch        --attn_impl
-#    0  baseline_baseline_manual         baseline    manual   (current default)
-#    1  baseline_baseline_sdpa           baseline    sdpa     (fused/flash)
-#    2  reversible_vf_narrow_manual      vf_scaling  manual
-#    3  reversible_vf_narrow_sdpa        vf_scaling  sdpa
+#   ID  run dir                      regime        backprop
+#    0  reversible_vpb_eager         vpb_baseline  ordinary autograd (reference)
+#    1  reversible_vpb_seg1          vpb_baseline  mem_efficient, segment=1
+#    2  reversible_vpb_seg0          vpb_baseline  mem_efficient, segment=0
+#    3  reversible_vf_eager          vf_scaling    ordinary autograd (reference)
+#    4  reversible_vf_seg1           vf_scaling    mem_efficient, segment=1
+#    5  reversible_vf_seg0           vf_scaling    mem_efficient, segment=0
 #
-# What to read off, per arch (compare 0 vs 1, and 2 vs 3):
+# The question
+# -----------
+# segment=0 runs the block stack under no_grad and reconstructs every activation
+# in backward by algebraically inverting each block -- O(1) activation memory in
+# depth, the actual payoff of reversibility. segment=1 stores every block's input
+# and never inverts (i.e. plain gradient checkpointing), which is bit-exact but
+# saves less.
 #
-#   * peak_mem_gb      sdpa should be MUCH lower. Manual measured ~25GB at
-#                      'small'; the three live (B,nh,T,T) bf16 tensors it builds
-#                      per layer are ~906MB each at B=12/T=1024, ~10GB over 12
-#                      layers. If sdpa is not clearly below manual, the fused
-#                      backend silently fell back to the math kernel -- run
-#                      `python -m test_attn_impl` on the node, which asserts a
-#                      fused backend is actually reachable at these shapes.
-#   * tokens_per_sec   sdpa should be higher. Manual measured ~62k tok/s
-#                      (7.95 s/step baseline, 8.35 s/step reversible). Expect
-#                      roughly 1.3-1.8x; attention is only ~13% of total FLOPs,
-#                      so the win is memory traffic, not arithmetic.
-#   * loss curve       manual and sdpa must track each other CLOSELY but not
-#                      exactly (same function, different reduction order). Same
-#                      seed and same deterministic batch order, so early steps
-#                      should agree to ~1e-3 and drift slowly. A visible gap
-#                      means the two paths are NOT computing the same thing --
-#                      stop and investigate before trusting either.
-#   * [params] lines   must be IDENTICAL between manual and sdpa (attn_impl adds
-#                      no parameters), and baseline vs vf_scaling/narrow must
-#                      differ by exactly +18,432 at 'small' (the 2*n_embd*n_layer
-#                      gamma/alpha vectors). If not, parity is broken.
-#   * GPU preflight    the job must land on Ampere or newer -- pre-sm80 cards
-#                      have no native bf16 and no flash SDPA, so 'sdpa' there is
-#                      correct but pointless. See the preflight near the bottom.
+# Measured offline on CPU: segment=1 gives bit-identical gradients in any
+# precision; segment=0 gives ~2e-5 relative gradient error in fp32 but 1.2-2.3e-2
+# in bf16 -- the bf16 sublayer recompute is a quantization floor, unaffected by
+# gamma/alpha init or by segmenting. That looked disqualifying.
 #
-# The reversible arm is vf_scaling rather than vpb_baseline deliberately: its
-# gamma/alpha are trainable, so it exercises strictly more code than the frozen
-# regime -- the rev_scale_params optimizer group, the --rev_scale_lr_mult path,
-# and the cheap_metrics gamma/alpha/log|det| logging. It is the arm most likely
-# to break. To smoke-test a different regime, edit TASK_ARGS below.
+# It may not be. Reformer (Kitaev et al. 2020) ships exactly this reconstruction,
+# additive coupling, with no precision handling whatsoever, and validates it on
+# LEARNING CURVES rather than gradient error -- the paper never measures
+# reconstruction error at all. And 1.6e-2 relative gradient error should be judged
+# against gradient NOISE: at 480 sequences / 491,520 tokens per step, minibatch
+# sampling noise is order 100% relative, ~2 orders of magnitude larger. So this
+# job asks the question the way Reformer did: does the loss curve care?
 #
-# NOTE: --cheap_metrics forces the MANUAL path for one forward per eval on the
-# small cheap_batch (the fused kernel never builds the attention matrix those
-# diagnostics need). That is by design and costs little, but it means peak_mem_gb
-# for the sdpa arms still includes one manual forward at cheap_batch_size=8.
+# What to read off, per arch (0 vs 1 vs 2, and 3 vs 4 vs 5)
+# ---------------------------------------------------------
+#   * step-0 train_loss   MUST BE IDENTICAL to the last digit across all three
+#                         modes of one arch. The forward is the same arithmetic in
+#                         the same order -- only the BACKWARD differs -- and this
+#                         was verified bit-identical offline. If step 0 differs at
+#                         all, something is wrong; stop and investigate. This is
+#                         the tripwire that makes the rest interpretable: every
+#                         later divergence is attributable to gradients alone.
+#   * loss curve          segment=1 should track eager essentially exactly
+#                         (bit-exact gradients; expect ~0 divergence, growing only
+#                         through optimizer chaos). segment=0 WILL drift. The
+#                         question is the CHARACTER of the drift: if it plateaus
+#                         and changes sign it is trajectory noise and bf16
+#                         inversion is fine; if it grows monotonically it is bias
+#                         and segment=1 is the answer. For calibration, the
+#                         manual-vs-sdpa A/B plateaued at ~0.4% relative and
+#                         changed sign repeatedly.
+#   * peak_mem_gb         Expect a MODEST drop, roughly 14.4 -> ~11.4 (seg=1) ->
+#                         ~10.6 GB (seg=0) at 'small'. Do NOT expect the 74x from
+#                         the offline saved-for-backward measurement: that counted
+#                         bytes stashed inside the STACK, and after --attn_impl
+#                         sdpa the stack is only ~3.9GB of the 14.4GB peak. The
+#                         rest is the loss head (logits at B*T*V = 618M elements,
+#                         bf16 plus the fp32 cross_entropy upcast plus the saved
+#                         log_softmax, ~6-8GB) and params+optimizer (~1.65GB),
+#                         neither of which this touches. The real claim is that
+#                         the stack term is FLAT IN DEPTH -- so the gap widens at
+#                         24L/48L, which is what makes 'medium' viable.
+#   * tokens_per_sec      seg=0 and seg=1 are SLOWER: one inverse plus one
+#                         recomputed forward per block on top of the gradient,
+#                         ~1.6x on the stack. This trade only makes sense when
+#                         memory is the binding constraint.
+#   * recon_drift_max     logged at every eval by --track_recon_drift. This is the
+#                         interesting scientific output: vpb_baseline freezes
+#                         gamma=alpha=0, so its drift should be CONSTANT, while
+#                         vf_scaling's gamma/alpha learn, so its drift should
+#                         EVOLVE -- error amplification through the inverse chain
+#                         goes like exp(sum_l gamma_l), and vf_scaling constrains
+#                         that sum not at all. A one-off measurement at init is
+#                         not representative; this is why it is logged over time.
+#
+# NOTE: --cheap_metrics forces the manual attention path for one forward per eval
+# on the small cheap_batch (the fused kernel never builds the attention matrix
+# those diagnostics need), so peak_mem_gb includes one such forward at
+# cheap_batch_size=8. All six arms use --attn_impl sdpa otherwise.
 #
 # Parameter parity
 # ----------------
@@ -87,16 +119,22 @@
 #           sbatch --export=ALL,MODEL_SIZE=tiny --mem=8G --gres=gpu:1 \
 #                  job_reversible_parity_regimes_test.slurm
 #
-# Also worth running on the node first (seconds, no queue): the equivalence suite,
-# whose CUDA-only check asserts a FUSED backend is actually reachable at these
-# shapes. If it reports no fused backend, the sdpa arms here will show no gain.
-#           python -m test_attn_impl
+# Worth running on the node first (seconds, no queue) -- the gradient-equivalence
+# suites, whose CUDA-only checks cannot run on a laptop:
+#           python -m test_attn_impl          # asserts a FUSED sdpa backend exists
 #
-# Compare the four task outputs pairwise (0 vs 1, 2 vs 3) on peak_mem_gb,
-# tokens_per_sec, loss curve and [params]; see the checklist at the top. If sdpa
-# wins on both memory and speed with a matching loss curve, switch the real job to
-# --attn_impl sdpa -- and RERUN ALL FIVE ARMS there, never mixing kernels within
-# one comparison.
+# Then compare within each arch (0/1/2 and 3/4/5): step-0 loss identical, then
+# loss curve, peak_mem_gb, tokens_per_sec, recon_drift_max. See the checklist at
+# the top.
+#
+# Outcome -> action:
+#   seg=0 tracks eager  ->  use --mem_efficient --mem_efficient_segment 0 in the
+#                           real job for O(1)-in-depth stack memory; this is what
+#                           makes 'medium' (24L) and deeper studies viable.
+#   seg=0 drifts, seg=1 clean -> use segment=1 (bit-exact, smaller win).
+#   step-0 loss differs at all -> a bug; do not use either.
+# Either way, do not MIX modes within one comparison: train.py logs mem_efficient
+# and mem_efficient_segment to the W&B config, so filter on them.
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=revparityreg_test
@@ -106,14 +144,15 @@
 # These three must match the DEFAULT MODEL_SIZE below ('small'), since sbatch reads
 # them from the file before the script runs. To submit at another size, pass the
 # matching --mem/--gres on the sbatch command line (they override these).
-# --time is 1h rather than the real job's 48h: 200 steps x 40 accum = 8,000
-# micro-steps, ~1/50th of the full run's 400,040, plus startup and data loading.
-# At the measured 7.95-8.35 s/step that is ~27 min per task; the four tasks run as
-# independent array jobs, so 1h is per task, not for all four.
+# --time is per TASK, not for the whole array (the six tasks are independent jobs).
+# With --attn_impl sdpa the real job measured 3.05-3.47 s/step, so 200 steps is
+# ~12 min eager. The mem_efficient arms add one inverse plus one recomputed forward
+# per block (~1.6x on the stack) and one drift pass per eval, so budget ~25 min.
+# 1h leaves room for startup, data loading and a slower node.
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
-#SBATCH --array=0-3                        # {baseline, vf_scaling} x {manual, sdpa}
+#SBATCH --array=0-5                        # {vpb_baseline, vf_scaling} x {eager, seg1, seg0}
 #SBATCH --output=output_revparityregtest_%A_%a.txt
 #SBATCH --error=output_revparityregtest_%A_%a.err
 
@@ -235,6 +274,12 @@ COMMON_ARGS=(
   # real sweep, and they share n_embd/block_size with it so a config filter alone
   # would not exclude them.
   --wandb --wandb_project sympformer-reversible-test
+  # sdpa for every arm: this A/B is about the BACKWARD pass, so the attention
+  # kernel must be held fixed (it was settled by the previous version of this job).
+  --attn_impl sdpa
+  # Logs recon_drift_max + per-layer drift at each eval. Costs one extra forward
+  # and one full inverse pass over the stack per eval, on a 4-sequence batch.
+  --track_recon_drift
   --sample_interval "${EVAL_INTERVAL}" --sample_prefix_tokens 32 --sample_max_new_tokens 128
   --sample_temperature 0.8 --sample_top_k 40
   --cheap_metrics
@@ -251,22 +296,37 @@ COMMON_ARGS=(
 #   readout=x   -> z_final can't reach the logits, so the last MLP gets no grad
 NARROW="--rev_embed narrow --rev_lift dup --rev_readout sum"
 
-# Each arch runs twice, once per attention kernel, so the A/B is within-arch:
-# manual vs sdpa on the same weights init, same seed, same batch order. To
-# smoke-test a different regime, swap vf_scaling below for vpb_baseline /
-# vpb_scaling / vpm_scaling (vpm additionally needs --rev_lambda ${REV_LAMBDA}).
+# Each regime runs three times -- eager / segment=1 / segment=0 -- on the same
+# init, seed and batch order, so the A/B is strictly within-arch. --attn_impl sdpa
+# and --track_recon_drift are in COMMON_ARGS, so every arm shares them (drift is a
+# property of the weights, measurable on the eager arms too).
+#
+# vpb_baseline and vf_scaling are the two ends of the conditioning question:
+# vpb_baseline freezes gamma=alpha=0, i.e. a purely ADDITIVE coupling -- exactly
+# Reformer's block, and the case with a global bound on the inverse's Lipschitz
+# constant. vf_scaling is AFFINE with the volume change unconstrained, which
+# Behrmann et al. (arXiv:2006.09347) show has only local bounds and can develop
+# arbitrarily large inverse-Jacobian singular values. If bf16 inversion is going
+# to fail anywhere, it fails on vf_scaling first.
+#
 # Keep --array (top) in sync with this.
 NAMES=(
-  baseline_manual
-  baseline_sdpa
-  reversible_vf_manual
-  reversible_vf_sdpa
+  reversible_vpb_eager
+  reversible_vpb_seg1
+  reversible_vpb_seg0
+  reversible_vf_eager
+  reversible_vf_seg1
+  reversible_vf_seg0
 )
+VPB="--rev_regime vpb_baseline ${NARROW}"
+VF="--rev_regime vf_scaling ${NARROW}"
 TASK_ARGS=(
-  "--arch baseline --attn_impl manual --run_name baseline_manual"
-  "--arch baseline --attn_impl sdpa   --run_name baseline_sdpa"
-  "--arch reversible --rev_regime vf_scaling ${NARROW} --attn_impl manual --run_name vf_narrow_manual"
-  "--arch reversible --rev_regime vf_scaling ${NARROW} --attn_impl sdpa   --run_name vf_narrow_sdpa"
+  "--arch reversible ${VPB} --run_name vpb_eager"
+  "--arch reversible ${VPB} --mem_efficient --mem_efficient_segment 1 --run_name vpb_seg1"
+  "--arch reversible ${VPB} --mem_efficient --mem_efficient_segment 0 --run_name vpb_seg0"
+  "--arch reversible ${VF}  --run_name vf_eager"
+  "--arch reversible ${VF}  --mem_efficient --mem_efficient_segment 1 --run_name vf_seg1"
+  "--arch reversible ${VF}  --mem_efficient --mem_efficient_segment 0 --run_name vf_seg0"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}

@@ -1255,6 +1255,24 @@ def main():
             track_repr=not args.cheap_no_repr,
         )
 
+    # Reconstruction-drift probe. Resolved once here (rather than per eval) so an
+    # ineligible arch is reported at startup instead of silently logging nothing.
+    drift_fn, drift_idx = None, None
+    if args.track_recon_drift:
+        try:
+            from revformer.rev_backprop import reconstruction_drift, stack_supported
+            if hasattr(model, "blocks") and stack_supported(model.blocks):
+                drift_fn = reconstruction_drift
+                dx, _ = next(val_it)
+                drift_idx = dx[:max(1, min(4, dx.shape[0]))].to(device)
+                print(f"[{args.arch}][drift] tracking reconstruction drift on a "
+                      f"{tuple(drift_idx.shape)} batch at every eval")
+            else:
+                print(f"[{args.arch}][drift] --track_recon_drift ignored: needs an "
+                      f"invertible ReversibleBlock stack")
+        except ImportError as e:
+            print(f"[{args.arch}][drift] --track_recon_drift unavailable: {e}")
+
     # Training loop
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
@@ -1392,6 +1410,21 @@ def main():
                 wandb_run.log({"val_loss": val_loss, "best_val": best_val, "lr": lr}, step=step)
             if cheap is not None:
                 cheap.snapshot(step)
+            # Reconstruction drift: forward the reversible stack keeping every
+            # activation, invert from the top, compare. Measures the conditioning of
+            # the inverse map at the CURRENT weights, so it moves as gamma/alpha
+            # learn -- a one-off measurement at init is not representative. Runs
+            # inside the same autocast context training uses, and under no_grad.
+            if args.track_recon_drift and drift_fn is not None:
+                with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype,
+                                    enabled=device.startswith("cuda")):
+                    d = drift_fn(model, drift_idx)
+                print(f"[{args.arch}][drift] step {step:6d} | max {d['recon_drift_max']:.3e} "
+                      f"| per-layer {[f'{v:.1e}' for v in d['recon_drift'][:4]]}...")
+                if wandb_run is not None:
+                    wandb_run.log({"recon_drift_max": d["recon_drift_max"],
+                                   **{f"recon_drift/l{i}": float(v)
+                                      for i, v in enumerate(d["recon_drift"])}}, step=step)
 
     # final checkpoint
     ckpt_path = os.path.join(run_dir, f"final_{args.arch}.pt")
