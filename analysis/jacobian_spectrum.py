@@ -335,6 +335,15 @@ def _gb(n: int, dtype) -> float:
 
 
 def run_arm(name: str, path: str, ids: torch.Tensor, args, dtype) -> tuple[list[dict], dict]:
+    """Every Jacobian for one arm. Records are STREAMED, not returned-then-written.
+
+    A single reversible arm is hours of SVD, so a run that hits the wall clock or
+    gets killed partway is a normal outcome, not an exception. Writing the JSONL
+    only at the end made those runs produce a directory full of .npy spectra and no
+    records at all — everything computed, nothing readable. The record file and the
+    manifest are therefore opened and flushed as we go, so whatever finished is
+    usable immediately.
+    """
     t_load = time.time()
     model, meta = load_model(path, device="cpu")
     n_switched = set_attn_impl(model, args.attn_impl)
@@ -356,11 +365,62 @@ def run_arm(name: str, path: str, ids: torch.Tensor, args, dtype) -> tuple[list[
           f"attn_impl={args.attn_impl} on {n_switched} modules, "
           f"loaded in {time.time() - t_load:.1f}s)", flush=True)
 
+    # Manifest before the first Jacobian: provenance is what makes a partial run
+    # interpretable, so it must not depend on the run completing.
+    manifest = {
+        "arm": name, "ckpt": path, "meta": meta,
+        "seq_len": T, "width": C, "n_dim": n, "layers": layers,
+        "n_points": int(ids.shape[0]), "dtype": args.dtype,
+        "attn_impl": args.attn_impl, "chunk": args.chunk,
+        "svd_driver": args.svd_driver, "device": args.device,
+        "seed": args.seed, "val_bin": args.val_bin,
+        "token_ids": ids.tolist(),
+        "torch": torch.__version__,
+        "complete": False,
+    }
+    os.makedirs(args.out_dir, exist_ok=True)
+    man_path = os.path.join(args.out_dir, f"manifest_{name}.json")
+    rec_path = os.path.join(args.out_dir, f"spectrum_{name}.jsonl")
+    with open(man_path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    # --resume: one reversible arm is 24 SVDs at 5-15 min each, so a task that dies
+    # at hour 5 of 8 has real work in it. Reload the (layer, point) pairs already on
+    # disk and append rather than truncating. A record only counts as done if its
+    # .npy is present too (unless --save_sv is off), so a record flushed just before
+    # the process died without its spectrum is recomputed rather than trusted.
     recs = []
+    done = set()
+    if args.resume and os.path.exists(rec_path):
+        sv_dir = os.path.join(args.out_dir, "sv")
+        for line in open(rec_path):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[{name}] resume: ignoring a truncated final record", flush=True)
+                continue
+            if r.get("seq_len") != T or r.get("dtype") != args.dtype:
+                continue                      # different geometry: not reusable
+            if args.save_sv and not args.skip_svd:
+                f = os.path.join(sv_dir, f"{name}_L{r['layer']:02d}_p{r['point']}_T{T}.npy")
+                if not os.path.exists(f):
+                    continue
+            done.add((r["layer"], r["point"]))
+            recs.append(r)
+        print(f"[{name}] resume: {len(done)} of {len(layers) * ids.shape[0]} "
+              f"(layer, point) pairs already complete", flush=True)
+
+    rec_fh = open(rec_path, "a" if done else "w")
     for layer in layers:
         ana_ld = analytic_logdet(model, layer, avg, T)
         fn = block_fn(model, layer, avg)
         for p in range(ids.shape[0]):
+            if (layer, p) in done:
+                print(f"  L{layer:02d} p{p} | skipped (already on disk)", flush=True)
+                continue
             x0 = caps[layer][p:p + 1].contiguous()
             t0 = time.time()
             J, fb = build_jacobian(fn, x0, chunk=args.chunk, verbose=args.verbose)
@@ -407,6 +467,10 @@ def run_arm(name: str, path: str, ids: torch.Tensor, args, dtype) -> tuple[list[
                 torch.cuda.reset_peak_memory_stats()
                 torch.cuda.empty_cache()
             recs.append(rec)
+            # Flush per record, not per arm: this line is the difference between a
+            # killed run being readable and being 24 orphaned .npy files.
+            rec_fh.write(json.dumps(rec) + "\n")
+            rec_fh.flush()
 
             nan = float("nan")
             ld = rec.get("sum_log_sigma", nan)
@@ -420,16 +484,13 @@ def run_arm(name: str, path: str, ids: torch.Tensor, args, dtype) -> tuple[list[
                   f"fd {nan if fd_err is None else fd_err:.2e} "
                   f"causal {cz:.2e}", flush=True)
 
-    manifest = {
-        "arm": name, "ckpt": path, "meta": meta,
-        "seq_len": T, "width": C, "n_dim": n, "layers": layers,
-        "n_points": int(ids.shape[0]), "dtype": args.dtype,
-        "attn_impl": args.attn_impl, "chunk": args.chunk,
-        "svd_driver": args.svd_driver, "device": args.device,
-        "seed": args.seed, "val_bin": args.val_bin,
-        "token_ids": ids.tolist(),
-        "torch": torch.__version__,
-    }
+    rec_fh.close()
+    # Only now is the run known to have finished every (layer, point). Anything
+    # reading these files can distinguish "still going / died" from "done".
+    manifest["complete"] = True
+    manifest["n_records"] = len(recs)
+    with open(man_path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
     return recs, manifest
 
 
@@ -469,6 +530,11 @@ def main():
     ap.add_argument("--skip_svd", action="store_true",
                     help="build J and run the checks only (timing/memory probe)")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep (layer, point) pairs already present in "
+                         "spectrum_<arm>.jsonl (with their .npy) and compute only "
+                         "the rest. Safe to pass always; without an existing record "
+                         "file it is a no-op.")
     args = ap.parse_args()
 
     found = discover(args.ckpt_dir)
@@ -504,12 +570,8 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     for name in names:
-        recs, manifest = run_arm(name, found[name], ids, args, dtype)
-        with open(os.path.join(args.out_dir, f"spectrum_{name}.jsonl"), "w") as fh:
-            for r in recs:
-                fh.write(json.dumps(r) + "\n")
-        with open(os.path.join(args.out_dir, f"manifest_{name}.json"), "w") as fh:
-            json.dump(manifest, fh, indent=2)
+        # run_arm owns both output files and streams to them; nothing to write here.
+        recs, _ = run_arm(name, found[name], ids, args, dtype)
         print(f"[{name}] wrote {len(recs)} records -> "
               f"{args.out_dir}/spectrum_{name}.jsonl", flush=True)
 

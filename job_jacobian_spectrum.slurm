@@ -126,6 +126,16 @@
 #SBATCH --array=0-4                        # one task per arm; see the table above
 #SBATCH --output=output_jacspec_%A_%a.txt
 #SBATCH --error=output_jacspec_%A_%a.err
+# Allow the GPU-usability probe below to put a task back in the queue when it lands
+# on a node whose card cannot create a CUDA context. Without this, `scontrol
+# requeue` is refused and the task just dies.
+#SBATCH --requeue
+# idun-07-06 failed all three reversible tasks of array 25002324 this way (see the
+# probe for the evidence). The probe now excludes a bad node dynamically, so this
+# line is belt-and-braces for the node we already know about — drop it once 07-06 is
+# fixed, and override per-submission with `sbatch --exclude=...` (the command line
+# wins over this directive).
+#SBATCH --exclude=idun-07-06
 
 #SBATCH --mail-user=hakon.noren@ntnu.no
 #SBATCH --mail-type=ALL
@@ -209,6 +219,50 @@ run python3 -u -m analysis.jacobian_spectrum --ckpt_dir "${CKPT_DIR}" --list_arm
 log "GPU alloc: SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv 2>&1 || log "nvidia-smi unavailable"
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 || true
+
+# ── GPU USABILITY PROBE — do not remove ───────────────────────────────────────
+# nvidia-smi reporting a healthy card is NOT sufficient. In array 25002324 tasks
+# 1, 2 and 3 all died 6 s in, at `model.to('cuda')`, with
+#
+#   torch.AcceleratorError: CUDA error: out of memory
+#
+# while the preflight smi on the SAME line printed "40960 MiB total, 0 MiB used,
+# 40442 MiB free" and an empty compute-apps table. The model is ~1 GB in fp64, so
+# this was never a sizing problem: the card could not create a CUDA context at
+# all. Tasks 0 and 4 ran to completion on other nodes with identical settings, and
+# all three failures were on idun-07-06.
+#
+# A node whose GPU cannot create a context is indistinguishable from a healthy one
+# until something tries to allocate, so allocate here — 3 s of probe instead of an
+# array task that dies after the 6 s model load having written nothing.
+GPU_PROBE=$(python3 -u -c "
+import torch
+torch.zeros(1, device='cuda'); torch.cuda.synchronize()
+free, total = torch.cuda.mem_get_info()
+print(f'{torch.cuda.get_device_name(0)} | allocatable {free/2**30:.1f} / {total/2**30:.1f} GiB')
+" 2>&1)
+PROBE_STATUS=$?
+if [[ ${PROBE_STATUS} -ne 0 ]]; then
+  log "ERROR: GPU on $(hostname -s) is unusable despite nvidia-smi looking healthy:"
+  log "  ${GPU_PROBE}"
+  RESTARTS=${SLURM_RESTART_COUNT:-0}
+  if [[ -n "${SLURM_JOB_ID:-}" ]] && (( RESTARTS < 3 )); then
+    # Exclude THIS node before requeueing, otherwise Slurm is free to hand the task
+    # straight back to the same broken card and we burn all three restarts on it.
+    log "Adding $(hostname -s) to this task's exclude list and requeueing (restart ${RESTARTS} -> $((RESTARTS+1)))."
+    scontrol update jobid="${SLURM_JOB_ID}" ExcNodeList="$(hostname -s)" 2>&1 | while read -r l; do log "  scontrol: ${l}"; done
+    if scontrol requeue "${SLURM_JOB_ID}"; then
+      log "Requeued. Exiting; Slurm will restart this task elsewhere."
+      exit 1
+    fi
+    log "requeue failed — giving up on this task."
+  else
+    log "Not requeueing (SLURM_RESTART_COUNT=${RESTARTS}). Resubmit with:"
+    log "  sbatch --exclude=$(hostname -s) --array=${ID} job_jacobian_spectrum.slurm"
+  fi
+  exit 1
+fi
+log "GPU probe OK: ${GPU_PROBE}"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 ARGS=(
