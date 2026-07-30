@@ -277,7 +277,7 @@
 # (8.5-9.7 h); segL trades that ~1.46x for memory flat in depth.
 # Check the partition allows it: sinfo -p GPUQ -o "%P %l"
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3                        # 4 volume regimes, all narrow, all segL
+#SBATCH --array=0                        # 4 volume regimes, all narrow, all segL
 #SBATCH --output=output_revparityregrevback_%A_%a.txt
 #SBATCH --error=output_revparityregrevback_%A_%a.err
 
@@ -412,15 +412,15 @@ SEGL="--mem_efficient --mem_efficient_segment ${N_LAYER}"
 
 NAMES=(
   reversible_vpb_baseline
-  reversible_vpm_scaling
-  reversible_vpb_scaling
-  reversible_vf_scaling
+  #reversible_vpm_scaling
+  #reversible_vpb_scaling
+  #reversible_vf_scaling
 )
 TASK_ARGS=(
   "--arch reversible --rev_regime vpb_baseline ${NARROW} ${SEGL} --run_name vpb_baseline_narrow"
-  "--arch reversible --rev_regime vpm_scaling  ${NARROW} ${SEGL} --run_name vpm_scaling_narrow --rev_lambda ${REV_LAMBDA}"
-  "--arch reversible --rev_regime vpb_scaling  ${NARROW} ${SEGL} --run_name vpb_scaling_narrow"
-  "--arch reversible --rev_regime vf_scaling   ${NARROW} ${SEGL} --run_name vf_scaling_narrow"
+  #"--arch reversible --rev_regime vpm_scaling  ${NARROW} ${SEGL} --run_name vpm_scaling_narrow --rev_lambda ${REV_LAMBDA}"
+  #"--arch reversible --rev_regime vpb_scaling  ${NARROW} ${SEGL} --run_name vpb_scaling_narrow"
+  #"--arch reversible --rev_regime vf_scaling   ${NARROW} ${SEGL} --run_name vf_scaling_narrow"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}
