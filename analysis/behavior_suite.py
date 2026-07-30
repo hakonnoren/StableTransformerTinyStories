@@ -49,55 +49,14 @@ EOT = 50256  # gpt2
 
 
 # ---------------------------------------------------------------- loader
-def _model_cfg(cfg_dict):
-    fields = {"vocab_size", "block_size", "n_layer", "n_head", "n_embd",
-              "dropout", "bias", "presymp_mlp_use_attn_vel"}
-    return ModelConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
-
-
-def load_model(path, device="cpu"):
-    ck = torch.load(path, map_location=device, weights_only=False)
-    cfg, a = _model_cfg(ck["cfg"]), ck.get("args", {})
-    arch = a.get("arch", "baseline")
-    g = a.get
-    if arch == "baseline":
-        m = GPTModel(cfg, no_mlp=g("no_mlp", False))
-    elif arch == "reversible":
-        m = RevFormerModel(cfg, RevConfig(
-            regime=g("rev_regime", "vpm_scaling"), lambd=g("rev_lambda", 0.0),
-            epsilon=g("rev_epsilon", 1.0), randn_init=g("rev_randn_init", False),
-            tanh_scale=g("rev_tanh", False)))
-    elif arch == "yurii_lt":
-        m = YuriiFormerModel(cfg, use_v0_init=not g("no_v0_init", False),
-                             noise_eta=g("yurii_noise_eta", 0.0), noise_gamma=g("yurii_noise_gamma", 0.55),
-                             noise_loc=g("yurii_noise_loc", "v"), restart_mode=g("yurii_restart", "none"),
-                             restart_min_layer=g("yurii_restart_min_layer", 1), no_mlp=g("no_mlp", False))
-    elif arch == "presymp_etd_ab2":
-        m = PresympModelETDAB2(cfg, h=g("presymp_h", 1.0), t0=g("presymp_t0", 1.0),
-                               eta_mu=g("eta_mu"), eta_log_coef=g("eta_log_coef"), eta_lin_coef=g("eta_lin_coef"),
-                               eta_log_init=g("eta_log_init"), eta_lin_init=g("eta_lin_init"),
-                               eta_learnable=g("eta_learnable", False), eta_mode=g("eta_mode", "log"),
-                               eta_init=g("eta_init"), eta_clip=g("eta_clip", 50.0),
-                               presymp_lnp=g("presymp_lnp", "end"), use_v0_init=not g("no_v0_init", False),
-                               mlp_use_attn_vel=g("presymp_mlp_use_attn_vel", False),
-                               mlp_use_p_vel=g("presymp_mlp_use_p_vel", False),
-                               no_mlp=g("no_mlp", False), lookahead=g("presymp_lookahead", False))
-    else:
-        raise ValueError(f"unknown arch {arch}")
-    m.load_state_dict(ck["model"])
-    m.eval().to(device)
-    return m, {"arch": arch, "regime": g("rev_regime"), "best_val": ck.get("best_val"),
-               "is_causal": arch != "presymp_etd_ab2"}
-
-
-def discover(ckpt_dir):
-    out = {}
-    for root, _, files in os.walk(ckpt_dir):
-        for f in files:
-            if f.startswith("best_") and f.endswith(".pt"):
-                name = os.path.basename(root)
-                out[name] = os.path.join(root, f)
-    return dict(sorted(out.items()))
+# Delegated to analysis/loader.py so the checkpoint-construction logic has ONE
+# home. It has to mirror train.py exactly (notably rev_embed/lift/readout, which
+# change parameter shapes), and keeping two copies in sync is how that breaks.
+from analysis.loader import (  # noqa: E402
+    bridge as _bridge,
+    discover,
+    load_model,
+)
 
 
 # ---------------------------------------------------------------- data
@@ -185,7 +144,7 @@ def probe_logit_lens(models, enc, device):
             h.remove()
         losses = []
         for hcap in caps:
-            logits = m.lm_head(m.ln_f(hcap))
+            logits = m.lm_head(m.ln_f(_bridge(m, hcap)))
             losses.append(F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1)).item())
         out[name] = losses
         print(f"  {name:26s} " + " ".join(f"{v:5.2f}" for v in losses) + f"   (min@L{int(np.argmin(losses))})")
@@ -310,7 +269,7 @@ def layer_last_logits(model, ids, device):
     model(ids.to(device))
     for h in hs:
         h.remove()
-    return [model.lm_head(model.ln_f(c))[0, -1].float().cpu() for c in caps]
+    return [model.lm_head(model.ln_f(_bridge(model, c)))[0, -1].float().cpu() for c in caps]
 
 
 @torch.no_grad()
