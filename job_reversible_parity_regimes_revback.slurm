@@ -55,38 +55,71 @@
 # n_layer at all, which is what makes 'medium' (24L) and deeper studies viable. At
 # 'small' the payoff is cashed in as a bigger micro-batch instead -- see below.
 #
-# Batch size: spending the freed memory (and why it differs per arm)
-# ------------------------------------------------------------------
+# Batch size: 24x20 for EVERY arm
+# -------------------------------
 # Accumulation is loss-scaled in train.py, so BATCH_SIZE x GRAD_ACCUM_STEPS is the
 # only thing the gradient sees -- the split between them is a pure memory-vs-speed
-# choice. Every arm here therefore keeps 480 sequences = 491,520 tokens/step (the
-# paper's TinyStories budget, its own 30x16), but splits it differently:
+# choice. Every arm keeps 480 sequences = 491,520 tokens/step (the paper's TinyStories
+# budget, its own 30x16) and every arm uses the SAME 24x20 split:
 #
-#   arm            split    seq   pessimistic peak      note
-#   0 baseline     24x20    480   ~27.0 GB              eager; cannot use segL
-#   1-4 segL       40x12    480   ~31.1 GB              12 micro-steps instead of 20
+#   arm            split    seq   pessimistic peak   real (measured basis)
+#   0 baseline     24x20    480   ~27.0 GB           ~24.6 GB
+#   1-4 segL       24x20    480   ~18.7 GB           ~16 GB
 #
 # "Pessimistic" = assume ALL of the measured B=12 peak scales linearly in B, which it
-# does not (params, optimizer state and the fixed --cheap_metrics forward do not), so
-# the real figures land lower -- expect ~25 GB for the segL arms. Both fit a 40 GB
-# A100. The baseline is held at 24x20 because it gets none of segL's saving: 40x12
-# would put it at ~45 GB pessimistic, over the card. There is a hard preflight below
-# and train.py logs peak_mem_gb every log interval, so read the first few log lines
-# rather than trusting these estimates.
+# does not (params, optimizer state and the fixed --cheap_metrics forward do not).
 #
-# Expect only a few percent of wall-clock from 20 -> 12 micro-steps. Halving the
-# micro-step count amortizes per-micro-step host overhead and nothing else; the FLOPs
-# per optimizer step are identical. If it measures no faster, drop the segL arms back
-# to 24x20 for the headroom -- the gradient does not care.
+# An earlier revision gave the segL arms 40x12 to spend the memory segL frees. That
+# is reverted, for two reasons.
 #
-# ⚠ CONSEQUENCE: the baseline sees a DIFFERENT DATA ORDER from arms 1-4. The loader
-# draws random offsets per micro-batch, so a different micro-batch shape consumes the
-# stream differently even at identical seed. Arms 1-4 share their order with each
-# other, so the regime-vs-regime comparison -- the primary question here -- keeps its
-# variance reduction. Only the baseline-vs-reversible gap picks up extra noise, and
-# that gap is a coarse correctness check (see "Arm 0"), not a fine measurement. If
-# you would rather have exact order parity across all five arms, set the segL arms to
-# 24x20 in BATCH_SIZES/ACCUM_STEPS below; you lose a few percent of wall-clock.
+# 1. IDENTICAL DATA ORDER ACROSS ARMS. data.py's BlockEpochIterator is a determin-
+#    istic block-epoch protocol: per epoch it draws one seeded offset and one shuffle
+#    of the block-start list, and NEITHER call depends on batch_size -- so the block
+#    list itself is identical for any split. Within the first epoch the two splits
+#    therefore consume the same 480 blocks per optimizer step. But at the epoch
+#    boundary they diverge: the reset discards whatever tail does not fill a
+#    micro-batch (464,000 blocks % 40 = 0 vs % 24 = 8) and the boundary lands at a
+#    different point inside an optimizer step. Simulated over 2000 steps at 'small',
+#    only the first 966 -- exactly one epoch -- have byte-identical 480-block sets;
+#    everything after drifts. Over 10001 steps (10.4 epochs) that is ~90% of the run
+#    with differently-grouped data. The groupings stay statistically equivalent, so
+#    this is noise rather than bias, but it is noise in exactly the cross-arm
+#    step-to-step comparison this sweep exists to make. One split for all five arms
+#    removes it outright.
+# 2. It bought almost nothing. 20 -> 12 micro-steps amortizes per-micro-step host
+#    overhead and nothing else; the FLOPs per optimizer step are identical. A few
+#    percent of wall-clock is not worth the above.
+#
+# 24x20 is also the split the main sweep runs and the one every memory figure quoted
+# here was measured against, so it is the known-good configuration. train.py logs
+# peak_mem_gb every log interval -- read it off the first few log lines rather than
+# trusting these estimates.
+#
+# If you ever do want the larger micro-batch back, BATCH_SEGL/ACCUM_SEGL below are
+# still separate from BATCH_BASE/ACCUM_BASE and the SEQ_PER_STEP guard will check the
+# product for you. Note the baseline cannot follow: it gets none of segL's saving, so
+# 40x12 puts it at ~45 GB pessimistic, over a 40 GB card.
+#
+# Post-mortem: the first submission's OOM was NOT a batch-size problem
+# -------------------------------------------------------------------
+# Arms 2, 3 and 4 died with `torch.AcceleratorError: CUDA error: out of memory` at
+# train.py's `model.to(device)`. Three things say that was GPU contention, not config:
+#   * model.to(device) allocates the PARAMETERS -- ~0.5 GB for a 124M model. No
+#     activation, no batch, no optimizer state exists yet. Nothing there is sensitive
+#     to BATCH_SIZE, so no batch-size change can fix it.
+#   * arm 1 (vpb_baseline) SURVIVED on the identical 40x12 split, and is
+#     memory-indistinguishable from arms 2-4 (its frozen gamma/alpha are buffers, a
+#     18,432-element difference). Same config, different outcome => environment.
+#   * it is a raw driver-level cudaErrorMemoryAllocation, not PyTorch's
+#     `torch.cuda.OutOfMemoryError`, which would have printed "Tried to allocate X
+#     MiB (GPU 0; Y GiB total capacity; Z GiB already allocated)". PyTorch's caching
+#     allocator never got a chance to report -- the device was already full.
+# So check the preflight lines this script prints BEFORE python starts (memory.free
+# and the compute-apps list). If free was well under total, another process owned the
+# card. Most likely cause: several array tasks landed on the same GPU. Throttle the
+# array with `sbatch --array=0-4%2` (at most 2 concurrent) if that is confirmed, and
+# resubmit just the failures with `sbatch --array=2-4`. The lower 24x20 peak helps
+# either way, but treat that as a hedge, not the fix.
 #
 # Arm 0: what it is for
 # ---------------------
@@ -256,16 +289,22 @@ case "${MODEL_SIZE}" in
   small)    # 123.6M non-positional params -- paper TS 12L recipe, matched exactly
     N_LAYER=12; N_HEAD=12; N_EMBD=768;  BLOCK_SIZE=1024
     SEQ_PER_STEP=480                            # 491,520 tokens/step
-    # Baseline is eager and gets none of segL's saving; 40x12 would put it at ~45 GB
-    # pessimistic, over a 40 GB card. segL arms take the freed memory as 40x12.
-    BATCH_BASE=24; ACCUM_BASE=20                # ~27.0 GB pessimistic
-    BATCH_SEGL=40; ACCUM_SEGL=12                # ~31.1 GB pessimistic, ~25 GB real
+    # ONE split for every arm, so all five see byte-identical data at every step --
+    # see "Batch size" in the header for the epoch-boundary drift that motivates it.
+    # Do not raise BATCH_BASE above 24: the baseline is eager and gets none of segL's
+    # saving, so 40x12 puts it at ~45 GB pessimistic, over a 40 GB card.
+    BATCH_BASE=24; ACCUM_BASE=20                # ~27.0 GB pessimistic, ~24.6 GB real
+    BATCH_SEGL=24; ACCUM_SEGL=20                # ~18.7 GB pessimistic, ~16 GB real
     # 10001 steps x 491,520 = 4.92B tokens = 10.4 TinyStories epochs (~960 steps per
     # epoch). Paper's val loss bottoms out near step 7.6k and overfits after, so
     # report BOTH best and final val -- train.py tracks best_val already.
     MAX_STEPS=10001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
     EVAL_INTERVAL=200; EVAL_BATCHES=50; LOG_INTERVAL=50
-    GPU_NEED_MB=34000
+    # Sized for the binding arm (baseline, ~27 GB pessimistic) plus headroom. Its job
+    # is to catch a card another process already owns -- the failure mode that killed
+    # arms 2-4 on the first submission -- so it must sit ABOVE the real requirement
+    # but well below a clean card's ~40.5 GB free.
+    GPU_NEED_MB=30000
     ;;
   medium)   # 353.6M non-positional params
     # WARNING: off-paper. The paper trains 24L/16H/1024d on OpenWebText only, at
