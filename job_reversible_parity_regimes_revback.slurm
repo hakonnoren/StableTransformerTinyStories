@@ -3,22 +3,20 @@
 # job_reversible_parity_regimes_revback.slurm — the full volume-regime sweep at
 # parameter parity, run through MEMORY-EFFICIENT REVERSIBLE BACKPROP
 # (--mem_efficient --mem_efficient_segment n_layer, "segL") instead of ordinary
-# autograd. Same five arms and same recipe as job_reversible_parity_regimes.slurm;
-# the reversible arms just reconstruct their activations in backward instead of
-# storing them, which frees enough GPU memory to nearly double the micro-batch.
+# autograd. The four reversible arms of job_reversible_parity_regimes.slurm, same
+# recipe, reconstructing their activations in backward instead of storing them. The
+# baseline arm is omitted -- it cannot use segL and the reference already exists.
 #
 #   ID  run dir                   regime        centering / volume behaviour
-#    0  baseline                  —             vanilla transformer (reference)
-#    1  reversible_vpb_baseline   vpb_baseline  gamma=alpha=0, frozen (no scaling)
-#    2  reversible_vpm_scaling    vpm_scaling   global centering, total log|det| = -REV_LAMBDA
-#    3  reversible_vpb_scaling    vpb_scaling   per-block centering, log|det| = 0 per block
-#    4  reversible_vf_scaling     vf_scaling    no centering, volume free
+#    0  reversible_vpb_baseline   vpb_baseline  gamma=alpha=0, frozen (no scaling)
+#    1  reversible_vpm_scaling    vpm_scaling   global centering, total log|det| = -REV_LAMBDA
+#    2  reversible_vpb_scaling    vpb_scaling   per-block centering, log|det| = 0 per block
+#    3  reversible_vf_scaling     vf_scaling    no centering, volume free
 #
 # Increasing freedom: vpb_baseline -> vpb_scaling -> vpm_scaling -> vf_scaling.
-# Arms 1-4 all run segL. Arm 0 is a vanilla transformer and CANNOT: --mem_efficient
-# is a hard error on --arch baseline (train.py exits), and there is nothing to invert
-# anyway. So arm 0 is eager here exactly as in the main sweep -- see "Arm 0" below
-# for what that does and does not confound.
+# Every arm runs segL. There is no baseline arm: a vanilla transformer cannot use
+# --mem_efficient (it is a hard error on --arch baseline, and there is nothing to
+# invert), and the reference already exists -- see "The baseline reference" below.
 #
 # ⚠ PREREQUISITE -- DO NOT SUBMIT THIS BLIND ⚠
 # ----------------------------------------------
@@ -53,87 +51,129 @@
 # that peak (the rest is the loss head at B*T*V logits plus params/optimizer, neither
 # of which this touches). The point is that the stack term no longer grows with
 # n_layer at all, which is what makes 'medium' (24L) and deeper studies viable. At
-# 'small' the payoff is cashed in as a bigger micro-batch instead -- see below.
+# 'small' the freed memory is simply left as headroom -- see "Batch size" for why it
+# is not spent on a larger micro-batch.
 #
-# Batch size: 24x20 for EVERY arm
-# -------------------------------
+# Batch size: 24x20, and why not larger now that the baseline is gone
+# -------------------------------------------------------------------
 # Accumulation is loss-scaled in train.py, so BATCH_SIZE x GRAD_ACCUM_STEPS is the
 # only thing the gradient sees -- the split between them is a pure memory-vs-speed
 # choice. Every arm keeps 480 sequences = 491,520 tokens/step (the paper's TinyStories
-# budget, its own 30x16) and every arm uses the SAME 24x20 split:
+# budget, its own 30x16) at a 24x20 split: ~18.7 GB pessimistic, ~16 GB real.
 #
-#   arm            split    seq   pessimistic peak   real (measured basis)
-#   0 baseline     24x20    480   ~27.0 GB           ~24.6 GB
-#   1-4 segL       24x20    480   ~18.7 GB           ~16 GB
+# "Pessimistic" = assume ALL of the measured B=12 peak (9.34 GB for segL) scales
+# linearly in B, which it does not (params, optimizer state and the fixed
+# --cheap_metrics forward do not).
 #
-# "Pessimistic" = assume ALL of the measured B=12 peak scales linearly in B, which it
-# does not (params, optimizer state and the fixed --cheap_metrics forward do not).
+# segL at 24x20 uses well under half a 40 GB card, so 40x12 (~31.1 GB pessimistic)
+# would now fit -- the baseline was what capped this at 24, and it is gone. It stays
+# at 24x20 anyway:
 #
-# An earlier revision gave the segL arms 40x12 to spend the memory segL frees. That
-# is reverted, for two reasons.
+# 1. DATA-ORDER ALIGNMENT WITH THE EXISTING BASELINE. This is the reason that
+#    survives dropping the arm. data.py's BlockEpochIterator is a deterministic
+#    block-epoch protocol: per epoch it draws one seeded offset and one shuffle of the
+#    block-start list, and NEITHER call depends on batch_size -- so the block list is
+#    identical for any split. Within one epoch, any split consumes the same 480 blocks
+#    per optimizer step. At the epoch boundary they diverge: the reset discards
+#    whatever tail does not fill a micro-batch (464,000 blocks % 40 = 0 vs % 24 = 8)
+#    and the boundary lands at a different point inside an optimizer step. Simulated
+#    over 2000 steps at 'small', only the first 966 -- exactly one epoch -- have
+#    byte-identical 480-block sets; everything after drifts. Over 10001 steps
+#    (10.4 epochs) that is ~90% of the run. The baseline this sweep is measured
+#    against ran at 24x20, so matching it keeps step-to-step curves comparable
+#    instead of merely statistically equivalent.
+# 2. It buys almost nothing. 20 -> 12 micro-steps amortizes per-micro-step host
+#    overhead and nothing else; the FLOPs per optimizer step are identical.
+# 3. Every memory figure quoted here was measured at 24x20, and it is the main
+#    sweep's split, so it is the known-good configuration.
 #
-# 1. IDENTICAL DATA ORDER ACROSS ARMS. data.py's BlockEpochIterator is a determin-
-#    istic block-epoch protocol: per epoch it draws one seeded offset and one shuffle
-#    of the block-start list, and NEITHER call depends on batch_size -- so the block
-#    list itself is identical for any split. Within the first epoch the two splits
-#    therefore consume the same 480 blocks per optimizer step. But at the epoch
-#    boundary they diverge: the reset discards whatever tail does not fill a
-#    micro-batch (464,000 blocks % 40 = 0 vs % 24 = 8) and the boundary lands at a
-#    different point inside an optimizer step. Simulated over 2000 steps at 'small',
-#    only the first 966 -- exactly one epoch -- have byte-identical 480-block sets;
-#    everything after drifts. Over 10001 steps (10.4 epochs) that is ~90% of the run
-#    with differently-grouped data. The groupings stay statistically equivalent, so
-#    this is noise rather than bias, but it is noise in exactly the cross-arm
-#    step-to-step comparison this sweep exists to make. One split for all five arms
-#    removes it outright.
-# 2. It bought almost nothing. 20 -> 12 micro-steps amortizes per-micro-step host
-#    overhead and nothing else; the FLOPs per optimizer step are identical. A few
-#    percent of wall-clock is not worth the above.
+# The lower peak is also a mild hedge against the unresolved OOM below: two segL arms
+# co-scheduled on one 40 GB card need ~32 GB at 24x20 (real) and might both survive,
+# where 2 x 40x12 could not. Do not mistake that for a fix.
 #
-# 24x20 is also the split the main sweep runs and the one every memory figure quoted
-# here was measured against, so it is the known-good configuration. train.py logs
-# peak_mem_gb every log interval -- read it off the first few log lines rather than
-# trusting these estimates.
+# train.py logs peak_mem_gb every log interval -- read it off the first few log lines
+# rather than trusting these estimates. If you do want the larger micro-batch, change
+# BATCH_SIZE/GRAD_ACCUM_STEPS in the size switch; the SEQ_PER_STEP guard checks the
+# product for you.
 #
-# If you ever do want the larger micro-batch back, BATCH_SEGL/ACCUM_SEGL below are
-# still separate from BATCH_BASE/ACCUM_BASE and the SEQ_PER_STEP guard will check the
-# product for you. Note the baseline cannot follow: it gets none of segL's saving, so
-# 40x12 puts it at ~45 GB pessimistic, over a 40 GB card.
-#
-# Post-mortem: the first submission's OOM was NOT a batch-size problem
-# -------------------------------------------------------------------
+# Post-mortem: array 24994972 (UNRESOLVED -- read this before rerunning)
+# ----------------------------------------------------------------------
+# NOTE: arm numbers in this section are the PREVIOUS submission's, which had the
+# baseline at ID 0. In the current table vpb_baseline is ID 0, so old arms 1-4 are
+# new arms 0-3.
 # Arms 2, 3 and 4 died with `torch.AcceleratorError: CUDA error: out of memory` at
-# train.py's `model.to(device)`. Three things say that was GPU contention, not config:
+# train.py's `model.to(device)`, ~9s after launch. This is NOT a batch-size problem
+# and lowering BATCH_SIZE is not known to fix it. The evidence:
 #   * model.to(device) allocates the PARAMETERS -- ~0.5 GB for a 124M model. No
-#     activation, no batch, no optimizer state exists yet. Nothing there is sensitive
-#     to BATCH_SIZE, so no batch-size change can fix it.
+#     activation, no batch, no optimizer state exists yet, so nothing at that point
+#     is sensitive to BATCH_SIZE.
 #   * arm 1 (vpb_baseline) SURVIVED on the identical 40x12 split, and is
-#     memory-indistinguishable from arms 2-4 (its frozen gamma/alpha are buffers, a
+#     memory-indistinguishable from arms 2-4 (its frozen gamma/alpha are buffers, an
 #     18,432-element difference). Same config, different outcome => environment.
 #   * it is a raw driver-level cudaErrorMemoryAllocation, not PyTorch's
 #     `torch.cuda.OutOfMemoryError`, which would have printed "Tried to allocate X
 #     MiB (GPU 0; Y GiB total capacity; Z GiB already allocated)". PyTorch's caching
-#     allocator never got a chance to report -- the device was already full.
-# So check the preflight lines this script prints BEFORE python starts (memory.free
-# and the compute-apps list). If free was well under total, another process owned the
-# card. Most likely cause: several array tasks landed on the same GPU. Throttle the
-# array with `sbatch --array=0-4%2` (at most 2 concurrent) if that is confirmed, and
-# resubmit just the failures with `sbatch --array=2-4`. The lower 24x20 peak helps
-# either way, but treat that as a hedge, not the fix.
+#     allocator never got to report, i.e. the driver refused the very first request.
+#   * AND YET the preflight passed on a nearly empty card. Task 2 logged
+#     "40442MiB free of 40960MiB", no compute-apps, host idun-07-06,
+#     SLURM_JOB_GPUS=7, CUDA_VISIBLE_DEVICES=0 -- then OOM'd seconds later.
+# So the simple "another job owned the card" story does NOT fit the preflight, and the
+# cause is still open. Two hypotheses remain, and they are distinguishable:
+#   (a) Two array tasks were placed on the SAME physical GPU. The preflight would then
+#       pass for both (both see it free at the same instant) and whichever process
+#       allocated its activations first would leave the other unable to get even
+#       0.5 GB. DIAGNOSTIC: compare `host` and SLURM_JOB_GPUS across all task
+#       logs. Any repeated (host, SLURM_JOB_GPUS) pair confirms it. FIX: throttle with
+#       `sbatch --array=0-3%1`, or add #SBATCH --exclusive.
+#   (b) Context creation failed for a non-memory reason the driver reports as OOM --
+#       compute mode Exclusive_Process with another context already open, or a wedged
+#       / ECC-degraded device. DIAGNOSTIC: the failure-time snapshot that run() now
+#       prints, including compute_mode. FIX: none from here; report the node.
+# Note SLURM's cgroup can hide other jobs' PIDs from --query-compute-apps while
+# memory.used still reflects them, so a clean app list is not proof of an idle card --
+# but memory.free coming back at 40442 MiB genuinely does mean it was idle at 22:17:33.
 #
-# Arm 0: what it is for
-# ---------------------
-# Arm 0 IS the paper's GD+Euler / GD+Lie-Trotter setup, which reach best val
-# 1.107 / 1.106 on this exact budget. If arm 0 lands near 1.11, the data order,
-# optimizer grouping, schedule and eval are validated before anyone reads the
-# reversible arms. It is a pipeline check, not a segL check -- arm 0 is eager, so it
-# says nothing about the reversible backprop. It is also NOT a like-for-like control
-# for segL: for that, use the eager arms of the 4000-step test job, which hold every
-# other variable fixed.
+# Also fixed here: run() now checks train.py's exit status and the script propagates
+# it. On array 24994972 a crashed arm still logged "Task 2 done" and exited 0, so
+# sacct reported COMPLETED and the failure looked like a success. The same defect
+# exists in job_reversible_parity_regimes.slurm and job_reversible_parity.slurm.
+#
+# Under the current 0-3 numbering the three that died are arms 1, 2 and 3, i.e.
+# `sbatch --array=1-3` reruns exactly the failures.
+#
+# The baseline reference (why there is no baseline arm here)
+# ----------------------------------------------------------
+# It already exists, twice, at exactly this recipe -- sdpa, 10001 steps, 24x20,
+# 12L/768d:
+#
+#   project                          best_val   note
+#   sympformer-reversible            1.0522     the main sweep's arm 0
+#   sympformer-reversible-revback    1.0528     arm 0 of array 24994972; it survived
+#                                               the OOM that killed arms 2-4
+#
+# So the reference is already IN this project and no rerun is needed. Two further
+# points worth having:
+#
+#   * Those two runs are an unintended REPLICATE: identical config and seed, differing
+#     only by GPU nondeterminism, and their best_val agrees to 0.0006. That is the
+#     long-horizon run-to-run floor, and it is the yardstick to judge regime
+#     differences against -- far tighter than the 0.011 measured from a 200-step pair,
+#     because best_val near convergence is a much more stable quantity than train_loss
+#     at step 190. For scale, the regime spread in the earlier 20001-step manual-kernel
+#     sweep was ~0.019 (baseline 1.1405 / vf 1.1534 / vpb_baseline 1.1591), i.e. about
+#     30x the floor. Differences below ~0.001 are noise.
+#   * It is a PIPELINE check, not a segL check. The baseline is eager, so it says
+#     nothing about the reversible backprop. For a like-for-like segL control use the
+#     eager arms of the 4000-step test job, which hold every other variable fixed.
+#
+# Do NOT compare against the baseline in results/revparityreg_24957997: that run is
+# attn_impl=manual, max_steps=20001 and truncated at step 18500. Wrong kernel, wrong
+# budget, incomplete -- see the attention-kernel note below for why the kernel alone
+# disqualifies it.
 #
 # Parameter parity
 # ----------------
-# All five arms share one geometry (whatever MODEL_SIZE selects). Attn/MLP already
+# All four arms share one geometry (whatever MODEL_SIZE selects). Attn/MLP already
 # match per block; --rev_embed narrow additionally puts the token/pos tables, ln_f
 # and the tied lm_head at n_embd (the baseline's exact shapes) instead of the full
 # 2*n_embd state width, bridging to the state parameter-free (lift dup: x = z = emb;
@@ -186,8 +226,11 @@
 #           sbatch --export=ALL,MODEL_SIZE=tiny --mem=8G --time=02:00:00 \
 #                  --gres=gpu:1 job_reversible_parity_regimes_revback.slurm
 #           (see the MODEL_SIZE switch below for the per-size resources)
-#           sbatch --array=1-4 job_reversible_parity_regimes_revback.slurm
-#                  # segL arms only, if the baseline already ran in the main sweep
+#           sbatch --array=0,3 job_reversible_parity_regimes_revback.slurm
+#                  # just the two ends of the freedom ordering (vpb_baseline, vf_scaling)
+#           sbatch --array=0-3%1 job_reversible_parity_regimes_revback.slurm
+#                  # one arm at a time -- use this if the OOM below turns out to be
+#                  # two array tasks sharing a GPU
 #
 # Resume:   train.py takes --resume <path>. Each arm writes best_<arch>.pt and
 #           final_<arch>.pt into its own run dir, and best_val is tracked, so a
@@ -197,6 +240,9 @@
 # Analyze:  python analyze_wandb.py --project sympformer-reversible-revback \
 #               --filter_config n_embd=768 block_size=1024 attn_impl=sdpa \
 #               --format pdf --out_dir plots/revparity_regimes_revback
+#           The already-finished baseline_baseline (best_val 1.0528) lives in this
+#           same project and this filter picks it up, so the reference plots itself
+#           alongside the four regimes with no extra work.
 #
 # Separate W&B project, deliberately: these runs share n_embd/block_size/attn_impl
 # with the main sweep, so a config filter alone would not separate them, and mixing
@@ -219,19 +265,19 @@
 # the main sweep. The memory this job actually spends is GPU memory, via BATCH_SIZE.
 # Raise to 48G+ only for OpenWebText (~17GB of bins).
 #SBATCH --mem=32G
-# --time is per TASK, not for the whole array (the five tasks are independent jobs).
+# --time is per TASK, not for the whole array (the four tasks are independent jobs).
 # Budget for MAX_STEPS=10001 at 'small', from the first run's MEASURED tokens_per_sec
 # (491,520 tokens/step):
-#   arm 0 baseline, eager   ~3.05-3.47 s/step  ->  8.5-9.7 h
-#   arms 1-4 segL           ~5.74-6.20 s/step  ->  16.0-17.2 h
-# Worst arm 17.2 h, plus 50 evals (50 batches + drift + cheap_metrics + sampling,
-# ~40s each) = 0.6 h, plus ~0.3 h startup and data loading => ~18.1 h. A slow node
-# costs up to another 22% (the eager replicate pair differed that much on identical
-# config), which would put it at ~21.6 h -- hence 24h rather than the main sweep's
-# 16h. The segL arms are genuinely slower than eager; this is the trade.
+# Every arm is segL, so every arm is on the slow path: ~5.74-6.20 s/step measured,
+# i.e. 16.0-17.2 h for 10001 steps. Plus 50 evals (50 batches + drift +
+# cheap_metrics + sampling, ~40s each) = 0.6 h, plus ~0.3 h startup and data loading
+# => ~18.1 h. A slow node costs up to another 22% (the eager replicate pair differed
+# that much on identical config), which would put it at ~21.6 h -- hence 24h rather
+# than the main sweep's 16h. For reference the eager baseline ran 3.05-3.47 s/step
+# (8.5-9.7 h); segL trades that ~1.46x for memory flat in depth.
 # Check the partition allows it: sinfo -p GPUQ -o "%P %l"
 #SBATCH --time=24:00:00
-#SBATCH --array=0-4                        # baseline (eager) + 4 regimes (segL), all narrow
+#SBATCH --array=0-3                        # 4 volume regimes, all narrow, all segL
 #SBATCH --output=output_revparityregrevback_%A_%a.txt
 #SBATCH --error=output_revparityregrevback_%A_%a.err
 
@@ -280,8 +326,7 @@ case "${MODEL_SIZE}" in
   tiny)     # 3.4M non-positional params -- fast probe
     N_LAYER=4;  N_HEAD=4;  N_EMBD=64;   BLOCK_SIZE=256
     SEQ_PER_STEP=72                             # 18,432 tokens/step
-    BATCH_BASE=6;  ACCUM_BASE=12
-    BATCH_SEGL=6;  ACCUM_SEGL=12                # too small for memory to bind
+    BATCH_SIZE=6;  GRAD_ACCUM_STEPS=12          # too small for memory to bind
     MAX_STEPS=10001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
     EVAL_INTERVAL=100; EVAL_BATCHES=50; LOG_INTERVAL=50
     GPU_NEED_MB=4000
@@ -289,22 +334,20 @@ case "${MODEL_SIZE}" in
   small)    # 123.6M non-positional params -- paper TS 12L recipe, matched exactly
     N_LAYER=12; N_HEAD=12; N_EMBD=768;  BLOCK_SIZE=1024
     SEQ_PER_STEP=480                            # 491,520 tokens/step
-    # ONE split for every arm, so all five see byte-identical data at every step --
-    # see "Batch size" in the header for the epoch-boundary drift that motivates it.
-    # Do not raise BATCH_BASE above 24: the baseline is eager and gets none of segL's
-    # saving, so 40x12 puts it at ~45 GB pessimistic, over a 40 GB card.
-    BATCH_BASE=24; ACCUM_BASE=20                # ~27.0 GB pessimistic, ~24.6 GB real
-    BATCH_SEGL=24; ACCUM_SEGL=20                # ~18.7 GB pessimistic, ~16 GB real
+    # 24x20 matches the existing baseline's split, so step-to-step curves stay
+    # comparable to it -- see "Batch size" in the header for the epoch-boundary
+    # drift that motivates it. segL leaves plenty of room; this is not a cap.
+    BATCH_SIZE=24; GRAD_ACCUM_STEPS=20          # ~18.7 GB pessimistic, ~16 GB real
     # 10001 steps x 491,520 = 4.92B tokens = 10.4 TinyStories epochs (~960 steps per
     # epoch). Paper's val loss bottoms out near step 7.6k and overfits after, so
     # report BOTH best and final val -- train.py tracks best_val already.
     MAX_STEPS=10001; WARMUP_STEPS=1000; PEAK_LR=6e-4; MUON_LR=0.02
     EVAL_INTERVAL=200; EVAL_BATCHES=50; LOG_INTERVAL=50
-    # Sized for the binding arm (baseline, ~27 GB pessimistic) plus headroom. Its job
-    # is to catch a card another process already owns -- the failure mode that killed
-    # arms 2-4 on the first submission -- so it must sit ABOVE the real requirement
-    # but well below a clean card's ~40.5 GB free.
-    GPU_NEED_MB=30000
+    # segL at 24x20 needs ~18.7 GB pessimistic. Set above that but well below a clean
+    # card's ~40.5 GB free, so the check still fires on a card another process owns.
+    # Note it CANNOT catch two of our own tasks sharing a GPU -- both would see it
+    # free at the same instant. See the post-mortem in the header.
+    GPU_NEED_MB=24000
     ;;
   medium)   # 353.6M non-positional params
     # WARNING: off-paper. The paper trains 24L/16H/1024d on OpenWebText only, at
@@ -313,11 +356,10 @@ case "${MODEL_SIZE}" in
     # scaled-down guess and are NOT the paper's recipe; fix before relying on them.
     N_LAYER=24; N_HEAD=16; N_EMBD=1024; BLOCK_SIZE=1024
     SEQ_PER_STEP=120                            # 122,880 tokens/step
-    BATCH_BASE=6;  ACCUM_BASE=20
-    BATCH_SEGL=6;  ACCUM_SEGL=20                # unmeasured at 24L; segL allows more
+    BATCH_SIZE=6;  GRAD_ACCUM_STEPS=20          # unmeasured at 24L; segL allows more
     MAX_STEPS=20001; WARMUP_STEPS=2000; PEAK_LR=3e-4; MUON_LR=0.02
     EVAL_INTERVAL=250; EVAL_BATCHES=50; LOG_INTERVAL=50
-    GPU_NEED_MB=34000
+    GPU_NEED_MB=30000
     ;;
   *)
     echo "Unknown MODEL_SIZE='${MODEL_SIZE}' (expected tiny, small or medium)"; exit 1
@@ -331,7 +373,24 @@ DATASET=tinystories          # existing GPT-2 bins
 REV_LAMBDA=0.0
 
 log() { echo "[$(date -Is)] $*"; }
-run() { log "RUN: $(printf '%q ' "$@")"; "$@"; }
+run() {
+  log "RUN: $(printf '%q ' "$@")"
+  "$@"; local rc=$?
+  if (( rc != 0 )); then
+    log "FAILED: exit ${rc}"
+    # A CUDA OOM at model.to(device) means the card filled between the preflight
+    # above and a ~0.5GB parameter allocation. Snapshot the device NOW, while the
+    # failure is fresh: this is the evidence that separates "another process took
+    # the card after our preflight" from "this device was never exclusively ours".
+    # Note SLURM's cgroup can hide other jobs' PIDs from --query-compute-apps while
+    # memory.used still reflects them, so read the totals, not just the app list.
+    log "GPU state at failure (host=$(hostname), SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-unset}, CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}):"
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv 2>&1 || true
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 || true
+    nvidia-smi --query-gpu=index,compute_mode,persistence_mode --format=csv 2>&1 || true
+  fi
+  return $rc
+}
 
 # ── Experiment table (indexed by SLURM_ARRAY_TASK_ID) ─────────────────────────
 # Run dir = OUTDIR/<arch>[_<run_name>]. Keep --array (top) in sync with this.
@@ -352,14 +411,12 @@ NARROW="--rev_embed narrow --rev_lift dup --rev_readout sum"
 SEGL="--mem_efficient --mem_efficient_segment ${N_LAYER}"
 
 NAMES=(
-  baseline
   reversible_vpb_baseline
   reversible_vpm_scaling
   reversible_vpb_scaling
   reversible_vf_scaling
 )
 TASK_ARGS=(
-  "--arch baseline --run_name baseline"
   "--arch reversible --rev_regime vpb_baseline ${NARROW} ${SEGL} --run_name vpb_baseline_narrow"
   "--arch reversible --rev_regime vpm_scaling  ${NARROW} ${SEGL} --run_name vpm_scaling_narrow --rev_lambda ${REV_LAMBDA}"
   "--arch reversible --rev_regime vpb_scaling  ${NARROW} ${SEGL} --run_name vpb_scaling_narrow"
@@ -371,15 +428,6 @@ if [[ -z "${ID}" || -z "${NAMES[$ID]+x}" ]]; then
   echo "No experiment for SLURM_ARRAY_TASK_ID='${ID}'. Submit with: sbatch job_reversible_parity_regimes_revback.slurm"; exit 1
 fi
 NAME="${NAMES[$ID]}"
-
-# ── Per-arm micro-batch split ─────────────────────────────────────────────────
-# Arm 0 is eager (no segL) and so cannot spend the freed memory; arms 1-4 can. The
-# product is held fixed at SEQ_PER_STEP so every arm takes the same optimizer step.
-if [[ "${ID}" -eq 0 ]]; then
-  BATCH_SIZE=${BATCH_BASE}; GRAD_ACCUM_STEPS=${ACCUM_BASE}
-else
-  BATCH_SIZE=${BATCH_SEGL}; GRAD_ACCUM_STEPS=${ACCUM_SEGL}
-fi
 
 # Hard guard: an arm that takes a different number of sequences per optimizer step is
 # not comparable to the others, and the mistake is silent -- the loss curve just
@@ -408,7 +456,7 @@ COMMON_ARGS=(
   # Separate project from the main sweep -- see the header for why.
   --wandb --wandb_project sympformer-reversible-revback
   # Logs recon_drift_max (interior l1..l_n) + recon_drift_input (l0) + per-layer
-  # drift at each eval. The baseline ignores this with a printed notice.
+  # drift at each eval. Every arm here is reversible, so every arm logs it.
   --track_recon_drift
   --sample_interval "${EVAL_INTERVAL}" --sample_prefix_tokens 32 --sample_max_new_tokens 128
   --sample_temperature 0.8 --sample_top_k 40
@@ -418,11 +466,7 @@ COMMON_ARGS=(
 log "Job meta: array_job=${SLURM_ARRAY_JOB_ID:-NA} task=${ID} experiment=${NAME} host=$(hostname)"
 log "Model size '${MODEL_SIZE}': ${N_LAYER}L/${N_HEAD}H/${N_EMBD}d block=${BLOCK_SIZE} batch=${BATCH_SIZE}x${GRAD_ACCUM_STEPS}"
 log "Tokens/step: $(( BATCH_SIZE * GRAD_ACCUM_STEPS * BLOCK_SIZE )) (${SEQ_PER_STEP} sequences)"
-if [[ "${ID}" -eq 0 ]]; then
-  log "Backprop: ordinary autograd (baseline arch cannot use mem_efficient)"
-else
-  log "Backprop: mem_efficient reversible, segment=${N_LAYER} (segL)"
-fi
+log "Backprop: mem_efficient reversible, segment=${N_LAYER} (segL)"
 log "OUTDIR=${OUTDIR}"
 
 # ── GPU sanity check ──────────────────────────────────────────────────────────
@@ -470,5 +514,14 @@ fi
 
 # shellcheck disable=SC2086  (intentional word-splitting of TASK_ARGS)
 run python3 -u train.py "${COMMON_ARGS[@]}" ${TASK_ARGS[$ID]}
+RC=$?
 
-log "Task ${ID} (${NAME}) done."
+# Propagate the failure. Without this the script exits 0 and logs "done" even when
+# train.py died in the first ten seconds, so sacct reports COMPLETED and a broken arm
+# reads as a successful one -- which is exactly what happened on array 24994972.
+if (( RC != 0 )); then
+  log "Task ${ID} (${NAME}) FAILED after $(( SECONDS ))s with exit ${RC}."
+  exit "${RC}"
+fi
+
+log "Task ${ID} (${NAME}) done in $(( SECONDS ))s."
