@@ -410,8 +410,14 @@ def run_arm(name: str, path: str, ids: torch.Tensor, args, dtype) -> tuple[list[
                     continue
             done.add((r["layer"], r["point"]))
             recs.append(r)
-        print(f"[{name}] resume: {len(done)} of {len(layers) * ids.shape[0]} "
-              f"(layer, point) pairs already complete", flush=True)
+        want = {(l, p) for l in layers for p in range(ids.shape[0])}
+        in_scope = done & want
+        extra = len(done) - len(in_scope)
+        print(f"[{name}] resume: {len(in_scope)} of {len(want)} requested "
+              f"(layer, point) pairs already complete"
+              + (f"; {extra} more records in the file are outside this run's "
+                 f"--layers/--n_points and are left untouched" if extra else ""),
+              flush=True)
 
     rec_fh = open(rec_path, "a" if done else "w")
     for layer in layers:
