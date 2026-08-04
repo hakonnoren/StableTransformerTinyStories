@@ -10,6 +10,20 @@
 #   --lr_schedule {cosine,wsd}, --decay_frac: adds warmup-stable-decay
 #     (trapezoidal) as an alternative to the historical cosine shape.
 #
+# RESUBMIT STATUS: 7/9 arms finished (0,1,2,3,4,6,7). Arms 5 (muon_nowarmup)
+# and 8 (wsd_wradam) never registered in W&B at all -- the two arms that need
+# the NEW flags above, everything else only uses the pre-existing
+# --warmup_steps. Consistent with the cluster's train.py not having these
+# changes yet: an unrecognized-argument error exits before wandb.init() ever
+# runs, so nothing gets logged (not a "failed" run, just absent). --array
+# below is trimmed to just these two -- sync the updated train.py first.
+#
+# Finished results (best_val, for reference): ref_w10pct 1.1013, w2pct 1.0933,
+# w5pct 1.0951, w20pct 1.1107, wradam 1.0917 (best so far), lr_2x 1.1077,
+# lr_0p5x 1.1198 (worst). Shorter warmup won every comparison run so far;
+# arm 5/8 fill in the two pieces (Muon-only, and a different schedule shape)
+# that result doesn't yet cover.
+#
 # Rationale per arm (see conversation for full literature discussion):
 #   0 ref_w10pct       current recipe: cosine, warmup=300 (10% of 3000), 6e-4/0.02
 #   1 w2pct            warmup=60 (2%) -- is 10% actually needed?
@@ -61,10 +75,10 @@
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
 #SBATCH --exclude=idun-07-06               # known external-contention node
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1                       # ANY GPU, not just A100 -- see header
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
-#SBATCH --array=0-8
+#SBATCH --array=5,8                        # only the arms that never registered in wandb -- see header
 #SBATCH --output=output_revL12_lrsweep_%A_%a.txt
 #SBATCH --error=output_revL12_lrsweep_%A_%a.err
 
@@ -175,6 +189,11 @@ nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>&1 |
 
 # Hard preflight: bail out NOW rather than dying on a CUDA OOM. NEED is a
 # generous floor -- baseline@12L at this batch should need well under 20GB.
+# --gres=gpu:1 (no type pin) lets this land on ANY of IDUN's ~268 GPUs, not
+# just the 104 A100s -- this job's memory footprint is small enough that
+# H100/H200/B300 (all newer/larger than A100) are trivially fine, and this
+# preflight's P100/V100/P40/K80/T4 name-match below still catches the older
+# cards that genuinely lack bf16/flash SDPA, so relaxing the gres type is safe.
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 GPU_TOTAL="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
 GPU_FREE="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)"

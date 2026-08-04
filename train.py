@@ -288,6 +288,30 @@ def cosine_lr(step: int, warmup_steps: int, total_steps: int, peak: float, min_r
     return peak * (min_ratio + (1.0 - min_ratio) * cosine)
 
 
+def wsd_lr(step: int, warmup_steps: int, total_steps: int, peak: float, min_ratio: float = 0.1,
+           decay_frac: float = 0.2) -> float:
+    """Warmup-Stable-Decay / trapezoidal: linear warmup, then CONSTANT at peak,
+    then linear decay to peak*min_ratio over the final decay_frac of total_steps.
+    (modded-nanogpt's default schedule; unlike cosine, changing warmup_steps
+    doesn't reshape the rest of the curve -- only the ramp-up changes.)"""
+    if step < warmup_steps:
+        return peak * (step / max(1, warmup_steps))
+    decay_start = max(warmup_steps, int(total_steps * (1.0 - decay_frac)))
+    if step < decay_start:
+        return peak
+    if step >= total_steps:
+        return peak * min_ratio
+    progress = (step - decay_start) / max(1, total_steps - decay_start)
+    return peak * (1.0 - (1.0 - min_ratio) * progress)
+
+
+def lr_frac(schedule: str, step: int, warmup_steps: int, total_steps: int, min_ratio: float,
+            decay_frac: float = 0.2) -> float:
+    if schedule == "wsd":
+        return wsd_lr(step, warmup_steps, total_steps, 1.0, min_ratio, decay_frac)
+    return cosine_lr(step, warmup_steps, total_steps, 1.0, min_ratio)
+
+
 class HybridOptimizer:
     """Presents an AdamW + Muon pair as a single optimizer object.
 
@@ -403,6 +427,7 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
                     weight_decay=muon_wd, ns_steps=muon_ns_steps,
                     adjust_lr_fn=muon_adjust_lr)
         muon.param_groups[0]["base_lr"] = muon_lr
+        muon.param_groups[0]["is_muon"] = True   # lets the training loop give Muon its own warmup schedule
         print(f"[optimizer] Muon ({_MUON_SOURCE}) on {len(muon_params)} matrices "
               f"(lr {muon_lr}, adjust_lr_fn={muon_adjust_lr}); AdamW on the rest (peak {peak_lr}).")
         return HybridOptimizer(adamw, muon)
@@ -653,6 +678,12 @@ def main():
     # Training hyperparams (paper: 10k steps, warmup 1k, peak AdamW LR 6e-4, bf16, clip 1.0)
     ap.add_argument("--max_steps", type=int, default=10_000)
     ap.add_argument("--warmup_steps", type=int, default=1_000)
+    ap.add_argument("--muon_warmup_steps", type=int, default=-1,
+                    help="separate warmup length for the Muon param group; -1 (default) "
+                         "reuses --warmup_steps, i.e. the historical shared-schedule behaviour. "
+                         "Muon's orthogonalized update doesn't have Adam's early-variance problem "
+                         "that warmup exists to fix, so this lets Muon warm up faster (or not at "
+                         "all, e.g. 1) independently of AdamW's schedule.")
     ap.add_argument("--peak_lr", type=float, default=6e-4)
     ap.add_argument("--amp_dtype", choices=["auto", "fp32", "bf16"], default="auto",
                     help="autocast dtype. 'auto' (default) = bf16 on CUDA, fp32 on CPU, i.e. "
@@ -667,6 +698,14 @@ def main():
                          "identical but not bit-identical (different reduction order), so "
                          "never mix the two within one comparison -- rerun every arm.")
     ap.add_argument("--min_lr_ratio", type=float, default=0.1)
+    ap.add_argument("--lr_schedule", choices=["cosine", "wsd"], default="cosine",
+                    help="'cosine' (default, historical): linear warmup then cosine decay to "
+                         "min_lr_ratio*peak. 'wsd' (warmup-stable-decay / trapezoidal, "
+                         "modded-nanogpt's default): linear warmup, then CONSTANT at peak, then "
+                         "linear decay to min_lr_ratio*peak over the final --decay_frac of "
+                         "max_steps. Applies to both AdamW and Muon's schedules.")
+    ap.add_argument("--decay_frac", type=float, default=0.2,
+                    help="wsd only: fraction of max_steps spent in the final linear decay")
     ap.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -1320,13 +1359,20 @@ def main():
     t0_wall = time.time()          # for wall_dt_s
     t_start = time.time()          # for wall_cum_s
     for step in range(start_step, args.max_steps):
-        # update learning rates: one shared cosine warmup/decay shape (frac in [0,1]),
-        # scaling each group's own base_lr (AdamW peak vs Muon peak).
-        frac = cosine_lr(step, args.warmup_steps, args.max_steps, 1.0, args.min_lr_ratio)
+        # update learning rates: cosine warmup/decay shape (frac in [0,1]), scaling
+        # each group's own base_lr (AdamW peak vs Muon peak). Muon gets its own
+        # warmup length (--muon_warmup_steps, default -1 = same as AdamW's) since
+        # its orthogonalized update doesn't share Adam's early-variance rationale
+        # for needing warmup at all -- see --muon_warmup_steps' help text.
+        frac = lr_frac(args.lr_schedule, step, args.warmup_steps, args.max_steps, args.min_lr_ratio, args.decay_frac)
+        muon_warmup = args.warmup_steps if args.muon_warmup_steps < 0 else args.muon_warmup_steps
+        frac_muon = (frac if muon_warmup == args.warmup_steps
+                     else lr_frac(args.lr_schedule, step, muon_warmup, args.max_steps, args.min_lr_ratio, args.decay_frac))
         lr = args.peak_lr * frac        # representative AdamW lr, for logging
         for pg in opt.param_groups:
-            base = pg.get("base_lr", pg.get("lr", args.peak_lr) / max(frac, 1e-12))
-            pg["lr"] = base * frac
+            f = frac_muon if pg.get("is_muon", False) else frac
+            base = pg.get("base_lr", pg.get("lr", args.peak_lr) / max(f, 1e-12))
+            pg["lr"] = base * f
 
         opt.zero_grad(set_to_none=True)
 
