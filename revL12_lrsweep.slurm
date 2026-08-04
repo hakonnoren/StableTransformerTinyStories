@@ -18,6 +18,15 @@
 # runs, so nothing gets logged (not a "failed" run, just absent). --array
 # below is trimmed to just these two -- sync the updated train.py first.
 #
+# --gres=gpu:1 CAVEAT: first resubmission attempt (array_job=25074093, task 5)
+# landed on a Tesla P100 (idun-11-14) and correctly bailed at the preflight
+# below rather than crashing mid-training -- but it still burned that task's
+# turnaround for nothing. SLURM's --gres has no "not this type" option, so
+# --exclude now explicitly lists the known P100/V100 node ranges (P100:
+# idun-11-[01-14], V100: idun-06-[08-12] + idun-07-[01-03] + idun-11-[15-17])
+# alongside the original bad-A100-node exclude. If a P100/V100 still gets
+# through, IDUN has added a node to one of those pools outside this range.
+#
 # Finished results (best_val, for reference): ref_w10pct 1.1013, w2pct 1.0933,
 # w5pct 1.0951, w20pct 1.1107, wradam 1.0917 (best so far), lr_2x 1.1077,
 # lr_0p5x 1.1198 (worst). Shorter warmup won every comparison run so far;
@@ -74,7 +83,7 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
-#SBATCH --exclude=idun-07-06               # known external-contention node
+#SBATCH --exclude=idun-07-[01-03,06],idun-06-[08-12],idun-11-[01-17]   # P100/V100 pools + the bad-node A100, see header
 #SBATCH --gres=gpu:1                       # ANY GPU, not just A100 -- see header
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
@@ -201,7 +210,8 @@ if [[ -n "${GPU_TOTAL}" && "${GPU_TOTAL}" =~ ^[0-9]+$ ]]; then
   case "${GPU_NAME}" in
     *P100*|*V100*|*P40*|*K80*|*T4*)
       log "FATAL: got '${GPU_NAME}', which predates Ampere -- no native bf16 and no flash"
-      log "       SDPA, and only ${GPU_TOTAL}MiB. Resubmit with --gres=gpu:a100:1 (or h100)."
+      log "       SDPA, and only ${GPU_TOTAL}MiB. Should not happen given --exclude above --"
+      log "       check for a P100/V100 node not covered by it."
       exit 1 ;;
   esac
   NEED=10000

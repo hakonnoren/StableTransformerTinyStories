@@ -11,6 +11,13 @@
 # a reversible-specific hyperparameter that baseline has no equivalent of, so
 # it gets its own file/regime rather than another baseline arm.
 #
+# RESUBMIT STATUS: only mult=5 (index 1) has registered in W&B (best_val
+# 1.1164) -- mult 1/10/20/50 never showed up, most likely still
+# queued/running rather than a code issue (this file uses no new train.py
+# flags, unlike revL12_lrsweep.slurm's two missing arms). --array below is
+# trimmed to just those four; check `squeue -u $USER` if they still don't
+# appear after this resubmission.
+#
 # Arms -- rev_scale_lr_mult in {1, 5, 10, 20, 50}, everything else FIXED at the
 # current standing recipe (cosine, warmup=300 [10% of 3000], peak_lr=6e-4,
 # muon_lr=0.02) so this isolates rev_scale_lr_mult alone, not warmup/LR too:
@@ -46,11 +53,11 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
-#SBATCH --exclude=idun-07-06               # known external-contention node
+#SBATCH --exclude=idun-07-[01-03,06],idun-06-[08-12],idun-11-[01-17]   # P100/V100 pools + the bad-node A100
 #SBATCH --gres=gpu:1                       # ANY GPU, not just A100 -- see header
 #SBATCH --mem=16G
 #SBATCH --time=06:00:00
-#SBATCH --array=0-4
+#SBATCH --array=0,2,3,4                    # only the arms that never registered in wandb -- mult=5 (index 1) finished
 #SBATCH --output=output_revL12_scalemult_%A_%a.txt
 #SBATCH --error=output_revL12_scalemult_%A_%a.err
 

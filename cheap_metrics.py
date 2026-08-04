@@ -22,6 +22,7 @@ W&B format: per-layer scalars (e.g. ``cheap/actgrad/L0``) plus one
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 
 
@@ -125,6 +126,27 @@ def extract_alpha_gamma(model):
         # per-position log|det| contribution of this block = -(sum gamma + sum alpha)
         logdet.append(float(-(g.sum() + a.sum())))
     return {"gamma_mean": gamma_mean, "alpha_mean": alpha_mean, "block_logdet": logdet}
+
+
+@torch.no_grad()
+def extract_alpha_gamma_full(model):
+    """Per-block, per-DIMENSION effective gamma/alpha (diagonal reversible models
+    only). Same centering as extract_alpha_gamma, but returns the full (n_layer,
+    n_embd) arrays instead of their per-layer means. {} if the model has no
+    per-dimension gamma/alpha (no blocks, or linear-map / lowrank_cayley blocks)."""
+    blocks = getattr(model, "blocks", [])
+    if not blocks or not hasattr(blocks[0], "_effective_gamma_alpha"):
+        return {}
+    avg = 0.0
+    rev_cfg = getattr(model, "rev_cfg", None)
+    if rev_cfg is not None and getattr(rev_cfg, "regime", "") == "vpm_scaling":
+        avg = model._avg_corr(1)
+    gamma, alpha = [], []
+    for blk in blocks:
+        g, a = blk._effective_gamma_alpha(avg)
+        gamma.append(g.reshape(-1).numpy())
+        alpha.append(a.reshape(-1).numpy())
+    return {"gamma": np.stack(gamma), "alpha": np.stack(alpha)}
 
 
 # ----------------------------------------------------------------------------

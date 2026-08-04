@@ -67,7 +67,7 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
-#SBATCH --exclude=idun-07-06               # known external-contention node
+#SBATCH --exclude=idun-07-[01-03,06],idun-06-[08-12],idun-11-[01-17]   # P100/V100 pools + the bad-node A100
 #SBATCH --gres=gpu:1                       # ANY GPU, not just A100 -- see revL12_lrsweep.slurm
 #SBATCH --mem=16G
 #SBATCH --time=06:00:00
