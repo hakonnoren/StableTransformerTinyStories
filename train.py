@@ -1,5 +1,6 @@
 
 import argparse
+import contextlib
 import os
 import time
 import csv
@@ -21,6 +22,7 @@ from data import DataConfig, BlockEpochIterator, load_bin
 from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
 from revformer import RevFormerModel, RevConfig
 from cheap_metrics import CheapMetrics
+import ddp_utils
 
 
 class _HFTokAdapter:
@@ -712,6 +714,20 @@ def main():
     # Batch / accumulation
     ap.add_argument("--batch_size", type=int, default=2, help="microbatch size (sequences) per iteration")
     ap.add_argument("--grad_accum_steps", type=int, default=16)
+
+    # ---- distributed (only active under torchrun; see ddp_utils.py) ----
+    # NOTE ON SEMANTICS: --batch_size and --grad_accum_steps describe the GLOBAL
+    # optimizer step. Under N ranks each rank runs grad_accum_steps//N micro-steps
+    # of batch_size sequences, so tokens/step does not depend on the GPU count and
+    # the data order is identical to a 1-GPU run of the same config.
+    ap.add_argument("--ddp_find_unused_params", action="store_true",
+                    help="pass find_unused_parameters=True to DDP. Slower; needed only if a "
+                         "parameter is genuinely unreachable from the loss. Does NOT fix a "
+                         "reachable-but-None gradient -- that is what dense-grad mode is for.")
+    ap.add_argument("--ddp_grad_check", type=int, default=1,
+                    help="under DDP, do one synthetic fwd/bwd at startup and report any "
+                         "parameter that receives no gradient (the classic silent-hang cause). "
+                         "1=on (default), 0=off.")
     ap.add_argument("--seed", type=int, default=1337)
 
     # Eval / logging / ckpt
@@ -781,15 +797,28 @@ def main():
     if args.arch in presymp_softmax_arches and not args.presymp_mlp_use_attn_vel and not args.presymp_mlp_use_p_vel:
         args.presymp_mlp_use_attn_vel = True
 
+    # ---- distributed init ------------------------------------------------------
+    # No-op unless launched by torchrun: without RANK/WORLD_SIZE/LOCAL_RANK in the
+    # environment this returns a disabled state and every ddp_utils helper below
+    # degrades to the identity, so `python train.py ...` is unchanged.
+    ddp = ddp_utils.init_distributed(args.device)
+
     # Use per-run directory to avoid collisions when running multiple arch variants.
     run_dir = os.path.join(args.out_dir, args.arch)
     if args.run_name:
         run_dir = os.path.join(args.out_dir, f"{args.arch}_{args.run_name}")
-    os.makedirs(run_dir, exist_ok=True)
+    if ddp.is_main:
+        os.makedirs(run_dir, exist_ok=True)
+    ddp_utils.barrier(ddp)          # workers must not race the mkdir
+    ddp_utils.redirect_nonmain_stdout(ddp, run_dir)
+    if ddp.enabled:
+        print(f"[ddp] rank {ddp.rank}/{ddp.world_size} local_rank={ddp.local_rank} "
+              f"backend={ddp.backend} device={ddp.device}")
 
     # Weights & Biases (optional). Authenticates without echoing the key.
+    # Main rank only: N ranks initialising the same run would create N W&B runs.
     wandb_run = None
-    if args.wandb:
+    if args.wandb and ddp.is_main:
         import wandb
         _wb_key = os.environ.get("WANDB_API_KEY")
         if not _wb_key and args.wandb_api_key_file and os.path.exists(args.wandb_api_key_file):
@@ -813,9 +842,35 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    device = args.device
+    # Under torchrun this is the rank's own cuda:<local_rank>; otherwise args.device.
+    device = ddp.device
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("CUDA requested but not available.")
+
+    # Global-batch bookkeeping: --batch_size / --grad_accum_steps describe the whole
+    # optimizer step, and the accumulation is what gets split across ranks. Refusing
+    # a non-divisible split is deliberate -- silently rounding would change the token
+    # budget, which is exactly the quantity the OWT jobs are matched on.
+    local_accum = args.grad_accum_steps
+    local_eval_batches = args.eval_batches
+    if ddp.enabled:
+        if args.grad_accum_steps % ddp.world_size != 0:
+            raise SystemExit(
+                f"--grad_accum_steps ({args.grad_accum_steps}) must be divisible by the "
+                f"world size ({ddp.world_size}); tokens/step would otherwise change.")
+        if args.eval_batches % ddp.world_size != 0:
+            raise SystemExit(
+                f"--eval_batches ({args.eval_batches}) must be divisible by the world "
+                f"size ({ddp.world_size}); the val set would otherwise not be covered evenly.")
+        local_accum = args.grad_accum_steps // ddp.world_size
+        local_eval_batches = args.eval_batches // ddp.world_size
+        # See revformer/rev_backprop.py: without this, a parameter whose gradient
+        # comes back None stalls DDP's all-reduce and the job hangs rather than fails.
+        from revformer.rev_backprop import set_dense_grads
+        set_dense_grads(True)
+        print(f"[ddp] global batch {args.batch_size}x{args.grad_accum_steps} -> per-rank "
+              f"{args.batch_size}x{local_accum}; tokens/step "
+              f"{args.batch_size * args.grad_accum_steps * args.block_size:,} (unchanged)")
     # 'auto' reproduces the historical behaviour exactly: bf16 on CUDA, fp32 on CPU.
     # Autocast is then enabled iff the dtype is not fp32, so forcing bf16 on CPU
     # actually takes effect (needed to reproduce CUDA numerics without a GPU).
@@ -835,7 +890,8 @@ def main():
     train_tokens = load_bin(train_path)
     val_tokens = load_bin(val_path)
 
-    dcfg = DataConfig(block_size=args.block_size, batch_size=args.batch_size, grad_accum_steps=args.grad_accum_steps, seed=args.seed, device=device)
+    dcfg = DataConfig(block_size=args.block_size, batch_size=args.batch_size, grad_accum_steps=args.grad_accum_steps, seed=args.seed, device=device,
+                      rank=ddp.rank, world_size=ddp.world_size)
     train_it = BlockEpochIterator(train_tokens, dcfg, split="train")
     val_it = BlockEpochIterator(val_tokens, dcfg, split="val")
 
@@ -1265,6 +1321,26 @@ def main():
         wandb_run.summary.update({"n_params": n_total, "n_params_emb": n_emb,
                                   "n_params_blocks": n_blocks, "n_params_rest": n_rest})
 
+    # DDP hang pre-flight. Runs HERE -- after the model is fully configured
+    # (mem_efficient, requires_grad toggles) but before CheapMetrics registers its
+    # backward hooks and before the drift probe -- so the synthetic fwd/bwd cannot
+    # pollute either diagnostic. See ddp_utils.report_missing_grads for why a
+    # parameter with no gradient is a deadlock rather than an error under DDP.
+    if ddp.enabled and args.ddp_grad_check:
+        missing = ddp_utils.report_missing_grads(
+            model, ddp, device, args.block_size, args.vocab_size, amp_dtype)
+        if missing:
+            print(f"[ddp][grad-check] {len(missing)} parameter(s) received NO gradient:")
+            for n in missing[:20]:
+                print(f"[ddp][grad-check]   {n}")
+            if len(missing) > 20:
+                print(f"[ddp][grad-check]   ... and {len(missing) - 20} more")
+            print("[ddp][grad-check] dense-grad mode covers these inside the reversible "
+                  "stack; anything listed OUTSIDE blocks.* may still stall the all-reduce "
+                  "-- rerun with --ddp_find_unused_params if the first step hangs.")
+        else:
+            print("[ddp][grad-check] every trainable parameter receives a gradient")
+
     opt = build_optimizer(model, peak_lr=args.peak_lr, betas=tuple(args.betas), scalar_lr_mult=args.scalar_lr_mult,
                           rev_scale_lr_mult=args.rev_scale_lr_mult, optimizer=args.optimizer,
                           muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
@@ -1282,13 +1358,24 @@ def main():
         best_val = ckpt.get("best_val", float("inf"))
         print(f"Resumed from {args.resume} at step {start_step}, best_val={best_val}")
 
+    # Main-rank-only wrappers around the CSV helpers. Every rank walks the same
+    # logging branches (the collectives inside them require that), but only rank 0
+    # may touch the file -- N ranks appending to one CSV interleaves rows.
+    def _csv_header_main(path, header):
+        if ddp.is_main:
+            ensure_csv_header(path, header)
+
+    def _csv_row_main(path, row):
+        if ddp.is_main:
+            append_csv_row(path, row)
+
     metrics_path = os.path.join(run_dir, "metrics.csv")
     # wall_dt_s: time since previous log print (train rows)
     # wall_cum_s: cumulative wall time since start of run
     # tokens_step: tokens processed per optimizer step
     # tokens_cum: cumulative tokens processed since step 0
     # sched_t_start / sched_t_end: cumulative schedule clock reported by the model (when available)
-    ensure_csv_header(
+    _csv_header_main(
         metrics_path,
         ["step", "train_loss", "val_loss", "lr", "wall_dt_s", "wall_cum_s", "tokens_step", "tokens_cum", "h_mean", "hY_mean", "xi_mean", "rX", "rP", "c_log_mean", "c_lin_mean", "leak_warnings", "sched_t_start", "sched_t_end"],
     )
@@ -1324,7 +1411,10 @@ def main():
     # at each eval. See cheap_metrics.py.
     cheap = None
     if args.cheap_metrics:
-        fx, fy = next(val_it)
+        # unsharded(): keep this probe draw world-size-independent so evaluation
+        # later starts from the same position as a single-GPU run. See data.py.
+        with val_it.unsharded():
+            fx, fy = next(val_it)
         nb = max(1, min(int(args.cheap_batch_size), fx.shape[0]))
         fx, fy = fx[:nb].to(device), fy[:nb].to(device)
         cheap = CheapMetrics(
@@ -1342,7 +1432,8 @@ def main():
             from revformer.rev_backprop import reconstruction_drift, stack_supported
             if hasattr(model, "blocks") and stack_supported(model.blocks):
                 drift_fn = reconstruction_drift
-                dx, _ = next(val_it)
+                with val_it.unsharded():        # world-size-independent probe draw
+                    dx, _ = next(val_it)
                 drift_idx = dx[:max(1, min(4, dx.shape[0]))].to(device)
                 print(f"[{args.arch}][drift] tracking reconstruction drift on a "
                       f"{tuple(drift_idx.shape)} batch at every eval")
@@ -1351,6 +1442,15 @@ def main():
                       f"invertible ReversibleBlock stack")
         except ImportError as e:
             print(f"[{args.arch}][drift] --track_recon_drift unavailable: {e}")
+
+    # ---- DDP wrap --------------------------------------------------------------
+    # `model` deliberately stays the *raw* module from here on: checkpoints,
+    # cheap_metrics, the drift probe, sampling, gradient clipping and every
+    # `getattr(model, "last_*")` diagnostic all keep working untouched, and the
+    # saved state_dict has no "module." prefix (so --resume and the analysis
+    # scripts stay compatible with single-GPU checkpoints). Only the training
+    # forward/backward goes through `train_model`.
+    train_model = ddp_utils.wrap(model, ddp, find_unused_parameters=args.ddp_find_unused_params)
 
     # Training loop
     if device.startswith("cuda"):
@@ -1378,15 +1478,25 @@ def main():
 
         loss_accum = 0.0
         restarts_accum = 0
-        for micro in range(args.grad_accum_steps):
+        for micro in range(local_accum):
             xb, yb = next(train_it)
             xb = xb.to(device)
             yb = yb.to(device)
 
-            with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
-                _, loss = model(xb, yb, global_step=step)
-                loss = loss / args.grad_accum_steps
-            loss.backward()
+            # Suppress the gradient all-reduce on every micro-step but the last:
+            # DDP would otherwise sync local_accum times per optimizer step instead
+            # of once, for identical results at many times the interconnect cost.
+            sync = (micro == local_accum - 1)
+            sync_ctx = contextlib.nullcontext() if (sync or not ddp.enabled) else train_model.no_sync()
+            with sync_ctx:
+                with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype, enabled=(amp_dtype != torch.float32)):
+                    _, loss = train_model(xb, yb, global_step=step)
+                    # Divide by the LOCAL count: DDP's all-reduce averages over ranks,
+                    # so local_accum * world_size = grad_accum_steps is applied in
+                    # total and the gradient is the mean over the full global batch.
+                    # With DDP off local_accum == args.grad_accum_steps, unchanged.
+                    loss = loss / local_accum
+                loss.backward()
             loss_accum += loss.item()
             if hasattr(model, "last_restart_count"):
                 restarts_accum += int(getattr(model, "last_restart_count", 0))
@@ -1410,6 +1520,10 @@ def main():
         wall_cum = time.time() - t_start
 
         if step % args.log_interval == 0:
+            # Collective: every rank reaches this branch on the same steps, so the
+            # all-reduce cannot deadlock. loss_accum is this rank's share of the
+            # global batch; averaging recovers the loss a 1-GPU run would report.
+            loss_accum = ddp_utils.all_reduce_mean(loss_accum, ddp)
             dt = time.time() - t0_wall
             t0_wall = time.time()
             extra = ""
@@ -1423,7 +1537,7 @@ def main():
                 f"[{args.arch}] step {step:6d} | loss {loss_accum:.4f} | lr {lr:.2e} | "
                 f"toks/step {toks_per_step} | wall_dt {dt:.2f}s | wall {wall_cum:.1f}s{extra}"
             )
-            append_csv_row(
+            _csv_row_main(
                 metrics_path,
                 [
                     step,
@@ -1457,13 +1571,25 @@ def main():
                 wandb_run.log(payload, step=step)
 
         if step % args.eval_interval == 0 and step > 0:
-            val_loss = estimate_loss(model, val_it, device, args.eval_batches, amp_dtype, global_step=step)
+            # Every rank evaluates its own shard of the SAME val stream (val_it is
+            # sharded identically to train_it), then the means are averaged. The
+            # union of shards is exactly the args.eval_batches batches a 1-GPU run
+            # would have used, so the reported val loss is comparable across world
+            # sizes -- and every rank must call this, hence no is_main guard.
+            val_loss = estimate_loss(model, val_it, device, local_eval_batches, amp_dtype, global_step=step)
+            val_loss = ddp_utils.all_reduce_mean(val_loss, ddp)
             print(f"[{args.arch}][eval] step {step:6d} | val_loss {val_loss:.4f}")
+            # print_sample draws its prompt from val_it (build_prompt_from_eval calls
+            # next() on it), so it MUST run on every rank: letting only rank 0 consume
+            # would advance that rank's val stream past the others and the eval shards
+            # would stop lining up from here on. It is not a collective, so the cost is
+            # one short generation per rank; only rank 0 records the result.
             if args.sample_interval > 0 and step % args.sample_interval == 0:
                 rec = print_sample(model, val_tokens, device, args, global_step=step,
                                    enc=enc_sample, val_it=val_it)
-                _record_sample(rec, step)
-            append_csv_row(
+                if ddp.is_main:
+                    _record_sample(rec, step)
+            _csv_row_main(
                 metrics_path,
                 [
                     step,
@@ -1486,22 +1612,30 @@ def main():
                     f"{getattr(model, 'last_t_end', '')}",
                 ],
             )
-            # checkpoint best
+            # checkpoint best. best_val is tracked on every rank (val_loss is already
+            # all-reduced, so they agree), but only rank 0 writes the file. `model` is
+            # the raw module, so the state_dict has no "module." prefix and stays
+            # loadable by --resume and the analysis scripts regardless of world size.
             if val_loss < best_val:
                 best_val = val_loss
-                ckpt_path = os.path.join(run_dir, f"best_{args.arch}.pt")
-                torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best_val": best_val, "cfg": asdict(mcfg), "args": vars(args)}, ckpt_path)
-                print(f"  saved best checkpoint -> {ckpt_path}")
+                if ddp.is_main:
+                    ckpt_path = os.path.join(run_dir, f"best_{args.arch}.pt")
+                    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best_val": best_val, "cfg": asdict(mcfg), "args": vars(args)}, ckpt_path)
+                    print(f"  saved best checkpoint -> {ckpt_path}")
             if wandb_run is not None:
                 wandb_run.log({"val_loss": val_loss, "best_val": best_val, "lr": lr}, step=step)
-            if cheap is not None:
+            # Both diagnostics below run on a FIXED batch captured at startup, not on
+            # val_it, so restricting them to rank 0 cannot desync anything. cheap's
+            # grad-norm readings are taken after opt.step(), i.e. from the already
+            # all-reduced gradients, so rank 0's view is the global one.
+            if cheap is not None and ddp.is_main:
                 cheap.snapshot(step)
             # Reconstruction drift: forward the reversible stack keeping every
             # activation, invert from the top, compare. Measures the conditioning of
             # the inverse map at the CURRENT weights, so it moves as gamma/alpha
             # learn -- a one-off measurement at init is not representative. Runs
             # inside the same autocast context training uses, and under no_grad.
-            if args.track_recon_drift and drift_fn is not None:
+            if args.track_recon_drift and drift_fn is not None and ddp.is_main:
                 with torch.autocast(device_type=device.split(':')[0], dtype=amp_dtype,
                                     enabled=(amp_dtype != torch.float32)):
                     d = drift_fn(model, drift_idx)
@@ -1519,18 +1653,20 @@ def main():
                                    **{f"recon_drift/l{i}": float(v)
                                       for i, v in enumerate(d["recon_drift"])}}, step=step)
 
-    # final checkpoint
-    ckpt_path = os.path.join(run_dir, f"final_{args.arch}.pt")
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": args.max_steps, "best_val": best_val, "cfg": asdict(mcfg), "args": vars(args)}, ckpt_path)
-    print(f"saved final checkpoint -> {ckpt_path}")
+    # final checkpoint (rank 0 writes; `model` is the raw module -- no "module." prefix)
+    if ddp.is_main:
+        ckpt_path = os.path.join(run_dir, f"final_{args.arch}.pt")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": args.max_steps, "best_val": best_val, "cfg": asdict(mcfg), "args": vars(args)}, ckpt_path)
+        print(f"saved final checkpoint -> {ckpt_path}")
     print(f"[{args.arch}] SUMMARY best_val={best_val:.6f} run_dir={run_dir}")
 
     if args.sample_interval > 0:
         rec = print_sample(model, val_tokens, device, args, global_step=args.max_steps,
                            enc=enc_sample, val_it=val_it)
-        _record_sample(rec, args.max_steps)
+        if ddp.is_main:
+            _record_sample(rec, args.max_steps)
 
-    if args.plot:
+    if args.plot and ddp.is_main:
         plot_metrics_csv(metrics_path, plot_path, title=f"{args.arch} loss")
 
     if cheap is not None:
@@ -1538,6 +1674,10 @@ def main():
 
     if wandb_run is not None:
         wandb_run.finish()
+
+    # Barrier then destroy: leaving the group up on exit makes NCCL log a warning
+    # and can leave a rank wedged if another is still writing its checkpoint.
+    ddp_utils.shutdown(ddp)
 
 
 if __name__ == "__main__":

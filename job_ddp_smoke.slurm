@@ -92,15 +92,31 @@ declare -a ARMS=(
   "--arch reversible --rev_regime vf_scaling  ${NARROW[*]} ${REV[*]}"
 )
 
+# ── Is the DDP code even here? ───────────────────────────────────────────────
+# Checked explicitly because the failure is silent: an older train.py has no
+# torchrun handling at all, so `torchrun --nproc_per_node=2 train.py` happily
+# launches TWO INDEPENDENT single-GPU runs. Every arm then "passes" while
+# testing nothing, both processes write the same checkpoint path, and the losses
+# look identical (same seed, same unsharded data) which reads as success.
+if ! grep -q "^import ddp_utils" train.py; then
+  log "FATAL: train.py does not import ddp_utils -- this checkout predates the DDP"
+  log "       work. Sync train.py, data.py, ddp_utils.py and revformer/rev_backprop.py"
+  log "       before running this test."
+  exit 1
+fi
+python3 -c "import ddp_utils, sys; sys.stderr.write(f'ddp_utils: {ddp_utils.__file__}\n')" || {
+  log "FATAL: cannot import ddp_utils.py from $(pwd)"; exit 1; }
+
 fail=0
 for i in "${!ARMS[@]}"; do
   name=${NAMES[$i]}
+  armlog="${OUTDIR}/arm_${name}.log"
   log "---- arm ${i}: ${name} ----"
   # timeout: a DDP hang must look like a failure, not like a slow job.
   timeout 480 torchrun --standalone --nproc_per_node="${NPROC}" train.py \
       "${SMOKE[@]}" ${ARMS[$i]} \
-      --out_dir "${OUTDIR}" --run_name "smoke_${name}"
-  rc=$?
+      --out_dir "${OUTDIR}" --run_name "smoke_${name}" 2>&1 | tee "${armlog}"
+  rc=${PIPESTATUS[0]}
   if (( rc == 124 )); then
     log "FAIL [${name}]: TIMED OUT -- this is the DDP hang. Re-run this job with"
     log "      --ddp_find_unused_params added to SMOKE and see if it clears."
@@ -108,8 +124,16 @@ for i in "${!ARMS[@]}"; do
   elif (( rc != 0 )); then
     log "FAIL [${name}]: exit ${rc}"
     fail=1
+  elif ! grep -q "\[ddp\] rank .*/${NPROC} " "${armlog}"; then
+    # Exit 0 is NOT sufficient -- see the note above. The banner is printed by
+    # train.py only after it has actually joined the process group.
+    log "FAIL [${name}]: ran clean but printed no '[ddp] rank i/${NPROC}' banner."
+    log "      DDP did NOT engage: torchrun started ${NPROC} independent single-GPU"
+    log "      runs. Nothing about distributed training was exercised."
+    fail=1
   else
-    log "ok   [${name}]"
+    ranks=$(grep -c "\[ddp\] rank .*/${NPROC} " "${armlog}")
+    log "ok   [${name}]  (${ranks}/${NPROC} ranks joined the process group)"
   fi
 done
 
