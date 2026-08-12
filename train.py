@@ -21,6 +21,7 @@ except ImportError:
 from data import DataConfig, BlockEpochIterator, load_bin
 from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
 from revformer import RevFormerModel, RevConfig
+from yurii_ext import YuriiExtModel, YuriiExtConfig
 from cheap_metrics import CheapMetrics
 import ddp_utils
 
@@ -468,7 +469,7 @@ def main():
         "--arch",
         type=str,
         default="yurii_lt",
-        choices=["baseline", "reversible", "yurii_lt", "presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler", "lin_baseline", "lin_yurii", "lin_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2"],
+        choices=["baseline", "reversible", "yurii_lt", "yurii_ext", "presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler", "lin_baseline", "lin_yurii", "lin_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2"],
         help="model architecture / attention discretization",
     )
 
@@ -676,6 +677,28 @@ def main():
     ap.add_argument("--yurii_noise_loc", type=str, default="v", choices=["dx", "v", "xin"], help="inject noise into dx, v, or lookahead xin")
     ap.add_argument("--yurii_restart", type=str, default="none", choices=["none", "speed", "loss"], help="restart criterion")
     ap.add_argument("--yurii_restart_min_layer", type=int, default=1, help="start checking restart conditions at this layer index")
+
+    # yurii_ext: Polyak + Lie-Trotter with determinant-preserving extensions (yurii_ext.py).
+    # Neither flag changes the layer determinant, so all four arms
+    # (none / adaptive / gyro / both) contract volume identically at equal beta.
+    ap.add_argument("--yx_adaptive", action="store_true",
+                    help="channel-wise state-dependent damping S=beta*exp(-eps*center(tanh(LN x))); "
+                         "geometric mean over channels stays exactly beta. +1 scalar per substep.")
+    ap.add_argument("--yx_gyro", action="store_true",
+                    help="reversible shear mixer on the velocity (p+=w q; q-=w p), det=1, giving the "
+                         "retained momentum a phase beta*e^{+-i theta}. +1 scalar per substep.")
+    ap.add_argument("--yx_eps_max", type=float, default=0.5,
+                    help="bound on eps: per-channel retention stays in [beta*e^-2eps, beta*e^+2eps]")
+    ap.add_argument("--yx_omega_max", type=float, default=0.5,
+                    help="bound on omega. det is 1 for any omega, but shear conditioning degrades with it.")
+    ap.add_argument("--yx_gyro_groups", type=int, default=1,
+                    help="channel-pair groups with independent omega (must divide n_embd/2)")
+    ap.add_argument("--yx_no_alternate", action="store_true",
+                    help="keep the same channel pairing at every depth instead of shifting it by one "
+                         "channel in odd layers")
+    ap.add_argument("--yx_beta_init", type=float, default=0.9, help="initial momentum retention")
+    ap.add_argument("--yx_gamma_init", type=float, default=1.0, help="initial drift gain")
+    ap.add_argument("--yx_eta_init", type=float, default=1.0, help="initial shear step size")
 
     # Training hyperparams (paper: 10k steps, warmup 1k, peak AdamW LR 6e-4, bf16, clip 1.0)
     ap.add_argument("--max_steps", type=int, default=10_000)
@@ -940,6 +963,24 @@ def main():
             restart_min_layer=args.yurii_restart_min_layer,
             no_mlp=args.no_mlp,
         )
+    elif args.arch == "yurii_ext":
+        ext_cfg = YuriiExtConfig(
+            adaptive=args.yx_adaptive,
+            gyro=args.yx_gyro,
+            eps_max=args.yx_eps_max,
+            omega_max=args.yx_omega_max,
+            gyro_groups=args.yx_gyro_groups,
+            gyro_alternate=(not args.yx_no_alternate),
+            beta_init=args.yx_beta_init,
+            gamma_init=args.yx_gamma_init,
+            eta_init=args.yx_eta_init,
+            use_v0_init=(not args.no_v0_init),
+            no_mlp=args.no_mlp,
+        )
+        model = YuriiExtModel(mcfg, ext_cfg)
+        print(f"[{args.arch}] arm={ext_cfg.arm_name()} "
+              f"log|det|/token at init = {model.log_det_per_token():.4f} "
+              f"(identical across arms by construction -- see yurii_ext.py)")
     else:
         # Presymp family: same overall architecture, different attention discretization
         if args.arch == "presymp":

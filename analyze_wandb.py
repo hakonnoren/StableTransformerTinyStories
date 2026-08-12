@@ -255,6 +255,71 @@ def main():
         plt.close(fig)
         print("wrote", out)
 
+    def write_latex_table(fname="results_table.tex"):
+        """Best/final val loss + final train loss per run, as a plain LaTeX table.
+
+        Reversible runs (config arch != "baseline") come first, sorted as in
+        `runs`; the baseline(s) follow below an \\hline and are excluded from
+        the bolding comparison, since "best among reversible" is the point.
+        """
+        def is_baseline(r):
+            return r.config.get("arch", "baseline") == "baseline"
+
+        def esc(s):
+            return s.replace("_", "\\_")
+
+        rows = []
+        for r in runs:
+            _, val_y = series(r.id, "val_loss")
+            _, train_y = series(r.id, "train_loss")
+            rows.append({
+                "label": labels[r.id],
+                "baseline": is_baseline(r),
+                "best_val": r.summary.get("best_val"),
+                "final_val": float(val_y[-1]) if val_y is not None and len(val_y) else None,
+                "train_loss": float(train_y[-1]) if train_y is not None and len(train_y) else None,
+            })
+
+        rev_rows = [row for row in rows if not row["baseline"]]
+        base_rows = [row for row in rows if row["baseline"]]
+
+        cols = ("best_val", "final_val", "train_loss")
+        best = {}
+        for key in cols:
+            vals = [row[key] for row in rev_rows if row[key] is not None]
+            best[key] = min(vals) if vals else None
+
+        def fmt(row, key):
+            v = row[key]
+            if v is None:
+                return "--"
+            s = f"{v:.4f}"
+            if not row["baseline"] and v == best[key]:
+                s = f"\\textbf{{{s}}}"
+            return s
+
+        def row_line(row):
+            return (f"{esc(row['label'])} & {fmt(row, 'best_val')} & "
+                    f"{fmt(row, 'final_val')} & {fmt(row, 'train_loss')} \\\\")
+
+        lines = [
+            r"\begin{tabular}{lccc}",
+            r"\hline",
+            r"Model & Best val loss & Final val loss & Train loss \\",
+            r"\hline",
+        ]
+        lines += [row_line(row) for row in rev_rows]
+        if base_rows:
+            lines.append(r"\hline")
+            lines += [row_line(row) for row in base_rows]
+        lines.append(r"\hline")
+        lines.append(r"\end{tabular}")
+
+        out = os.path.join(args.out_dir, fname)
+        with open(out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print("wrote", out)
+
     # ---- figures ---------------------------------------------------------------
     # Loss: log-y by default, x trimmed past the initial hockey-stick (y rescaled
     # to the visible window) so models separate where the curves flatten.
@@ -290,6 +355,8 @@ def main():
     # training-time evolution of the per-layer structure (layer x step heatmaps)
     for metric in ("act_erank", "act_token_sim", "actgrad", "attn_entropy_norm", "gamma_mean"):
         evolution_heatmap(metric, f"evo_{metric}")
+
+    write_latex_table()
 
     print(f"\nDone. Plots in {args.out_dir}/")
 
