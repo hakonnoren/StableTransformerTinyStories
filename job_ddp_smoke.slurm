@@ -98,14 +98,29 @@ declare -a ARMS=(
 # launches TWO INDEPENDENT single-GPU runs. Every arm then "passes" while
 # testing nothing, both processes write the same checkpoint path, and the losses
 # look identical (same seed, same unsharded data) which reads as success.
-if ! grep -q "^import ddp_utils" train.py; then
-  log "FATAL: train.py does not import ddp_utils -- this checkout predates the DDP"
-  log "       work. Sync train.py, data.py, ddp_utils.py and revformer/rev_backprop.py"
-  log "       before running this test."
+# The DDP work spans FOUR files. A partial sync is the likely mistake -- and it
+# fails late and confusingly (train.py imports a symbol an old rev_backprop.py
+# does not have), so every file is checked for a marker of its change up front.
+missing=0
+check() {  # <file> <grep-pattern> <what it is>
+  if [[ ! -f "$1" ]]; then log "MISSING FILE : $1"; missing=1
+  elif ! grep -q "$2" "$1"; then log "STALE        : $1  (no '$3')"; missing=1
+  else log "ok           : $1"; fi
+}
+check train.py                  "^import ddp_utils"  "import ddp_utils"
+check ddp_utils.py              "def init_distributed" "init_distributed"
+check data.py                   "world_size"          "rank/world_size sharding"
+check revformer/rev_backprop.py "def set_dense_grads" "set_dense_grads"
+if (( missing )); then
+  log "FATAL: the checkout is missing or stale on the files above. Copy ALL FOUR"
+  log "       from the working tree, then rerun. Verify with:"
+  log "         md5sum train.py data.py ddp_utils.py revformer/rev_backprop.py"
   exit 1
 fi
 python3 -c "import ddp_utils, sys; sys.stderr.write(f'ddp_utils: {ddp_utils.__file__}\n')" || {
   log "FATAL: cannot import ddp_utils.py from $(pwd)"; exit 1; }
+python3 -c "from revformer.rev_backprop import set_dense_grads" || {
+  log "FATAL: revformer/rev_backprop.py lacks set_dense_grads (stale copy)"; exit 1; }
 
 fail=0
 for i in "${!ARMS[@]}"; do

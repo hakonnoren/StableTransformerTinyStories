@@ -63,10 +63,24 @@
 #      whose Rust core releases the GIL, so these are real parallel threads. No
 #      multiprocessing, no temp shards, no extra disk.
 #
-# --num_threads defaults to SLURM_CPUS_PER_TASK. Expect well under 2h; the job
-# prints a live docs/s and ETA every batch, so you will know within a minute.
-# --time stays generously above the estimate because it is extrapolated from a
-# laptop, not measured on a CPUQ node.
+# ── WHY 16 CPUs AND NOT 32 ───────────────────────────────────────────────────
+# Because it is measured, not assumed. The loop is threaded encode + a serial
+# flatten/write, so Amdahl sets a hard ceiling. On the benchmark corpus the
+# serial part is ~12% of single-threaded runtime (after the np.fromiter change
+# above cut it 1.7x), which caps end-to-end at ~8x however many threads you add:
+#
+#     threads   8      16      32      inf
+#     speedup  4.3x   5.7x    6.8x    8.3x
+#
+# So 16 -> 32 buys ~19% more for 2x the cores, and a 16-core request backfills
+# far sooner on a busy CPUQ than a 32-core one. Since the job is short, spending
+# less time queued almost certainly beats the 19%. Raise it if CPUQ is idle.
+#
+# --num_threads defaults to SLURM_CPUS_PER_TASK, so changing --cpus-per-task is
+# enough. Estimate is ~1-2h; --time=6h is 3-6x that, kept as headroom because the
+# figures above come from a laptop, not a CPUQ node -- and the script has no
+# checkpointing, so being killed at the wall means starting over. The job prints
+# live docs/s and an ETA every batch, so the real number shows up within a minute.
 #
 # Usage:   sbatch job_owt_preprocess.slurm
 # Output:  data/openwebtext_train.bin , data/openwebtext_val.bin
@@ -77,9 +91,9 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=CPUQ
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=32       # encode threads scale with this; CPUQ nodes have 56
+#SBATCH --cpus-per-task=16       # measured sweet spot -- see RUNTIME; also backfills fast
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=output_owt_preprocess.txt
 #SBATCH --error=output_owt_preprocess.err
 

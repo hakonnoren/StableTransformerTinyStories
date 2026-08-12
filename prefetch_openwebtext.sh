@@ -29,7 +29,7 @@ echo " HF_HOME : $HF_HOME"
 echo " disk    : $(df -h "$HF_HOME" | tail -1 | awk '{print $4" free of "$2}')"
 echo "=============================================================="
 echo
-echo "OpenWebText needs roughly 55GB here (compressed shards + extracted arrow)."
+echo "OpenWebText needs roughly 64GB here (24GB download + 40GB extracted arrow)."
 echo "The encoded bins written later by job_owt_preprocess.slurm need a further"
 echo "~18GB under data/ in the repo. Ctrl-C now if either is short."
 echo

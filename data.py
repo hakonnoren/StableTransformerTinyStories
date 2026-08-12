@@ -1,4 +1,5 @@
 
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import Iterator, Tuple, Optional
@@ -14,6 +15,10 @@ class DataConfig:
     grad_accum_steps: int = 1
     seed: int = 1337
     device: str = "cuda"
+    # Data-parallel sharding. Defaults (0, 1) reproduce the historical
+    # single-process behaviour exactly -- see BlockEpochIterator.__next__.
+    rank: int = 0
+    world_size: int = 1
 
 
 class BlockEpochIterator:
@@ -57,14 +62,47 @@ class BlockEpochIterator:
     def __iter__(self) -> "BlockEpochIterator":
         return self
 
+    @contextlib.contextmanager
+    def unsharded(self):
+        """Draw rank-independent batches for the duration of the block.
+
+        For one-off *probe* batches (cheap_metrics' fixed batch, the reconstruction-
+        drift batch) that are pulled from the val iterator at startup. Those draws
+        must advance the stream by the same amount no matter how many ranks are
+        running, otherwise the position at which evaluation subsequently begins
+        depends on the world size and val loss stops being comparable between a
+        1-GPU and an N-GPU run of the same config.
+
+        Inside the block every rank takes the identical batch and _pos advances by
+        batch_size (not batch_size*world_size), exactly as a single-process run
+        does -- so single-process behaviour is untouched and the N-rank stream stays
+        aligned across ranks.
+        """
+        rank, world = self.cfg.rank, self.cfg.world_size
+        self.cfg.rank, self.cfg.world_size = 0, 1
+        try:
+            yield self
+        finally:
+            self.cfg.rank, self.cfg.world_size = rank, world
+
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = self.cfg.batch_size
-        if self._pos + bs > len(self._starts):
+        ws = max(1, int(self.cfg.world_size))
+        # Blocks consumed *globally* per micro-step. Rank r takes the r-th slice of
+        # that span, so the union over ranks at micro-step m is exactly the span a
+        # 1-GPU run would have consumed at micro-steps m*ws .. m*ws+ws-1, in the same
+        # order. Data order is therefore identical to single-GPU for any world size,
+        # which is what lets DDP and non-DDP runs of the same config be compared
+        # directly (the paper controls for data order across arms).
+        # With ws=1 this reduces term-for-term to the original two lines.
+        span = bs * ws
+        if self._pos + span > len(self._starts):
             # start new epoch
             self._prepare_epoch()
 
-        batch_starts = self._starts[self._pos:self._pos + bs]
-        self._pos += bs
+        lo = self._pos + self.cfg.rank * bs
+        batch_starts = self._starts[lo:lo + bs]
+        self._pos += span
 
         T = self.T
         x = np.stack([self.tokens[s:s+T] for s in batch_starts], axis=0)

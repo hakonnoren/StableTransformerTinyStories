@@ -62,7 +62,18 @@ def init_distributed(device_arg: str) -> DDPState:
         device = device_arg
         backend = "gloo"
 
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    # device_id pins this rank to its GPU up front. Without it NCCL warns
+    # "Guessing device ID based on global rank. This can cause a hang if rank to
+    # GPU mapping is heterogeneous", and collectives that carry no tensor (our
+    # barrier) have to infer a device -- which is a real hang risk on an 8-GPU
+    # node, not a cosmetic warning. Passing it also silences the barrier() warning.
+    kwargs = {}
+    if device.startswith("cuda"):
+        kwargs["device_id"] = torch.device(device)
+    try:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, **kwargs)
+    except TypeError:                     # torch too old for device_id
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     return DDPState(enabled=True, rank=rank, local_rank=local_rank,
                     world_size=world_size, device=device, backend=backend)
 

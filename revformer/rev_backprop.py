@@ -83,6 +83,39 @@ def _check_dropout_replayable(blocks) -> None:
                     "with --dropout 0 or set model.mem_efficient = False.")
 
 
+# ---------------------------------------------------------------------------
+# Dense-gradient mode (required under DDP)
+# ---------------------------------------------------------------------------
+# _RevStack.backward uses autograd.grad(..., allow_unused=True) and leaves None in
+# the gradient tuple for any parameter that produced nothing. Under single-process
+# training that is exactly right: .grad stays None and the optimizer skips the
+# parameter entirely (notably, no decoupled weight decay is applied to it).
+#
+# Under DDP it is a deadlock. DDP installs a hook on every parameter's
+# AccumulateGrad node and blocks the backward all-reduce until all of them have
+# fired. A parameter that is reachable in the graph -- these are, they are explicit
+# Function inputs -- but comes back None never fires its hook, so the collective
+# never completes and the job HANGS until the watchdog kills it. This is not
+# something find_unused_parameters=True fixes; that flag only covers parameters
+# unreachable from the loss.
+#
+# Turning this on substitutes an explicit zero for each such None, which is the
+# same value mathematically and makes the hook fire. It is OFF by default so
+# single-process runs keep their existing optimizer semantics unchanged; train.py
+# turns it on only when it has actually joined a process group.
+_DENSE_GRADS = False
+
+
+def set_dense_grads(flag: bool) -> None:
+    """Emit explicit zeros instead of None for parameters with no gradient."""
+    global _DENSE_GRADS
+    _DENSE_GRADS = bool(flag)
+
+
+def dense_grads_enabled() -> bool:
+    return _DENSE_GRADS
+
+
 def _block_params(block):
     """Trainable parameters that block's forward actually depends on.
 
@@ -181,6 +214,12 @@ class _RevStack(torch.autograd.Function):
         # would differentiate a subtly different function.
         ctx.device_type = y0.device.type
         ctx.ac_enabled, ctx.ac_dtype = _autocast_state(ctx.device_type)
+        # Metadata only (no tensor refs, so nothing is kept alive) -- lets backward
+        # materialise a correctly-shaped zero for any parameter that comes back
+        # with no gradient. See set_dense_grads.
+        ctx.dense_grads = _DENSE_GRADS
+        ctx.param_meta = ([(p.shape, p.dtype, p.device) for p in params]
+                          if _DENSE_GRADS else None)
 
         avg = avg_t if ctx.has_avg else avg_c
         ckpts = []
@@ -257,6 +296,14 @@ class _RevStack(torch.autograd.Function):
                         continue
                     grads[slot] = gp if grads[slot] is None else grads[slot] + gp
                 y = y_in.detach()
+
+        # Under DDP a None here would stall the gradient all-reduce forever; swap in
+        # an explicit zero so every parameter's hook fires. See set_dense_grads.
+        if ctx.dense_grads:
+            for i, g in enumerate(grads):
+                if g is None:
+                    shape, dtype, dev = ctx.param_meta[i]
+                    grads[i] = torch.zeros(shape, dtype=dtype, device=dev)
 
         # (y0, avg_t, blocks, avg_c, segment, index, *params)
         return (dy, d_avg, None, None, None, None, *grads)
