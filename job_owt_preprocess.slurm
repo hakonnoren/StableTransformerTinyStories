@@ -4,9 +4,10 @@
 # job_owt_medium.slurm consumes. CPU-only: encodes the corpus with the GPT-2
 # byte-level BPE (tiktoken) to uint16 and writes data/openwebtext_{train,val}.bin.
 #
-# WHY THIS JOB EXISTS: data/ currently holds only tinystories_val.bin. There is
-# no OpenWebText on disk, so the training job cannot start until this finishes.
-# train.py raises SystemExit at the "Missing dataset bins" check otherwise.
+# WHY THIS JOB EXISTS: data/ holds only the TinyStories bins (tinystories* and
+# tinystories10k*). There is no OpenWebText on disk, so the training jobs cannot
+# start until this finishes -- train.py raises SystemExit at its "Missing dataset
+# bins" check.
 #
 # ── SPLIT: 5% val, NOT the script default ────────────────────────────────────
 # process_openwebtext.py defaults to --val_fraction 0.005 (0.5%). The paper
@@ -35,25 +36,37 @@
 # Set HF_DATASETS_OFFLINE=1 in the environment to force cache-only mode (fails
 # fast rather than silently re-downloading if the cache is somehow incomplete).
 #
-# If load_dataset errors asking for trust_remote_code, the installed `datasets`
-# is new enough to refuse the legacy loading script; add that flag to
-# process_openwebtext.py:31. prefetch_openwebtext.sh already handles both.
+# No trust_remote_code needed: Skylion007/openwebtext is auto-converted to
+# Parquet on the Hub (8,013,769 rows -- exactly the paper's count), so it has no
+# legacy loading script for `datasets` 4.x to reject. Checked against the
+# installed datasets 4.4.1.
 #
 # ── DISK ─────────────────────────────────────────────────────────────────────
-# HF cache after download:  ~55GB (compressed shards + extracted arrow)
+# HF cache after download:  ~64GB (24GB download + 40GB extracted arrow)
 # Emitted bins:             ~18.1GB (9.05B tokens x 2 bytes uint16)
 # Keep BOTH off $HOME -- HF_HOME is redirected to $USERWORK below. The bins land
 # in data/ under the submit dir; check `dusage` before running if data/ is on a
 # quota'd filesystem.
 #
 # ── RUNTIME ──────────────────────────────────────────────────────────────────
-# process_openwebtext.py encodes single-threaded (one Python loop over 8.0M
-# docs, one encode_ordinary call each). tiktoken itself is fast, but the per-doc
-# Python/arrow overhead dominates; budget 6-12h. --time is set to 24h to cover
-# the bad case, and --cpus-per-task=8 only helps tiktoken's internal threading,
-# NOT the loop. If this turns out too slow to tolerate, the fix is a
-# multiprocessing rewrite of that script (nanoGPT's prepare.py pattern) -- out of
-# scope here since you asked for no code changes.
+# The first version of this job measured ~137 docs/s on a real run, i.e. ~15h for
+# the 7.6M train docs. process_openwebtext.py has since been reworked and now
+# scales with --cpus-per-task. Two changes, neither of which alters a single
+# output byte (verified by hashing both versions' bins on a synthetic corpus):
+#
+#   1. Documents are read in batches (ds[j:j+2000]["text"]) instead of one Arrow
+#      row at a time, and addressed by OFFSET instead of through ds.select().
+#      .select() attaches an indices mapping, so every read paid an extra
+#      indirection -- cheap on a local disk, expensive on /cluster. Measured 8.8x
+#      from batching and a further 1.5x from dropping the mapping.
+#   2. Encoding goes through tiktoken's encode_ordinary_batch(num_threads=N),
+#      whose Rust core releases the GIL, so these are real parallel threads. No
+#      multiprocessing, no temp shards, no extra disk.
+#
+# --num_threads defaults to SLURM_CPUS_PER_TASK. Expect well under 2h; the job
+# prints a live docs/s and ETA every batch, so you will know within a minute.
+# --time stays generously above the estimate because it is extrapolated from a
+# laptop, not measured on a CPUQ node.
 #
 # Usage:   sbatch job_owt_preprocess.slurm
 # Output:  data/openwebtext_train.bin , data/openwebtext_val.bin
@@ -64,9 +77,9 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=CPUQ
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32       # encode threads scale with this; CPUQ nodes have 56
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=output_owt_preprocess.txt
 #SBATCH --error=output_owt_preprocess.err
 
@@ -83,7 +96,8 @@ export HF_HOME=${HF_HOME:-${USERWORK:-$HOME/work}/hf_cache}
 # NOT forced offline: if the compute node has network this job can download for
 # itself. Export HF_DATASETS_OFFLINE=1 before sbatch to require the cache instead.
 export HF_DATASETS_OFFLINE=${HF_DATASETS_OFFLINE:-0}
-export TOKENIZERS_PARALLELISM=false       # single-threaded loop; avoids fork warnings
+# HF `tokenizers` is unused here (we encode with tiktoken); silence its fork warning.
+export TOKENIZERS_PARALLELISM=false
 export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 mkdir -p "${HF_HOME}"
 
@@ -108,11 +122,13 @@ fi
 mkdir -p data
 
 # 95/5 document split to match the paper (see header).
-log "encoding OpenWebText -> data/openwebtext_{train,val}.bin (single-threaded, expect 6-12h)"
+log "encoding OpenWebText -> data/openwebtext_{train,val}.bin (${SLURM_CPUS_PER_TASK:-8} threads)"
 python3 -u process_openwebtext.py \
   --out_dir data \
   --val_fraction 0.05 \
-  --seed 1337
+  --seed 1337 \
+  --num_threads "${SLURM_CPUS_PER_TASK:-8}" \
+  --batch_docs 2000
 rc=$?
 
 if (( rc != 0 )); then
