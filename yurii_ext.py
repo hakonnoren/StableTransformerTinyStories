@@ -107,6 +107,7 @@ from model import (
     CausalSelfAttention,
     MLP,
     ConstrainedScalar,
+    _generic_generate,
 )
 
 
@@ -149,17 +150,25 @@ class YuriiExtConfig:
 # bounded scalar
 # --------------------------------------------------------------------------- #
 class BoundedScalar(nn.Module):
-    """`bound * tanh(raw)`, initialized at raw = 0 so the value starts at exactly 0.
+    """`bound * tanh(raw)`, initialized at `init` (default 0, i.e. raw = 0 exactly).
 
     The parameter is called `raw` so `train.build_optimizer` sweeps it into the
     "learned scalar update-rule params" group (weight decay 0, 5x lr) alongside
     the `ConstrainedScalar` raws.
+
+    `init != 0` exists for coefficients that would otherwise start at a
+    zero-gradient point -- see `yurii_state.ThermostatBlock`, where eps and rho
+    multiply each other and both are dead if either starts at 0.
     """
 
-    def __init__(self, bound: float, numel: int = 1):
+    def __init__(self, bound: float, numel: int = 1, init: float = 0.0):
         super().__init__()
         self.bound = float(bound)
-        self.raw = nn.Parameter(torch.zeros(numel, dtype=torch.float32))
+        frac = float(init) / self.bound
+        if not -1.0 < frac < 1.0:
+            raise ValueError(f"init={init} must lie strictly inside (-{bound}, {bound})")
+        raw0 = math.atanh(frac)
+        self.raw = nn.Parameter(torch.full((numel,), raw0, dtype=torch.float32))
 
     def forward(self) -> torch.Tensor:
         return self.bound * torch.tanh(self.raw)
@@ -547,6 +556,10 @@ class YuriiExtModel(nn.Module):
                 max(float((x - x0).abs().max()), float((v - v0).abs().max())) / scale
             ),
         }
+
+
+# Reuse the baseline's exact sampling logic, so train.py's print_sample works.
+YuriiExtModel.generate = _generic_generate
 
 
 def build_yurii_ext(cfg: ModelConfig, ext: Optional[YuriiExtConfig] = None) -> YuriiExtModel:
