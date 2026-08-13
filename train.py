@@ -22,6 +22,7 @@ from data import DataConfig, BlockEpochIterator, load_bin
 from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
 from revformer import RevFormerModel, RevConfig
 from yurii_ext import YuriiExtModel, YuriiExtConfig
+from yurii_state import YuriiStateModel, StateConfig, VARIANTS as YS_VARIANTS
 from cheap_metrics import CheapMetrics
 import ddp_utils
 
@@ -469,7 +470,7 @@ def main():
         "--arch",
         type=str,
         default="yurii_lt",
-        choices=["baseline", "reversible", "yurii_lt", "yurii_ext", "presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler", "lin_baseline", "lin_yurii", "lin_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2"],
+        choices=["baseline", "reversible", "yurii_lt", "yurii_ext", "yurii_state", "presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler", "lin_baseline", "lin_yurii", "lin_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2"],
         help="model architecture / attention discretization",
     )
 
@@ -699,6 +700,67 @@ def main():
     ap.add_argument("--yx_beta_init", type=float, default=0.9, help="initial momentum retention")
     ap.add_argument("--yx_gamma_init", type=float, default=1.0, help="initial drift gain")
     ap.add_argument("--yx_eta_init", type=float, default=1.0, help="initial shear step size")
+
+    # yurii_state: state-structure variants (yurii_state.py). Unlike --yx_*, these
+    # change what the block carries, not just how it updates it. thermostat /
+    # dual_momentum / two_stream match the polyak baseline's layer determinant at
+    # equal beta_init; multirate deliberately does not (it has k+1 substeps).
+    ap.add_argument("--ys_variant", type=str, default="thermostat", choices=list(YS_VARIANTS),
+                    help="thermostat (X,V,r): per-token scalar regulates momentum energy, an "
+                         "invertible replacement for velocity LayerNorm. dual_momentum "
+                         "(X,V_A,V_M): attention and MLP get separate memories with independent "
+                         "decay rates. two_stream (X,Z): two representational streams, roles "
+                         "swapped each layer, no velocity. multirate: 1 attention per k MLPs.")
+    ap.add_argument("--ys_beta_init", type=float, default=0.9,
+                    help="retention / stream scaling init. 0.9 makes thermostat, dual_momentum "
+                         "and two_stream determinant-identical to --arch yurii_ext.")
+    ap.add_argument("--ys_gamma_init", type=float, default=1.0, help="initial oracle gain")
+    ap.add_argument("--ys_eta_init", type=float, default=1.0, help="initial drift step")
+    ap.add_argument("--ys_no_share_v0", action="store_true",
+                    help="give each auxiliary stream its own v0 token+pos tables instead of "
+                         "sharing one. For dual_momentum that is +vocab*n_embd params (+38.6M "
+                         "at d=768, ~+31%%), which breaks parity with every other arm.")
+    ap.add_argument("--ys_drift_norm", type=str, default="auto", choices=["auto", "on", "off"],
+                    help="read-only LN(V) inside the drift shear. 'auto' = off for thermostat "
+                         "(replacing LNv is its hypothesis), on for dual_momentum/multirate.")
+    # thermostat
+    ap.add_argument("--ys_thermostat_scalar", action="store_true",
+                    help="thermostat: revert to the original ONE-SCALAR-PER-TOKEN r driven by "
+                         "|V|^2/d. Default is d-wide r with channel-centered zeta, which can "
+                         "see anisotropy (what velocity LN actually fixes) and pins the layer "
+                         "determinant exactly and causally.")
+    ap.add_argument("--ys_zeta_max", type=float, default=1.0, help="thermostat: |zeta| bound")
+    ap.add_argument("--ys_eps_max", type=float, default=0.5, help="thermostat: friction gain bound")
+    ap.add_argument("--ys_eps_init", type=float, default=0.25,
+                    help="thermostat: MUST be nonzero -- eps and rho multiply, so a zero here "
+                         "makes rho's gradient identically zero forever (see yurii_state.py)")
+    ap.add_argument("--ys_rho_max", type=float, default=0.1, help="thermostat: r-update gain bound")
+    ap.add_argument("--ys_rho_init", type=float, default=0.01,
+                    help="thermostat: MUST be nonzero -- see --ys_eps_init")
+    ap.add_argument("--ys_tau_init", type=float, default=1.0,
+                    help="thermostat: initial target for |V|^2/d (learned)")
+    # two_stream
+    ap.add_argument("--ys_no_swap", action="store_true",
+                    help="two_stream: keep each stream permanently specialized instead of "
+                         "exchanging their roles every layer")
+    ap.add_argument("--ys_readout", type=str, default="x", choices=["x", "sum"],
+                    help="two_stream: read stream 0, or the sum of both streams")
+    ap.add_argument("--ys_scalar_ab", action="store_true",
+                    help="two_stream: scalar a/b instead of per-channel vectors")
+    # multirate
+    ap.add_argument("--ys_attn_memory", action="store_true",
+                    help="multirate: carry a decaying attention field A (third stream) that "
+                         "every MLP substep draws on, instead of leaving them with no token "
+                         "mixing at all. A <- c*A + Attn(LN X), still exactly invertible.")
+    ap.add_argument("--ys_attn_mem_init", type=float, default=0.9,
+                    help="multirate: decay c of the attention memory")
+    ap.add_argument("--ys_attn_mem_delta_init", type=float, default=0.1,
+                    help="multirate: initial strength with which each substep draws on A")
+    ap.add_argument("--ys_n_mlp", type=int, default=2,
+                    help="multirate: MLP substeps per attention call. NOTE --n_layer counts "
+                         "MACROBLOCKS, so --n_layer 6 --ys_n_mlp 2 = 6 attn + 12 MLP calls.")
+    ap.add_argument("--ys_share_mlp", action="store_true",
+                    help="multirate: reuse one MLP across the k substeps")
 
     # Training hyperparams (paper: 10k steps, warmup 1k, peak AdamW LR 6e-4, bf16, clip 1.0)
     ap.add_argument("--max_steps", type=int, default=10_000)
@@ -981,6 +1043,44 @@ def main():
         print(f"[{args.arch}] arm={ext_cfg.arm_name()} "
               f"log|det|/token at init = {model.log_det_per_token():.4f} "
               f"(identical across arms by construction -- see yurii_ext.py)")
+    elif args.arch == "yurii_state":
+        if args.no_mlp:
+            raise SystemExit("--no_mlp is not meaningful for --arch yurii_state "
+                             "(two_stream and multirate are defined by their MLP structure)")
+        state_cfg = StateConfig(
+            variant=args.ys_variant,
+            beta_init=args.ys_beta_init,
+            gamma_init=args.ys_gamma_init,
+            eta_init=args.ys_eta_init,
+            drift_norm=(None if args.ys_drift_norm == "auto" else args.ys_drift_norm == "on"),
+            use_v0_init=(not args.no_v0_init),
+            share_v0=(not args.ys_no_share_v0),
+            thermostat_channels=(not args.ys_thermostat_scalar),
+            zeta_max=args.ys_zeta_max,
+            eps_max=args.ys_eps_max,
+            eps_init=args.ys_eps_init,
+            rho_max=args.ys_rho_max,
+            rho_init=args.ys_rho_init,
+            tau_init=args.ys_tau_init,
+            swap=(not args.ys_no_swap),
+            readout=args.ys_readout,
+            channel_scaling=(not args.ys_scalar_ab),
+            n_mlp=args.ys_n_mlp,
+            share_mlp=args.ys_share_mlp,
+            attn_memory=args.ys_attn_memory,
+            attn_mem_init=args.ys_attn_mem_init,
+            attn_mem_delta_init=args.ys_attn_mem_delta_init,
+        )
+        model = YuriiStateModel(mcfg, state_cfg)
+        oc = model.oracle_calls()
+        streams = "+".join(s.name for s in model.spec)
+        print(f"[{args.arch}] variant={state_cfg.name()} state=({streams}) "
+              f"oracles={oc['attn']} attn + {oc['mlp']} mlp "
+              f"| drift_norm={'on' if state_cfg.uses_drift_norm() else 'off'} "
+              f"| log|det|/token at init = {model.log_det_per_token():.4f}"
+              + (" (beta-only part; scalar thermostat adds an input-dependent term)"
+                 if (state_cfg.variant == "thermostat"
+                     and not state_cfg.thermostat_channels) else ""))
     else:
         # Presymp family: same overall architecture, different attention discretization
         if args.arch == "presymp":
