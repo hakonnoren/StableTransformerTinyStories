@@ -2,7 +2,7 @@
 Checkpoint loading, batched scoring, and the 2*D residual-state lens policy.
 
 Canonical loader for the v2 suite. Three things it fixes relative to the v1
-loader in behavior_suite.py:
+loader (in the since-removed analysis/behavior_suite.py):
 
 1. RevConfig is built from ALL the training args, mirroring train.py. Omitting
    embed/lift/readout silently builds wide (2*n_embd) embedding tables for a
@@ -36,7 +36,7 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModelETDAB2  # noqa: E402
+from model import ModelConfig, GPTModel, YuriiFormerModel  # noqa: E402
 from revformer import RevFormerModel, RevConfig  # noqa: E402
 
 
@@ -60,7 +60,7 @@ class LensPolicy:
 def bridge(model, h: torch.Tensor, policy: str = LensPolicy.SUM) -> torch.Tensor:
     """Block output -> head width, under `policy`.
 
-    Baseline/yurii/presymp and wide-embed reversible models already match the head
+    Baseline/yurii and wide-embed reversible models already match the head
     width and pass through untouched (their state IS what ln_f consumes).
     """
     narrow = getattr(model, "narrow_emb", False)
@@ -88,7 +88,7 @@ def _model_cfg(cfg_dict: dict) -> ModelConfig:
     # ckpt read back as "manual" is still the trained model — but the difference is
     # recorded in the manifest, because reduction order is not identical.
     fields = {"vocab_size", "block_size", "n_layer", "n_head", "n_embd",
-              "dropout", "bias", "attn_impl", "presymp_mlp_use_attn_vel"}
+              "dropout", "bias", "attn_impl"}
     return ModelConfig(**{k: v for k, v in cfg_dict.items() if k in fields})
 
 
@@ -96,7 +96,7 @@ def build_model(cfg: ModelConfig, a: dict):
     """Instantiate the architecture described by a checkpoint's saved args.
 
     Mirrors train.py's construction field for field. Keep it that way: any arg that
-    changes parameter SHAPES (rev_embed, rev_linear_map, no_mlp) will otherwise
+    changes parameter SHAPES (rev_embed, no_mlp) will otherwise
     fail to load, and any arg that changes only the FUNCTION will load fine and
     silently compute something else.
     """
@@ -108,12 +108,9 @@ def build_model(cfg: ModelConfig, a: dict):
         return RevFormerModel(cfg, RevConfig(
             regime=g("rev_regime", "vpm_scaling"), lambd=g("rev_lambda", 0.0),
             epsilon=g("rev_epsilon", 1.0), randn_init=g("rev_randn_init", False),
-            tanh_scale=g("rev_tanh", False),
+            tanh_scale=g("rev_tanh", False), init_offset=g("rev_init_offset", 0.0),
             kappa_min=g("rev_kappa_min", 0.005), kappa_max=g("rev_kappa_max", 0.08),
             kappa_mem=g("rev_kappa_mem", 0.001),
-            linear_map=g("rev_linear_map", "diag"), lowrank_r=g("rev_lowrank_r", 4),
-            cayley_h=g("rev_cayley_h", 1.0), rotation=g("rev_rotation", "none"),
-            n_householder=g("rev_n_householder", 4),
             embed=g("rev_embed", "wide"), lift=g("rev_lift", "dup"),
             readout=g("rev_readout", "sum")))
     if arch == "yurii_lt":
@@ -124,17 +121,6 @@ def build_model(cfg: ModelConfig, a: dict):
                                 restart_mode=g("yurii_restart", "none"),
                                 restart_min_layer=g("yurii_restart_min_layer", 1),
                                 no_mlp=g("no_mlp", False))
-    if arch == "presymp_etd_ab2":
-        return PresympModelETDAB2(
-            cfg, h=g("presymp_h", 1.0), t0=g("presymp_t0", 1.0),
-            eta_mu=g("eta_mu"), eta_log_coef=g("eta_log_coef"), eta_lin_coef=g("eta_lin_coef"),
-            eta_log_init=g("eta_log_init"), eta_lin_init=g("eta_lin_init"),
-            eta_learnable=g("eta_learnable", False), eta_mode=g("eta_mode", "log"),
-            eta_init=g("eta_init"), eta_clip=g("eta_clip", 50.0),
-            presymp_lnp=g("presymp_lnp", "end"), use_v0_init=not g("no_v0_init", False),
-            mlp_use_attn_vel=g("presymp_mlp_use_attn_vel", False),
-            mlp_use_p_vel=g("presymp_mlp_use_p_vel", False),
-            no_mlp=g("no_mlp", False), lookahead=g("presymp_lookahead", False))
     raise ValueError(f"unknown arch {arch}")
 
 
@@ -159,7 +145,7 @@ def load_model(path: str, device: str = "cpu"):
         "n_embd": cfg.n_embd,
         "n_params": sum(p.numel() for p in m.parameters()),
         "narrow": bool(getattr(m, "narrow_emb", False)),
-        "is_causal": a.get("arch", "baseline") != "presymp_etd_ab2",
+        "is_causal": True,   # every supported arch is causal (tests/test_causality.py)
     }
     return m, meta
 

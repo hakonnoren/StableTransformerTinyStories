@@ -4,7 +4,6 @@ import contextlib
 import os
 import time
 import csv
-import warnings
 from dataclasses import asdict
 
 import numpy as np
@@ -19,10 +18,8 @@ except ImportError:
     _MUON_SOURCE = "vendored optim.Muon"
 
 from data import DataConfig, BlockEpochIterator, load_bin
-from model import ModelConfig, GPTModel, YuriiFormerModel, PresympModel, PresympModelAB2, PresympModelETDAB2, LinAttnModel, LinAttnYuriiModel, LinAttnEulerModel, LinAttnPresympModel, LinAttnAB2Model, LinAttnETDAB2Model
+from model import ModelConfig, GPTModel, YuriiFormerModel
 from revformer import RevFormerModel, RevConfig
-from yurii_ext import YuriiExtModel, YuriiExtConfig
-from yurii_state import YuriiStateModel, StateConfig, VARIANTS as YS_VARIANTS
 from cheap_metrics import CheapMetrics
 import ddp_utils
 
@@ -378,7 +375,6 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
     emb_params = []
     norm_params = []
     scalar_params = []
-    integrator_params = []  # theta_h/theta_xi_raw
     rev_scale_params = []   # reversible alpha_bias/gamma_bias
     muon_params = []        # 2D hidden weight matrices (only populated when use_muon)
     other_params = []       # everything AdamW handles outside the named groups
@@ -388,16 +384,10 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
             continue
         if ("tok_emb" in name) or ("pos_emb" in name) or ("tok_v0_emb" in name) or ("pos_v0_emb" in name) or ("lm_head" in name):
             emb_params.append(p)
-        elif "theta_h" in name or "theta_hX" in name or "theta_hY" in name or "theta_xi_raw" in name:
-            integrator_params.append(p)
         elif ("gamma_bias" in name or "alpha_bias" in name        # reversible scaling vectors
-              or name.endswith(".rho") or name.endswith(".u")      # damped: kappa / split; lowrank_cayley: rho
+              or name.endswith(".rho") or name.endswith(".u")      # damped: kappa / split
               or "mem_gate" in name):                              # damped_mem: memory gate
             rev_scale_params.append(p)
-        elif name.endswith(".U_param") or name.endswith(".K_param") or name.endswith(".V"):
-            # linear-map orthogonal/bottleneck generators (Householder V, Cayley K,
-            # bottleneck U): keep on AdamW — never hand a structured generator to Muon.
-            other_params.append(p)
         elif ".raw" in name:  # ConstrainedScalar raw parameters
             scalar_params.append(p)
         elif "ln_" in name or ".ln" in name or "ln_f" in name or "ln_v" in name or "LayerNorm" in name:
@@ -419,8 +409,6 @@ def build_optimizer(model: nn.Module, peak_lr: float, betas=(0.9, 0.95), scalar_
         adamw_groups.append(grp(norm_params, peak_lr, 0.0))
     if scalar_params:
         adamw_groups.append(grp(scalar_params, peak_lr * scalar_mult, 0.0, scalar_mult))
-    if integrator_params:
-        adamw_groups.append(grp(integrator_params, peak_lr * scalar_mult, 0.0, scalar_mult))
     if rev_scale_params:
         adamw_groups.append(grp(rev_scale_params, peak_lr * rev_scale_lr_mult, 0.0, rev_scale_lr_mult))
 
@@ -470,8 +458,8 @@ def main():
         "--arch",
         type=str,
         default="yurii_lt",
-        choices=["baseline", "reversible", "yurii_lt", "yurii_ext", "yurii_state", "presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler", "lin_baseline", "lin_yurii", "lin_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2"],
-        help="model architecture / attention discretization",
+        choices=["baseline", "reversible", "yurii_lt"],
+        help="model architecture",
     )
 
     # RevFormer (reversible-coupling transformer) options. Attn/MLP run at the
@@ -482,6 +470,19 @@ def main():
                     help="reversible volume regime (see revformer/README.md)")
     ap.add_argument("--rev_lambda", type=float, default=0.0,
                     help="vpm_scaling only: total log|det| of the block stack = -rev_lambda")
+    ap.add_argument("--rev_init_offset", type=float, default=0.0,
+                    help="deterministic value added to the gamma/alpha bias parameters at "
+                         "init (reversible, non-frozen regimes only). forward applies "
+                         "exp(-gamma), so c>0 starts every block CONTRACTING by e^-c per "
+                         "coordinate; c=0.105=-ln(0.9) matches yurii_lt's beta=0.9 "
+                         "per-substep decay, c<0 starts it expanding. Pure initialization: "
+                         "the functional form of the block is unchanged.")
+    ap.add_argument("--init_resid_scale", type=float, default=1.0,
+                    help="multiply the init std of the residual OUTPUT projections "
+                         "(attn.c_proj and mlp.fc2) by this. Everything here inits at "
+                         "std 0.02 flat -- no GPT-2 1/sqrt(2L) residual scaling anywhere -- "
+                         "so this is the direct handle on the per-layer step size. Applies "
+                         "to any --arch. Pure initialization.")
     ap.add_argument("--rev_epsilon", type=float, default=1.0,
                     help="scale of gamma/alpha init (and tanh range if --rev_tanh)")
     ap.add_argument("--rev_randn_init", action="store_true",
@@ -496,19 +497,6 @@ def main():
                     help="damped regimes: max per-layer contraction budget kappa")
     ap.add_argument("--rev_kappa_mem", type=float, default=0.001,
                     help="damped_mem: contraction floor for protected memory channels")
-    # ---- linear-map block (controlled-det map L on the full 2*n_embd state) ----
-    ap.add_argument("--rev_linear_map", choices=["diag", "lowrank_cayley"], default="diag",
-                    help="'diag' (default, existing block) or 'lowrank_cayley' (LinearMixed block: "
-                         "contract r learned directions, optional orthogonal mixing). Not for damped regimes.")
-    ap.add_argument("--rev_lowrank_r", type=int, default=4,
-                    help="lowrank_cayley: # contracted learned directions")
-    ap.add_argument("--rev_cayley_h", type=float, default=1.0,
-                    help="lowrank_cayley: Cayley step size (only used when --rev_rotation cayley)")
-    ap.add_argument("--rev_rotation", choices=["none", "householder", "cayley"], default="none",
-                    help="lowrank_cayley mixing: 'none' (cheap rank-r bottleneck), 'householder' "
-                         "(WY-vectorized orthogonal mixing, cheap+scalable), 'cayley' (dense, small-d only)")
-    ap.add_argument("--rev_n_householder", type=int, default=4,
-                    help="lowrank_cayley + rotation=householder: # Householder reflections")
     # ---- memory-efficient reversible backprop (revformer/rev_backprop.py) ----
     ap.add_argument("--mem_efficient", action="store_true",
                     help="run the reversible block stack under no_grad and reconstruct "
@@ -564,7 +552,7 @@ def main():
         "--scalar_lr_mult",
         type=float,
         default=10.0,
-        help="LR multiplier for learned scalar parameters (ConstrainedScalar .raw, theta_h, theta_xi_raw). "
+        help="LR multiplier for learned scalar parameters (ConstrainedScalar .raw, i.e. yurii_lt's mu/beta/gamma). "
              "Higher values let the scalars update faster and diverge more across layers. Default: 10.0",
     )
 
@@ -583,13 +571,6 @@ def main():
                     help="Muon lr scaling. 'original' (Keller) pairs with muon_lr~0.02 (TinyStories recipe); "
                          "'match_rms_adamw' (Moonlight) scales updates to AdamW RMS and pairs with AdamW-scale lr.")
 
-    # ---- learned integrator scalars toggles ----
-    ap.add_argument("--learn_h", type=int, default=1,
-                    help="If 1, learn the integrator step size h (theta_h is trainable). If 0, keep it fixed.")
-    ap.add_argument("--learn_xi", type=int, default=1,
-                    help="If 1, learn the coupling xi (theta_xi_raw is trainable). If 0, keep it fixed.")
-
-
     # Paper-like defaults (TinyStories small)
     ap.add_argument("--n_layer", type=int, default=12)
     ap.add_argument("--n_head", type=int, default=12)
@@ -599,77 +580,11 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.0)
     ap.add_argument("--bias", action="store_true", help="paper uses no bias; keep default False")
 
-    # Presymplectic params
-    ap.add_argument("--presymp_h", type=float, default=1.0)
-    ap.add_argument("--presymp_xi", type=float, default=1.0)
-    ap.add_argument("--presymp_t0", type=float, default=1.0)
-    ap.add_argument("--eta_mu", type=float, default=None, help="if set (and --eta_learnable is not used), use fixed linear eta(t)=mu*t instead of eta(t)=3*log(t/t0)")
-    ap.add_argument("--eta_learnable", action="store_true", help="make eta schedule coefficient(s) learnable")
-    ap.add_argument(
-        "--eta_mode",
-        type=str,
-        default="log",
-        choices=["log", "linear", "loglin"],
-        help="eta schedule family: log=c_log*log(t/t0); linear=c_lin*t; loglin=c_log*log(t/t0)+c_lin*t",
-    )
-    # Fixed coefficients (when --eta_learnable is NOT set)
-    ap.add_argument("--eta_log_coef", type=float, default=None, help="fixed c_log for log(t/t0) term (eta_mode=log or loglin)")
-    ap.add_argument("--eta_lin_coef", type=float, default=None, help="fixed c_lin for t term (eta_mode=linear or loglin). If unset, falls back to --eta_mu for linear part")
-    # Learnable initializations (when --eta_learnable is set)
-    ap.add_argument("--eta_init", type=float, default=None, help="backward-compatible init: for log/linear; for loglin initializes log coefficient unless --eta_log_init is set")
-    ap.add_argument("--eta_log_init", type=float, default=None, help="initial value for learnable c_log (eta_mode=log or loglin)")
-    ap.add_argument("--eta_lin_init", type=float, default=None, help="initial value for learnable c_lin (eta_mode=linear or loglin)")
-    ap.add_argument("--eta_clip", type=float, default=50.0, help="clamp eta(t) to [-eta_clip, eta_clip] before exponentiation")
-
-    # Presymplectic xi adaptation (data-driven)
-    # ap.add_argument("--presymp_xi_adapt", action="store_true", help="adapt xi online based on r_X and r_P thresholds (breaks exact presymplecticity)")
-    ap.add_argument("--presymp_r_thresh", type=float, default=1e-2, help="increase xi if max(r_X,r_P) exceeds this")
-    ap.add_argument("--presymp_r_low", type=float, default=1e-4, help="decrease xi if max(r_X,r_P) goes below this")
-    ap.add_argument("--presymp_xi_mult_up", type=float, default=1.25, help="multiplier when increasing xi")
-    ap.add_argument("--presymp_xi_mult_down", type=float, default=0.5, help="multiplier when decreasing xi")
-    ap.add_argument("--presymp_xi_min", type=float, default=1e-4, help="lower bound for xi during adaptation")
-    ap.add_argument("--presymp_xi_max", type=float, default=100.0, help="upper bound for xi during adaptation (also capped by theta_max/(2h))")
-    ap.add_argument("--presymp_theta_max", type=float, default=1.0, help="cap the coupling rotation angle theta=2*xi*h to at most theta_max by enforcing xi<=theta_max/(2h)")
-    # ap.add_argument("--presymp_xi_adapt_warmup", type=int, default=10, help="do not adapt xi for the first this many presymp steps")
-    # ap.add_argument("--presymp_xi_adapt_every", type=int, default=1, help="update xi every N presymp steps (after warmup)")
-    ap.add_argument(
-        "--presymp_lookahead",
-        action="store_true",
-        default=False,
-        help=(
-            "Evaluate the presymp oracle at X + mu_la*P instead of X "
-            "(Nesterov lookahead inside the symplectic step). "
-            "mu_la is a per-layer learned scalar initialised near 0 (no-op start)."
-        ),
-    )
-    ap.add_argument("--presymp_lnp", type=str, default="end", choices=["none","end","each_substep"], help="LayerNorm on presymplectic attention momentum P/Pi: none|end|each_substep")
-
-    # Variant A: use attention-induced velocity for the MLP lookahead (drop separate MLP velocity dynamics)
-    ap.add_argument(
-        "--presymp_mlp_use_attn_vel",
-        action="store_true",
-        help="Presymp only: use v_attn ≈ (X_after_attn - X_before_attn)/h as the velocity in the MLP lookahead (Variant A).",
-    )
-    # Variant B: use P (symplectic momentum) as the shared MLP velocity (YuriiFormer Lie-Trotter style)
-    ap.add_argument(
-        "--presymp_mlp_use_p_vel",
-        action="store_true",
-        help="Presymp only: use P from the attention step as velocity for the MLP substep (Variant B). "
-             "The MLP updates P in-place; updated P flows to the next layer's attention. "
-             "Mutually exclusive with --presymp_mlp_use_attn_vel.",
-    )
-
-
     # v0 initialization embeddings for momentum variants (YuriiFormer Appendix A.1)
     ap.add_argument(
         "--no_v0_init",
         action="store_true",
-        help="disable separate token/pos v0 embeddings for initializing velocity/momentum (momentum variants only)",
-    )
-    ap.add_argument(
-        "--allow_token_conditioned_v0_init",
-        action="store_true",
-        help="opt back into token-conditioned v0 initialisation. Unsafe for leak-free autoregressive evaluation and therefore disabled by default for presymplectic softmax models.",
+        help="disable separate token/pos v0 embeddings for initializing the velocity (yurii_lt only)",
     )
 
     # YuriiFormer noise + restart (applied across depth)
@@ -678,89 +593,6 @@ def main():
     ap.add_argument("--yurii_noise_loc", type=str, default="v", choices=["dx", "v", "xin"], help="inject noise into dx, v, or lookahead xin")
     ap.add_argument("--yurii_restart", type=str, default="none", choices=["none", "speed", "loss"], help="restart criterion")
     ap.add_argument("--yurii_restart_min_layer", type=int, default=1, help="start checking restart conditions at this layer index")
-
-    # yurii_ext: Polyak + Lie-Trotter with determinant-preserving extensions (yurii_ext.py).
-    # Neither flag changes the layer determinant, so all four arms
-    # (none / adaptive / gyro / both) contract volume identically at equal beta.
-    ap.add_argument("--yx_adaptive", action="store_true",
-                    help="channel-wise state-dependent damping S=beta*exp(-eps*center(tanh(LN x))); "
-                         "geometric mean over channels stays exactly beta. +1 scalar per substep.")
-    ap.add_argument("--yx_gyro", action="store_true",
-                    help="reversible shear mixer on the velocity (p+=w q; q-=w p), det=1, giving the "
-                         "retained momentum a phase beta*e^{+-i theta}. +1 scalar per substep.")
-    ap.add_argument("--yx_eps_max", type=float, default=0.5,
-                    help="bound on eps: per-channel retention stays in [beta*e^-2eps, beta*e^+2eps]")
-    ap.add_argument("--yx_omega_max", type=float, default=0.5,
-                    help="bound on omega. det is 1 for any omega, but shear conditioning degrades with it.")
-    ap.add_argument("--yx_gyro_groups", type=int, default=1,
-                    help="channel-pair groups with independent omega (must divide n_embd/2)")
-    ap.add_argument("--yx_no_alternate", action="store_true",
-                    help="keep the same channel pairing at every depth instead of shifting it by one "
-                         "channel in odd layers")
-    ap.add_argument("--yx_beta_init", type=float, default=0.9, help="initial momentum retention")
-    ap.add_argument("--yx_gamma_init", type=float, default=1.0, help="initial drift gain")
-    ap.add_argument("--yx_eta_init", type=float, default=1.0, help="initial shear step size")
-
-    # yurii_state: state-structure variants (yurii_state.py). Unlike --yx_*, these
-    # change what the block carries, not just how it updates it. thermostat /
-    # dual_momentum / two_stream match the polyak baseline's layer determinant at
-    # equal beta_init; multirate deliberately does not (it has k+1 substeps).
-    ap.add_argument("--ys_variant", type=str, default="thermostat", choices=list(YS_VARIANTS),
-                    help="thermostat (X,V,r): per-token scalar regulates momentum energy, an "
-                         "invertible replacement for velocity LayerNorm. dual_momentum "
-                         "(X,V_A,V_M): attention and MLP get separate memories with independent "
-                         "decay rates. two_stream (X,Z): two representational streams, roles "
-                         "swapped each layer, no velocity. multirate: 1 attention per k MLPs.")
-    ap.add_argument("--ys_beta_init", type=float, default=0.9,
-                    help="retention / stream scaling init. 0.9 makes thermostat, dual_momentum "
-                         "and two_stream determinant-identical to --arch yurii_ext.")
-    ap.add_argument("--ys_gamma_init", type=float, default=1.0, help="initial oracle gain")
-    ap.add_argument("--ys_eta_init", type=float, default=1.0, help="initial drift step")
-    ap.add_argument("--ys_no_share_v0", action="store_true",
-                    help="give each auxiliary stream its own v0 token+pos tables instead of "
-                         "sharing one. For dual_momentum that is +vocab*n_embd params (+38.6M "
-                         "at d=768, ~+31%%), which breaks parity with every other arm.")
-    ap.add_argument("--ys_drift_norm", type=str, default="auto", choices=["auto", "on", "off"],
-                    help="read-only LN(V) inside the drift shear. 'auto' = off for thermostat "
-                         "(replacing LNv is its hypothesis), on for dual_momentum/multirate.")
-    # thermostat
-    ap.add_argument("--ys_thermostat_scalar", action="store_true",
-                    help="thermostat: revert to the original ONE-SCALAR-PER-TOKEN r driven by "
-                         "|V|^2/d. Default is d-wide r with channel-centered zeta, which can "
-                         "see anisotropy (what velocity LN actually fixes) and pins the layer "
-                         "determinant exactly and causally.")
-    ap.add_argument("--ys_zeta_max", type=float, default=1.0, help="thermostat: |zeta| bound")
-    ap.add_argument("--ys_eps_max", type=float, default=0.5, help="thermostat: friction gain bound")
-    ap.add_argument("--ys_eps_init", type=float, default=0.25,
-                    help="thermostat: MUST be nonzero -- eps and rho multiply, so a zero here "
-                         "makes rho's gradient identically zero forever (see yurii_state.py)")
-    ap.add_argument("--ys_rho_max", type=float, default=0.1, help="thermostat: r-update gain bound")
-    ap.add_argument("--ys_rho_init", type=float, default=0.01,
-                    help="thermostat: MUST be nonzero -- see --ys_eps_init")
-    ap.add_argument("--ys_tau_init", type=float, default=1.0,
-                    help="thermostat: initial target for |V|^2/d (learned)")
-    # two_stream
-    ap.add_argument("--ys_no_swap", action="store_true",
-                    help="two_stream: keep each stream permanently specialized instead of "
-                         "exchanging their roles every layer")
-    ap.add_argument("--ys_readout", type=str, default="x", choices=["x", "sum"],
-                    help="two_stream: read stream 0, or the sum of both streams")
-    ap.add_argument("--ys_scalar_ab", action="store_true",
-                    help="two_stream: scalar a/b instead of per-channel vectors")
-    # multirate
-    ap.add_argument("--ys_attn_memory", action="store_true",
-                    help="multirate: carry a decaying attention field A (third stream) that "
-                         "every MLP substep draws on, instead of leaving them with no token "
-                         "mixing at all. A <- c*A + Attn(LN X), still exactly invertible.")
-    ap.add_argument("--ys_attn_mem_init", type=float, default=0.9,
-                    help="multirate: decay c of the attention memory")
-    ap.add_argument("--ys_attn_mem_delta_init", type=float, default=0.1,
-                    help="multirate: initial strength with which each substep draws on A")
-    ap.add_argument("--ys_n_mlp", type=int, default=2,
-                    help="multirate: MLP substeps per attention call. NOTE --n_layer counts "
-                         "MACROBLOCKS, so --n_layer 6 --ys_n_mlp 2 = 6 attn + 12 MLP calls.")
-    ap.add_argument("--ys_share_mlp", action="store_true",
-                    help="multirate: reuse one MLP across the k substeps")
 
     # Training hyperparams (paper: 10k steps, warmup 1k, peak AdamW LR 6e-4, bf16, clip 1.0)
     ap.add_argument("--max_steps", type=int, default=10_000)
@@ -869,18 +701,6 @@ def main():
     ap.add_argument("--cheap_no_repr", action="store_true", help="disable representation geometry + accuracy (#7/#1)")
 
     args = ap.parse_args()
-
-    presymp_softmax_arches = {"presymp", "presymp_euler", "presymp_exp_euler", "presymp_ab2", "presymp_etd_ab2", "presymp_strang", "plain_euler"}
-    if args.arch in presymp_softmax_arches and not args.allow_token_conditioned_v0_init:
-        args.no_v0_init = True
-    elif args.arch in presymp_softmax_arches and args.allow_token_conditioned_v0_init:
-        warnings.warn(
-            "Token-conditioned v0 initialisation was explicitly re-enabled. This can create an autoregressive shortcut in the momentum stream; leak checks will warn at runtime if it becomes unsafe.",
-            RuntimeWarning,
-        )
-
-    if args.arch in presymp_softmax_arches and not args.presymp_mlp_use_attn_vel and not args.presymp_mlp_use_p_vel:
-        args.presymp_mlp_use_attn_vel = True
 
     # ---- distributed init ------------------------------------------------------
     # No-op unless launched by torchrun: without RANK/WORLD_SIZE/LOCAL_RANK in the
@@ -1001,14 +821,10 @@ def main():
             epsilon=args.rev_epsilon,
             randn_init=args.rev_randn_init,
             tanh_scale=args.rev_tanh,
+            init_offset=args.rev_init_offset,
             kappa_min=args.rev_kappa_min,
             kappa_max=args.rev_kappa_max,
             kappa_mem=args.rev_kappa_mem,
-            linear_map=args.rev_linear_map,
-            lowrank_r=args.rev_lowrank_r,
-            cayley_h=args.rev_cayley_h,
-            rotation=args.rev_rotation,
-            n_householder=args.rev_n_householder,
             embed=args.rev_embed,
             lift=args.rev_lift,
             readout=args.rev_readout,
@@ -1025,368 +841,26 @@ def main():
             restart_min_layer=args.yurii_restart_min_layer,
             no_mlp=args.no_mlp,
         )
-    elif args.arch == "yurii_ext":
-        ext_cfg = YuriiExtConfig(
-            adaptive=args.yx_adaptive,
-            gyro=args.yx_gyro,
-            eps_max=args.yx_eps_max,
-            omega_max=args.yx_omega_max,
-            gyro_groups=args.yx_gyro_groups,
-            gyro_alternate=(not args.yx_no_alternate),
-            beta_init=args.yx_beta_init,
-            gamma_init=args.yx_gamma_init,
-            eta_init=args.yx_eta_init,
-            use_v0_init=(not args.no_v0_init),
-            no_mlp=args.no_mlp,
-        )
-        model = YuriiExtModel(mcfg, ext_cfg)
-        print(f"[{args.arch}] arm={ext_cfg.arm_name()} "
-              f"log|det|/token at init = {model.log_det_per_token():.4f} "
-              f"(identical across arms by construction -- see yurii_ext.py)")
-    elif args.arch == "yurii_state":
-        if args.no_mlp:
-            raise SystemExit("--no_mlp is not meaningful for --arch yurii_state "
-                             "(two_stream and multirate are defined by their MLP structure)")
-        state_cfg = StateConfig(
-            variant=args.ys_variant,
-            beta_init=args.ys_beta_init,
-            gamma_init=args.ys_gamma_init,
-            eta_init=args.ys_eta_init,
-            drift_norm=(None if args.ys_drift_norm == "auto" else args.ys_drift_norm == "on"),
-            use_v0_init=(not args.no_v0_init),
-            share_v0=(not args.ys_no_share_v0),
-            thermostat_channels=(not args.ys_thermostat_scalar),
-            zeta_max=args.ys_zeta_max,
-            eps_max=args.ys_eps_max,
-            eps_init=args.ys_eps_init,
-            rho_max=args.ys_rho_max,
-            rho_init=args.ys_rho_init,
-            tau_init=args.ys_tau_init,
-            swap=(not args.ys_no_swap),
-            readout=args.ys_readout,
-            channel_scaling=(not args.ys_scalar_ab),
-            n_mlp=args.ys_n_mlp,
-            share_mlp=args.ys_share_mlp,
-            attn_memory=args.ys_attn_memory,
-            attn_mem_init=args.ys_attn_mem_init,
-            attn_mem_delta_init=args.ys_attn_mem_delta_init,
-        )
-        model = YuriiStateModel(mcfg, state_cfg)
-        oc = model.oracle_calls()
-        streams = "+".join(s.name for s in model.spec)
-        print(f"[{args.arch}] variant={state_cfg.name()} state=({streams}) "
-              f"oracles={oc['attn']} attn + {oc['mlp']} mlp "
-              f"| drift_norm={'on' if state_cfg.uses_drift_norm() else 'off'} "
-              f"| log|det|/token at init = {model.log_det_per_token():.4f}"
-              + (" (beta-only part; scalar thermostat adds an input-dependent term)"
-                 if (state_cfg.variant == "thermostat"
-                     and not state_cfg.thermostat_channels) else ""))
     else:
-        # Presymp family: same overall architecture, different attention discretization
-        if args.arch == "presymp":
-            model = PresympModel(
-                mcfg,
-                attn_scheme="presymp",
-                h=args.presymp_h,
-                xi=args.presymp_xi,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                use_v0_init=(not args.no_v0_init),
-                # xi_adapt=args.presymp_xi_adapt,
-                r_thresh=args.presymp_r_thresh,
-                r_low=args.presymp_r_low,
-                xi_mult_up=args.presymp_xi_mult_up,
-                xi_mult_down=args.presymp_xi_mult_down,
-                xi_min=args.presymp_xi_min,
-                xi_max=args.presymp_xi_max,
-                theta_max=args.presymp_theta_max,
-                presymp_lnp=args.presymp_lnp,
-                # xi_adapt_warmup=args.presymp_xi_adapt_warmup,
-                # xi_adapt_every=args.presymp_xi_adapt_every,
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "presymp_euler":
-            model = PresympModel(
-                mcfg,
-                attn_scheme="euler",
-                h=args.presymp_h,
-                xi=args.presymp_xi,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                use_v0_init=(not args.no_v0_init),
-                # xi_adapt=args.presymp_xi_adapt,
-                r_thresh=args.presymp_r_thresh,
-                r_low=args.presymp_r_low,
-                xi_mult_up=args.presymp_xi_mult_up,
-                xi_mult_down=args.presymp_xi_mult_down,
-                xi_min=args.presymp_xi_min,
-                xi_max=args.presymp_xi_max,
-                theta_max=args.presymp_theta_max,
-                presymp_lnp=args.presymp_lnp,
-                # xi_adapt_warmup=args.presymp_xi_adapt_warmup,
-                # xi_adapt_every=args.presymp_xi_adapt_every,
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "presymp_exp_euler":
-            model = PresympModel(
-                mcfg,
-                attn_scheme="exp_euler",
-                h=args.presymp_h,
-                xi=args.presymp_xi,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                use_v0_init=(not args.no_v0_init),
-                # xi_adapt=args.presymp_xi_adapt,
-                r_thresh=args.presymp_r_thresh,
-                r_low=args.presymp_r_low,
-                xi_mult_up=args.presymp_xi_mult_up,
-                xi_mult_down=args.presymp_xi_mult_down,
-                xi_min=args.presymp_xi_min,
-                xi_max=args.presymp_xi_max,
-                theta_max=args.presymp_theta_max,
-                presymp_lnp=args.presymp_lnp,
-                # xi_adapt_warmup=args.presymp_xi_adapt_warmup,
-                # xi_adapt_every=args.presymp_xi_adapt_every,
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "presymp_ab2":
-            model = PresympModelAB2(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "presymp_etd_ab2":
-            model = PresympModelETDAB2(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "presymp_strang":
-            model = PresympModel(
-                mcfg,
-                attn_scheme="strang",
-                h=args.presymp_h,
-                xi=args.presymp_xi,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                use_v0_init=(not args.no_v0_init),
-                # xi_adapt=args.presymp_xi_adapt,
-                r_thresh=args.presymp_r_thresh,
-                r_low=args.presymp_r_low,
-                xi_mult_up=args.presymp_xi_mult_up,
-                xi_mult_down=args.presymp_xi_mult_down,
-                xi_min=args.presymp_xi_min,
-                xi_max=args.presymp_xi_max,
-                theta_max=args.presymp_theta_max,
-                presymp_lnp=args.presymp_lnp,
-                # xi_adapt_warmup=args.presymp_xi_adapt_warmup,
-                # xi_adapt_every=args.presymp_xi_adapt_every,
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
+        raise ValueError(f"Unknown arch: {args.arch}")
 
-        elif args.arch == "plain_euler":
-            model = PresympModel(
-                mcfg,
-                attn_scheme="plain_euler",
-                h=args.presymp_h,
-                xi=args.presymp_xi,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                use_v0_init=(not args.no_v0_init),
-                r_thresh=args.presymp_r_thresh,
-                r_low=args.presymp_r_low,
-                xi_mult_up=args.presymp_xi_mult_up,
-                xi_mult_down=args.presymp_xi_mult_down,
-                xi_min=args.presymp_xi_min,
-                xi_max=args.presymp_xi_max,
-                theta_max=args.presymp_theta_max,
-                presymp_lnp=args.presymp_lnp,
-                mlp_use_attn_vel=args.presymp_mlp_use_attn_vel,
-                mlp_use_p_vel=args.presymp_mlp_use_p_vel,
-                no_mlp=args.no_mlp,
-                lookahead=args.presymp_lookahead,
-            )
-        elif args.arch == "lin_baseline":
-            model = LinAttnModel(
-                mcfg,
-                h=args.presymp_h,
-                no_mlp=args.no_mlp,
-            )
-        elif args.arch == "lin_yurii":
-            model = LinAttnYuriiModel(
-                mcfg,
-                h=args.presymp_h,
-                no_mlp=args.no_mlp,
-                use_v0_init=(not args.no_v0_init),
-            )
-        elif args.arch == "lin_euler":
-            model = LinAttnEulerModel(
-                mcfg,
-                h=args.presymp_h,
-                alpha_init=0.9,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                no_mlp=args.no_mlp,
-            )
-        elif args.arch == "lin_presymp":
-            model = LinAttnPresympModel(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                no_mlp=args.no_mlp,
-            )
-        elif args.arch == "lin_exp_euler":
-            # Presymplectic exponential Euler for the linear-attention Hamiltonian.
-            # Like lin_presymp but position update uses old Y^k (not updated Y^{k+1}).
-            model = LinAttnPresympModel(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                no_mlp=args.no_mlp,
-                attn_cls="exp_euler",
-            )
-        elif args.arch == "lin_ab2":
-            model = LinAttnAB2Model(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                no_mlp=args.no_mlp,
-            )
-        elif args.arch == "lin_etd_ab2":
-            model = LinAttnETDAB2Model(
-                mcfg,
-                h=args.presymp_h,
-                t0=args.presymp_t0,
-                eta_mu=args.eta_mu,
-                eta_log_coef=args.eta_log_coef,
-                eta_lin_coef=args.eta_lin_coef,
-                eta_log_init=args.eta_log_init,
-                eta_lin_init=args.eta_lin_init,
-                eta_learnable=args.eta_learnable,
-                eta_mode=args.eta_mode,
-                eta_init=args.eta_init,
-                eta_clip=args.eta_clip,
-                presymp_lnp=args.presymp_lnp,
-                use_v0_init=(not args.no_v0_init),
-                no_mlp=args.no_mlp,
-            )
-        else:
-            raise ValueError(f"Unknown arch: {args.arch}")
+    # Residual output-projection init scale (--init_resid_scale). Applied here so it
+    # covers every arch: attn.c_proj and mlp.fc2 are the two matrices that write back
+    # into the residual stream, and scaling them scales the per-layer displacement at
+    # init without touching the forward step. Deliberately BEFORE .to(device) and
+    # before any resume, so a resumed checkpoint is not rescaled twice.
+    if args.init_resid_scale != 1.0:
+        n_scaled = 0
+        with torch.no_grad():
+            for name, mod in model.named_modules():
+                if name.endswith(("attn.c_proj", "mlp.fc2")):
+                    mod.weight.mul_(args.init_resid_scale)
+                    n_scaled += 1
+        if n_scaled == 0:
+            raise SystemExit(f"--init_resid_scale {args.init_resid_scale} matched no "
+                             f"attn.c_proj / mlp.fc2 modules under --arch {args.arch}")
+        print(f"[{args.arch}][init] scaled {n_scaled} residual output projections "
+              f"(attn.c_proj, mlp.fc2) by {args.init_resid_scale}")
 
     model.to(device)
 
@@ -1427,20 +901,6 @@ def main():
             print(f"[{args.arch}][mem_efficient] segment={seg} in bf16: y0 is "
                   f"checkpointed (exact), {min(seg, n_blocks) - 1} chained inverses per "
                   "segment leave ~1e-2 relative reconstruction error in the interior.")
-
-    # Optionally freeze learned integrator scalars (h, xi) so they stay fixed.
-    if args.learn_h == 0:
-        for n, p in model.named_parameters():
-            if "theta_h" in n or "theta_hX" in n or "theta_hY" in n:
-                p.requires_grad_(False)
-    if args.learn_xi == 0:
-        for n, p in model.named_parameters():
-            if "theta_xi_raw" in n:
-                p.requires_grad_(False)
-        # disable heuristic xi adaptation if present
-        # if hasattr(args, "presymp_xi_adapt"):
-        #     args.presymp_xi_adapt = False
-
 
     # Parameter census. Counts each tensor once (lm_head is tied to tok_emb), split
     # embedding vs. block so a reversible-vs-baseline A/B can be checked for param
@@ -1492,7 +952,9 @@ def main():
     best_val = float("inf")
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
+        # weights_only=False: our own checkpoints hold numpy scalars (the scheduled
+        # lr in the optimizer state) and the args dict, which torch>=2.6 rejects by default.
+        ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["opt"])
         start_step = ckpt.get("step", 0)
@@ -1515,10 +977,9 @@ def main():
     # wall_cum_s: cumulative wall time since start of run
     # tokens_step: tokens processed per optimizer step
     # tokens_cum: cumulative tokens processed since step 0
-    # sched_t_start / sched_t_end: cumulative schedule clock reported by the model (when available)
     _csv_header_main(
         metrics_path,
-        ["step", "train_loss", "val_loss", "lr", "wall_dt_s", "wall_cum_s", "tokens_step", "tokens_cum", "h_mean", "hY_mean", "xi_mean", "rX", "rP", "c_log_mean", "c_lin_mean", "leak_warnings", "sched_t_start", "sched_t_end"],
+        ["step", "train_loss", "val_loss", "lr", "wall_dt_s", "wall_cum_s", "tokens_step", "tokens_cum"],
     )
     plot_path = os.path.join(run_dir, "loss.png")
 
@@ -1645,7 +1106,7 @@ def main():
         # clip
         if args.grad_clip > 0:
             muon_ids = getattr(opt, "muon_param_ids", None)
-            clip_params = [p for (n,p) in model.named_parameters() if p.requires_grad and ('theta_h' not in n and 'theta_hX' not in n and 'theta_hY' not in n and 'theta_xi_raw' not in n)]
+            clip_params = [p for p in model.parameters() if p.requires_grad]
             if muon_ids:   # Muon orthonormalizes its own update; don't clip those matrices
                 clip_params = [p for p in clip_params if id(p) not in muon_ids]
             torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
@@ -1670,10 +1131,6 @@ def main():
             extra = ""
             if args.arch == "yurii_lt" and args.yurii_restart != "none":
                 extra = f" | restarts {restarts_accum}"
-            if (args.arch.startswith("presymp") or args.arch in ("plain_euler", "lin_presymp", "lin_exp_euler", "lin_ab2", "lin_etd_ab2")) and hasattr(model, "last_xi_mean"):
-                extra += f" | hX {getattr(model, 'last_h_mean', float('nan')):.4g} | hY {getattr(model, 'last_hY_mean', float('nan')):.4g} | xi_mean {getattr(model, 'last_xi_mean', float('nan')):.3g} | rX {getattr(model, 'last_rX_max', float('nan')):.2e} | rP {getattr(model, 'last_rP_max', float('nan')):.2e} | c_log {getattr(model, 'last_c_log_mean', float('nan')):.4g} | c_lin {getattr(model, 'last_c_lin_mean', float('nan')):.4g} | leak_warn {int(getattr(model, 'last_leak_warnings', 0))}"
-                if hasattr(model, 'last_t_start') or hasattr(model, 'last_t_end'):
-                    extra += f" | t_sched0 {getattr(model, 'last_t_start', float('nan')):.4g} | t_sched1 {getattr(model, 'last_t_end', float('nan')):.4g}"
             print(
                 f"[{args.arch}] step {step:6d} | loss {loss_accum:.4f} | lr {lr:.2e} | "
                 f"toks/step {toks_per_step} | wall_dt {dt:.2f}s | wall {wall_cum:.1f}s{extra}"
@@ -1689,16 +1146,6 @@ def main():
                     f"{wall_cum:.6f}",
                     str(toks_per_step),
                     str(toks_cum),
-                    f"{getattr(model, 'last_h_mean', '')}",
-                    f"{getattr(model, 'last_hY_mean', '')}",
-                    f"{getattr(model, 'last_xi_mean', '')}",
-                    f"{getattr(model, 'last_rX_max', '')}",
-                    f"{getattr(model, 'last_rP_max', '')}",
-                    f"{getattr(model, 'last_c_log_mean', '')}",
-                    f"{getattr(model, 'last_c_lin_mean', '')}",
-                    f"{getattr(model, 'last_leak_warnings', '')}",
-                    f"{getattr(model, 'last_t_start', '')}",
-                    f"{getattr(model, 'last_t_end', '')}",
                 ],
             )
             if wandb_run is not None:
@@ -1741,16 +1188,6 @@ def main():
                     f"{wall_cum:.6f}",
                     str(toks_per_step),
                     str(toks_cum),
-                    f"{getattr(model, 'last_h_mean', '')}",
-                    f"{getattr(model, 'last_hY_mean', '')}",
-                    f"{getattr(model, 'last_xi_mean', '')}",
-                    f"{getattr(model, 'last_rX_max', '')}",
-                    f"{getattr(model, 'last_rP_max', '')}",
-                    f"{getattr(model, 'last_c_log_mean', '')}",
-                    f"{getattr(model, 'last_c_lin_mean', '')}",
-                    f"{getattr(model, 'last_leak_warnings', '')}",
-                    f"{getattr(model, 'last_t_start', '')}",
-                    f"{getattr(model, 'last_t_end', '')}",
                 ],
             )
             # checkpoint best. best_val is tracked on every rank (val_loss is already
