@@ -185,9 +185,10 @@ _REV_BLOCKS = (ReversibleBlock,)
 # from the same checkpoint.
 SCHEMA = 2
 
-# A bound gap below this is a violation, not rounding. The SVD's sigma_min carries
-# relative error ~eps * cond, i.e. ~1e-13 at the conditioning seen at T=16.
-BOUND_TOL = 1e-8
+# A log bound gap below this is a violation, not rounding. The SVD's sigma_min
+# carries relative error ~eps * cond: ~1e-13 in fp64 at the conditioning seen at
+# T=16, ~1e-6 in fp32 on a GPT-2-width block, with margin for cuSOLVER.
+BOUND_TOL = {"float64": 1e-8, "float32": 1e-3}
 
 
 def _clock(device) -> float:
@@ -606,8 +607,9 @@ def bound_gaps(rec: dict) -> None:
         if hi is not None and rec.get("sigma_max") is not None:
             rec[f"bound_hi_gap_{kind}"] = math.log(hi) - math.log(rec["sigma_max"])
     if "bound_lo_gap_exact" in rec and "bound_hi_gap_exact" in rec:
-        rec["bound_ok"] = (rec["bound_lo_gap_exact"] >= -BOUND_TOL
-                           and rec["bound_hi_gap_exact"] >= -BOUND_TOL)
+        tol = BOUND_TOL.get(rec.get("dtype"), BOUND_TOL["float32"])
+        rec["bound_ok"] = (rec["bound_lo_gap_exact"] >= -tol
+                           and rec["bound_hi_gap_exact"] >= -tol)
 
 
 # ------------------------------------------------------------------ driver

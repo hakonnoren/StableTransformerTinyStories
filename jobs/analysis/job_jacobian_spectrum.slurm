@@ -35,7 +35,7 @@
 # `--list_arms` prints. Verify before trusting the mapping above:
 #   python -m analysis.jacobian_spectrum --ckpt_dir ${CKPT_DIR} --list_arms
 #
-# What it costs (measured on array 25002324, A100 40 GB, fp64, T=16)
+# What it costs (measured on array 25002324: A100 40 GB, fp64, T=16; fp32 should be no slower)
 # ------------------------------------------------------------------
 #   per-block SVD          baseline ~62 s, reversible ~470-570 s     x 12 x N_POINTS
 #   stack SVD              same N as a block, so the same ~8.5 min   x |STACK_DEPTHS| x N_POINTS
@@ -67,15 +67,19 @@
 # licenses extrapolating the spectrum to T=1024 — if the T-dependence matters,
 # submit T=8 and T=16 and read the trend off the two (see "Other sizes" below).
 #
-# Precision: float64, not negotiable at the default settings
-# ----------------------------------------------------------
-# Measured on the trained 'small' baseline at T=4: sigma_max 3.6e+01,
-# sigma_min 3.0e-05, i.e. cond(J) ~ 1.2e6. float32 has ~1.2e-7 relative
-# precision, so the bottom of that spectrum is at the noise floor in fp32 and
-# sum_log_sigma (= log|det J|, the quantity the regime sweep is *about*) would be
-# garbage. fp64 costs ~2x the flops on an A100 and buys the whole tail. Use
-# --dtype float32 only for a T=32+ probe where fp64 will not fit, and then do not
-# report anything from the small singular values.
+# Precision: float32 by default, so any GPU will do
+# -------------------------------------------------
+# float32 halves memory and drops the A100 requirement. Checked against the fp64
+# T=16 spectra of array 25002324: every reversible block has cond <= 5e3, well
+# inside float32's ~1e7 range, and on a GPT-2-width block fp32 reproduced the fp64
+# singular values to ~1e-6 relative, the LU center to 3e-9, the bounds to 1e-5.
+# What float32 does lose: the baseline's smallest singular values (block 0 has
+# cond 1.8e8; blocks 1-3 a few tail values) and the bottom of the baseline STACK.
+# n_sigma_below_floor flags them. For those, rerun the baseline in fp64:
+#   sbatch --array=0 --gres=gpu:a100:1 --export=ALL,DTYPE=float64,OUT_DIR=results/jacobian_spectrum_T16_paper_fp64 ...
+# The center is taken by LU, not by summing log sigma, so it is fine in fp32.
+# fd_rel_err is a central difference in the run's dtype and sits at ~1e-2 in fp32
+# (cancellation), so in fp32 it only catches gross AD errors.
 #
 # Validation this job carries with it
 # -----------------------------------
@@ -191,11 +195,11 @@
 #SBATCH --account=share-ie-imf            # replace with your IDUN account
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
-# 40 GB is the binding constraint, not compute: the reversible J is 4.83 GB in
-# fp64 at T=16 and cuSOLVER's SVD workspace sits on top of it. An a100 also has
-# real fp64 throughput (9.7 TFLOPS, 19.5 with DMMA), which a consumer card does
-# not — do not relax this to gpu:1 without dropping to --dtype float32.
-#SBATCH --gres=gpu:a100:1
+# Any GPU: in float32 the reversible J is 2.4 GB at T=16 and the measured fp64 peak
+# of 28 GB halves to ~14 GB. A 16 GB card is tight; if cuSOLVER runs out of
+# workspace, svdvals() falls back to the CPU (slow, not fatal). For DTYPE=float64
+# pass --gres=gpu:a100:1 on the command line.
+#SBATCH --gres=gpu:1
 # HOST ram, and unusually small for this repo: no training bins are loaded, only
 # data/tinystories_val.bin (9.5 MB). The 24 G is sized for the CPU SVD fallback
 # in svdvals(), which needs the 4.83 GB matrix plus LAPACK workspace on the host
@@ -259,7 +263,7 @@ N_POINTS=${N_POINTS:-1}
 # Blank = all blocks. Set e.g. LAYERS="0 5 11" to shard a T=32 run.
 LAYERS=${LAYERS:-}
 
-DTYPE=${DTYPE:-float64}
+DTYPE=${DTYPE:-float32}
 
 # Rows of J per batched backward. Activation memory scales with it, wall-clock
 # inversely. 256 keeps the batched-VJP intermediates at a few hundred MB at these
