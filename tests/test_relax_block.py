@@ -169,7 +169,93 @@ def test_causal():
             assert (out[0, :j] - base[0, :j]).abs().max() < 1e-10
 
 
+def _inject_model(rate=0.5, seed=0):
+    torch.manual_seed(seed)
+    m = RevFormerModel(_cfg(), RevConfig(regime="relax", relax_rate=rate, embed="narrow",
+                                         relax_inject=True))
+    return m.double()
+
+
+def test_inject_forward_inverse_and_model():
+    m = _inject_model()
+    m.eval()
+    torch.manual_seed(6)
+    idx = torch.randint(0, VOCAB, (2, T))
+    with torch.no_grad():
+        y0, avg = m.stack_input(idx)
+        e = m.tok_emb(idx) + m.pos_emb(torch.arange(T))[None]
+        assert torch.equal(y0[..., :D], e)
+        y = y0
+        for b in m.blocks:
+            g, a = b.get_gamma(), b.get_alpha()
+            x, z = y.split(D, dim=-1)
+            x1 = torch.exp(-g) * x + (1 - torch.exp(-g)) * (z + b.attn(b.ln_1(z + e)))
+            z1 = torch.exp(-a) * z + (1 - torch.exp(-a)) * (x1 + b.mlp(b.ln_2(x1 + e)))
+            out = b(y, avg, e)
+            assert (out - torch.cat([x1, z1], -1)).abs().max() < 1e-13
+            assert (b.inverse(out, avg, e) - y).abs().max() / y.abs().max() < 1e-11
+            y = out
+        # model forward == the manual stack above (readout sum -> ln_f -> head)
+        logits, _ = m(idx)
+        ref = m.lm_head(m.ln_f(y[..., :D] + y[..., D:]))
+        assert (logits - ref).abs().max() < 1e-12
+        # injection actually changes the function
+        m0 = _model(rate=0.5)
+        m0.load_state_dict(m.state_dict())
+        m0.eval()
+        assert (m0(idx)[0] - logits).abs().max() > 1e-4
+
+    # Callers that skip e must fail loudly, not run the un-injected map.
+    for call in (lambda: m.blocks[0](y0), lambda: m.blocks[0].inverse(y0)):
+        try:
+            call()
+        except RuntimeError:
+            continue
+        raise AssertionError("injected block ran without e")
+    m.train()
+    m.mem_efficient, m.mem_efficient_segment = True, L
+    try:
+        m(idx, idx)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("mem_efficient + relax_inject should raise")
+
+
+def test_inject_causal_and_logdet():
+    m = _inject_model(rate=1.0)
+    m.eval()
+    torch.manual_seed(7)
+    idx = torch.randint(0, VOCAB, (1, T))
+    with torch.no_grad():
+        base, _ = m(idx)
+        for j in range(1, T):
+            idx2 = idx.clone()
+            idx2[0, j] = (idx2[0, j] + 1) % VOCAB
+            assert (m(idx2)[0][0, :j] - base[0, :j]).abs().max() < 1e-10
+    b = m.blocks[0]
+    Tn = 3
+    e = torch.randn(1, Tn, D, dtype=torch.float64)
+    y = torch.randn(1, Tn, 2 * D, dtype=torch.float64)
+    J = torch.autograd.functional.jacobian(
+        lambda v: b(v.view(1, Tn, 2 * D), 0.0, e).reshape(-1), y.reshape(-1))
+    expected = -Tn * float((b.get_gamma() + b.get_alpha()).sum().detach())
+    assert abs(float(torch.linalg.slogdet(J)[1]) - expected) < 1e-9
+
+
 def test_config_validation():
+    for kw in (dict(relax_inject=True, embed="wide"),):
+        try:
+            RevConfig(regime="relax", **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"RevConfig(regime='relax', {kw}) should have raised")
+    try:
+        RevConfig(regime="vf_scaling", relax_inject=True, embed="narrow")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("relax_inject outside relax should raise")
     for kw in (dict(tanh_scale=True), dict(randn_init=True), dict(init_offset=0.1),
                dict(relax_rate=0.0), dict(relax_rate=-1.0)):
         try:

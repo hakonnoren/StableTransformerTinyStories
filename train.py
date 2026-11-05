@@ -504,6 +504,11 @@ def main():
                          "state per block; 3.0 keeps 5%%. The inverse re-expands the x-z "
                          "difference mode by e^(gamma+alpha) per block, so --mem_efficient is "
                          "only numerically usable at small rates.")
+    ap.add_argument("--rev_relax_inject", action="store_true",
+                    help="--rev_regime relax (narrow embed): add the token+position embedding "
+                         "to every force argument, Attn(LN(z + e)) and MLP(LN(x + e)), as in "
+                         "the looped relax model. Eager backprop only (not --mem_efficient); "
+                         "disables --track_recon_drift.")
     ap.add_argument("--rev_relax_fixed", action="store_true",
                     help="--rev_regime relax: freeze the rates at --rev_relax_rate (buffers) "
                          "instead of learning them")
@@ -837,6 +842,7 @@ def main():
             kappa_mem=args.rev_kappa_mem,
             relax_rate=args.rev_relax_rate,
             relax_learn=not args.rev_relax_fixed,
+            relax_inject=args.rev_relax_inject,
             embed=args.rev_embed,
             lift=args.rev_lift,
             readout=args.rev_readout,
@@ -882,6 +888,9 @@ def main():
     if args.mem_efficient:
         if not hasattr(model, "mem_efficient"):
             raise SystemExit(f"--mem_efficient needs --arch reversible; got {args.arch}")
+        if getattr(args, "rev_relax_inject", False):
+            raise SystemExit("--mem_efficient does not support --rev_relax_inject: the "
+                             "reversible stack does not pass the injected embedding")
         model.mem_efficient = True
         model.mem_efficient_segment = int(args.mem_efficient_segment)
         from revformer.rev_backprop import stack_supported
@@ -1059,7 +1068,10 @@ def main():
     if args.track_recon_drift:
         try:
             from revformer.rev_backprop import reconstruction_drift, stack_supported
-            if hasattr(model, "blocks") and stack_supported(model.blocks):
+            if getattr(getattr(model, "rev_cfg", None), "relax_inject", False):
+                print(f"[{args.arch}][drift] --track_recon_drift ignored: the drift probe "
+                      "does not pass the injected embedding (--rev_relax_inject)")
+            elif hasattr(model, "blocks") and stack_supported(model.blocks):
                 drift_fn = reconstruction_drift
                 with val_it.unsharded():        # world-size-independent probe draw
                     dx, _ = next(val_it)

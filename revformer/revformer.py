@@ -100,6 +100,16 @@ Caveat for --mem_efficient: with Attn = MLP = 0 the layer keeps the common mode
 x = z and contracts the difference mode x - z by e^-(gamma+alpha), so the inverse
 re-expands it by e^(gamma+alpha) per block. At rate 3 that is e^6 ~ 400x per
 inverted block, i.e. reconstruction is invertible in exact arithmetic only.
+
+Embedding injection (RevConfig.relax_inject, off by default): as in the looped
+relax model, the token+position embedding e is added to every force ARGUMENT,
+
+    x_new = e^-gamma * x + (1 - e^-gamma) * (z + Attn(LN_1(z + e)))
+    z_new = e^-alpha * z + (1 - e^-alpha) * (x_new + MLP(LN_2(x_new + e)))
+
+The forces still see only the other stream plus a constant, so the block stays
+exactly invertible with the same log|det|. Eager backprop only: the
+--mem_efficient stack and the drift probe do not pass e (blocks raise if asked).
 """
 
 import math
@@ -158,6 +168,7 @@ class RevConfig:
     # relax_rate. relax_learn=False keeps them as frozen buffers at that value.
     relax_rate: float = 3.0
     relax_learn: bool = True
+    relax_inject: bool = False    # add the embedding to every force argument (narrow only)
     # ---- embedding width (see module docstring) ----
     # "wide" keeps the historical 2*n_embd token/pos tables, ln_f and tied lm_head.
     # "narrow" puts them at n_embd -- the baseline's exact shapes -- and lifts /
@@ -211,11 +222,14 @@ class RevConfig:
                     f"softplus, so these flags have no effect: {offenders}")
             if not self.relax_rate > 0:
                 raise ValueError(f"regime='relax' needs relax_rate > 0; got {self.relax_rate}")
-        elif self.relax_rate != 3.0 or not self.relax_learn:
+            if self.relax_inject and self.embed != "narrow":
+                raise ValueError("relax_inject needs embed='narrow': the injected embedding "
+                                 "must have the width of one stream")
+        elif self.relax_rate != 3.0 or not self.relax_learn or self.relax_inject:
             raise ValueError(
-                f"relax_rate / relax_learn only apply to regime='relax'; got "
-                f"relax_rate={self.relax_rate}, relax_learn={self.relax_learn} "
-                f"with regime={self.regime!r}")
+                f"relax_rate / relax_learn / relax_inject only apply to regime='relax'; got "
+                f"relax_rate={self.relax_rate}, relax_learn={self.relax_learn}, "
+                f"relax_inject={self.relax_inject} with regime={self.regime!r}")
         if self.init_offset != 0.0 and self.regime in _DAMPED_REGIMES:
             raise ValueError(
                 f"init_offset={self.init_offset} has no effect under regime="
@@ -245,6 +259,7 @@ class ReversibleBlock(nn.Module):
         self.damped = self.regime in _DAMPED_REGIMES
         self.use_mem = self.regime == "damped_mem"
         self.relax = self.regime == "relax"
+        self.inject = self.relax and bool(rev_cfg.relax_inject)
 
         if self.relax:
             # Positive rates via softplus; raw0 = softplus^-1(rate). Named *_bias so
@@ -323,14 +338,25 @@ class ReversibleBlock(nn.Module):
         # vf_scaling: avg is 0.0, so this is the identity.
         return gamma - avg, alpha - avg
 
-    def forward(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
+    def _check_injection(self, e):
+        if self.inject and e is None:
+            raise RuntimeError(
+                "this relax block was built with relax_inject=True and needs the "
+                "embedding e; callers that run blocks directly (mem_efficient stack, "
+                "reconstruction_drift, Jacobian analysis) do not pass it")
+        return e if self.inject else None
+
+    def forward(self, y: torch.Tensor, avg=0.0, e: Optional[torch.Tensor] = None) -> torch.Tensor:
         x, z = torch.split(y, y.shape[-1] // 2, dim=-1)
         if self.relax:
             # x <- e^-g x + (1 - e^-g)(z + Attn(LN_1 z)); -expm1(-g) = 1 - e^-g, accurate
-            # for small rates too.
+            # for small rates too. With injection the force arguments are z + e, x + e.
+            e = self._check_injection(e)
             g, a = self.get_gamma(), self.get_alpha()
-            x = torch.exp(-g) * x - torch.expm1(-g) * (z + self.attn(self.ln_1(z)))
-            z = torch.exp(-a) * z - torch.expm1(-a) * (x + self.mlp(self.ln_2(x)))
+            zin = z if e is None else z + e
+            x = torch.exp(-g) * x - torch.expm1(-g) * (z + self.attn(self.ln_1(zin)))
+            xin = x if e is None else x + e
+            z = torch.exp(-a) * z - torch.expm1(-a) * (x + self.mlp(self.ln_2(xin)))
         elif self.frozen:
             x = x + self.attn(self.ln_1(z))
             z = z + self.mlp(self.ln_2(x))
@@ -340,7 +366,7 @@ class ReversibleBlock(nn.Module):
             z = torch.exp(-alpha) * z + self.mlp(self.ln_2(x))
         return torch.cat([x, z], dim=-1)
 
-    def inverse(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
+    def inverse(self, y: torch.Tensor, avg=0.0, e: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Exact algebraic inverse of forward -- no fixed-point iteration. This is
         what makes memory-efficient reversible backprop possible; see
         revformer/rev_backprop.py.
@@ -367,9 +393,12 @@ class ReversibleBlock(nn.Module):
         """
         x, z = torch.split(y, y.shape[-1] // 2, dim=-1)      # x is x', z is z'
         if self.relax:
+            e = self._check_injection(e)
             g, a = self.get_gamma(), self.get_alpha()
-            z = torch.exp(a) * (z + torch.expm1(-a) * (x + self.mlp(self.ln_2(x))))
-            x = torch.exp(g) * (x + torch.expm1(-g) * (z + self.attn(self.ln_1(z))))
+            xin = x if e is None else x + e
+            z = torch.exp(a) * (z + torch.expm1(-a) * (x + self.mlp(self.ln_2(xin))))
+            zin = z if e is None else z + e
+            x = torch.exp(g) * (x + torch.expm1(-g) * (z + self.attn(self.ln_1(zin))))
         elif self.frozen:
             z = z - self.mlp(self.ln_2(x))
             x = x - self.attn(self.ln_1(z))
@@ -456,6 +485,9 @@ class RevFormerModel(nn.Module):
         loop -- an unsupported block type is not an error, just not eligible."""
         if not self.mem_efficient or not torch.is_grad_enabled():
             return False
+        if self.rev_cfg.relax_inject:
+            raise RuntimeError("mem_efficient reversible backprop does not pass the injected "
+                               "embedding (relax_inject=True); train eagerly")
         from revformer.rev_backprop import stack_supported             # noqa: PLC0415
         return stack_supported(self.blocks)
 
@@ -493,11 +525,17 @@ class RevFormerModel(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None,
                 global_step: Optional[int] = None):
         x, avg = self.stack_input(idx)
+        # relax_inject (narrow only): both lifts put the embedding in the first half
+        # of y0 (dup: [e, e], zeros: [e, 0]), so this is exactly drop(tok + pos).
+        e = x[..., :self.cfg.n_embd] if self.rev_cfg.relax_inject else None
 
         if self._mem_efficient_active():
             from revformer.rev_backprop import run_reversible_stack   # noqa: PLC0415
             x = run_reversible_stack(self.blocks, x, avg,
                                      segment=self.mem_efficient_segment)
+        elif e is not None:
+            for blk in self.blocks:
+                x = blk(x, avg, e)
         else:
             for blk in self.blocks:
                 x = blk(x, avg)

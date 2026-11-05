@@ -10,9 +10,19 @@
 #    0  relax_eager_L12        3.0, learned  ordinary autograd         sympformer-reversible
 #    1  relax_segL_r0.1_L12    0.1, fixed    reconstructed (segL)      sympformer-reversible-revback
 #    2  relax_eager_r0.1_L12   0.1, fixed    ordinary autograd         sympformer-reversible
+#    3  relax_eager_inject_L12 3.0, learned  ordinary autograd         sympformer-reversible
 #
 # Default submission is arms 0-1. Arm 2 is the clean control for arm 1 (same
 # model, eager backprop): `sbatch --array=2 jobs/relax/relaxL12.slurm`.
+#
+# Arm 3 is arm 0 with ONE change, --rev_relax_inject: the token+position embedding e
+# is added to every force argument, as in the looped relax model,
+#   x' = e^-g x + (1 - e^-g)(z + Attn(LN_1(z + e)))
+#   z' = e^-a z + (1 - e^-a)(x' + MLP(LN_2(x' + e)))
+# Arms 0-2 do NOT inject (e enters once, via y0 = [e, e]). No new parameters, same
+# log|det|, still exactly invertible -- but eager only: the mem_efficient stack and
+# the drift probe do not pass e, so train.py refuses --mem_efficient with it and
+# skips --track_recon_drift. Submit: `sbatch --array=3 jobs/relax/relaxL12.slurm`.
 #
 # Why the two variants use different rates
 # ----------------------------------------
@@ -75,7 +85,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-1                        # 0=relax eager (rate 3)  1=relax segL (rate 0.1)  [2=eager control]
+#SBATCH --array=0-1                        # 0=relax eager (rate 3)  1=relax segL (rate 0.1)  [2=eager control  3=eager + embedding injection]
 #SBATCH --output=output_relaxL12_%A_%a.txt
 #SBATCH --error=output_relaxL12_%A_%a.err
 
@@ -158,16 +168,19 @@ NAMES=(
   relax_eager_L12
   relax_segL_r${RELAX_RATE_REV}_L12
   relax_eager_r${RELAX_RATE_REV}_L12
+  relax_eager_inject_L12
 )
 PROJECTS=(
   sympformer-reversible
   sympformer-reversible-revback
+  sympformer-reversible
   sympformer-reversible
 )
 TASK_ARGS=(
   "--rev_relax_rate ${RELAX_RATE_EAGER}"
   "--rev_relax_rate ${RELAX_RATE_REV} --rev_relax_fixed ${SEGL}"
   "--rev_relax_rate ${RELAX_RATE_REV} --rev_relax_fixed"
+  "--rev_relax_rate ${RELAX_RATE_EAGER} --rev_relax_inject"
 )
 
 ID=${SLURM_ARRAY_TASK_ID}
