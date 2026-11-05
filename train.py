@@ -4,6 +4,7 @@ import contextlib
 import os
 import time
 import csv
+import math
 from dataclasses import asdict
 
 import numpy as np
@@ -466,7 +467,7 @@ def main():
     # full n_embd width (same as the baseline), so pass the SAME --n_embd to both.
     ap.add_argument("--rev_regime", type=str, default="vpm_scaling",
                     choices=["vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling",
-                             "damped", "damped_mem"],
+                             "damped", "damped_mem", "relax"],
                     help="reversible volume regime (see revformer/README.md)")
     ap.add_argument("--rev_lambda", type=float, default=0.0,
                     help="vpm_scaling only: total log|det| of the block stack = -rev_lambda")
@@ -497,6 +498,15 @@ def main():
                     help="damped regimes: max per-layer contraction budget kappa")
     ap.add_argument("--rev_kappa_mem", type=float, default=0.001,
                     help="damped_mem: contraction floor for protected memory channels")
+    ap.add_argument("--rev_relax_rate", type=float, default=3.0,
+                    help="--rev_regime relax: initial per-channel rates gamma = alpha "
+                         "(softplus-parametrised, > 0). Each stream keeps e^-rate of its own "
+                         "state per block; 3.0 keeps 5%%. The inverse re-expands the x-z "
+                         "difference mode by e^(gamma+alpha) per block, so --mem_efficient is "
+                         "only numerically usable at small rates.")
+    ap.add_argument("--rev_relax_fixed", action="store_true",
+                    help="--rev_regime relax: freeze the rates at --rev_relax_rate (buffers) "
+                         "instead of learning them")
     # ---- memory-efficient reversible backprop (revformer/rev_backprop.py) ----
     ap.add_argument("--mem_efficient", action="store_true",
                     help="run the reversible block stack under no_grad and reconstruct "
@@ -825,6 +835,8 @@ def main():
             kappa_min=args.rev_kappa_min,
             kappa_max=args.rev_kappa_max,
             kappa_mem=args.rev_kappa_mem,
+            relax_rate=args.rev_relax_rate,
+            relax_learn=not args.rev_relax_fixed,
             embed=args.rev_embed,
             lift=args.rev_lift,
             readout=args.rev_readout,
@@ -901,6 +913,21 @@ def main():
             print(f"[{args.arch}][mem_efficient] segment={seg} in bf16: y0 is "
                   f"checkpointed (exact), {min(seg, n_blocks) - 1} chained inverses per "
                   "segment leave ~1e-2 relative reconstruction error in the interior.")
+        # relax: every inverse re-expands the x-z difference mode by e^(gamma+alpha),
+        # on top of the error above. Measured at 12L/768d init, bf16, segment=12:
+        # segL gradient error 9.9e-3 at rate 0.1 (vf_scaling: 5.2e-3), 2.3e-1 at 0.3,
+        # 5e2 at 1.0, NaN at 3.0 (NaN in fp32 too).
+        if eligible and args.rev_regime == "relax" and seg != 1:
+            with torch.no_grad():
+                kmax = max(float((b.get_gamma() + b.get_alpha()).max()) for b in model.blocks)
+            n_inv = (min(seg, n_blocks) if seg > 0 else n_blocks + 1) - 1
+            amp = kmax * n_inv
+            print(f"[{args.arch}][mem_efficient] relax: {n_inv} chained inverses at "
+                  f"max(gamma+alpha)={kmax:.3f} re-expand rounding error by up to "
+                  f"e^{amp:.1f} = {math.exp(min(amp, 700)):.1e}"
+                  + (" -- reconstructed gradients will be garbage; lower "
+                     "--rev_relax_rate (<= ~0.1 at 12L in bf16, ideally with "
+                     "--rev_relax_fixed) or use segment=1" if amp > 3.0 else ""))
 
     # Parameter census. Counts each tensor once (lm_head is tied to tok_emb), split
     # embedding vs. block so a reversible-vs-baseline A/B can be checked for param

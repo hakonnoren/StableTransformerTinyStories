@@ -80,8 +80,29 @@ centered, which sets each block's log-volume change:
                  change however the model likes (deliberately not VP).
 
 Increasing freedom: vpb_baseline -> vpb_scaling -> vpm_scaling -> vf_scaling.
+
+The relaxed coupling (regime="relax")
+-------------------------------------
+A different block, not a fifth centering. Each stream moves a fraction
+1 - e^-rate of the way towards "other stream + its sublayer":
+
+    x_new = e^-gamma * x + (1 - e^-gamma) * (z + Attn(LN_1(z)))
+    z_new = e^-alpha * z + (1 - e^-alpha) * (x_new + MLP(LN_2(x_new)))
+
+with POSITIVE rates gamma = softplus(gamma_bias), alpha = softplus(alpha_bias),
+per channel, initialised at RevConfig.relax_rate (3.0 => each stream keeps 5% of
+its own state). It is the conformal block above with the forces replaced by
+(e^gamma - 1)(z + Attn) and (1 - e^-alpha)(x + MLP), so it keeps the closed-form
+inverse and log|det| = -T * sum(gamma + alpha) < 0: no VP regime, volume always
+contracts. Large rates approach the standard pre-LN block on the z stream.
+
+Caveat for --mem_efficient: with Attn = MLP = 0 the layer keeps the common mode
+x = z and contracts the difference mode x - z by e^-(gamma+alpha), so the inverse
+re-expands it by e^(gamma+alpha) per block. At rate 3 that is e^6 ~ 400x per
+inverted block, i.e. reconstruction is invertible in exact arithmetic only.
 """
 
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -105,7 +126,7 @@ from model import (  # noqa: E402
 
 
 _VALID_REGIMES = ("vpb_baseline", "vpb_scaling", "vpm_scaling", "vf_scaling",
-                  "damped", "damped_mem")
+                  "damped", "damped_mem", "relax")
 _DAMPED_REGIMES = ("damped", "damped_mem")
 
 
@@ -132,6 +153,11 @@ class RevConfig:
     kappa_min: float = 0.005
     kappa_max: float = 0.08
     kappa_mem: float = 0.001      # damped_mem: contraction floor for protected "memory" channels
+    # ---- relax regime (see module docstring) ----
+    # gamma = softplus(gamma_bias) > 0, per channel, initialised so gamma = alpha =
+    # relax_rate. relax_learn=False keeps them as frozen buffers at that value.
+    relax_rate: float = 3.0
+    relax_learn: bool = True
     # ---- embedding width (see module docstring) ----
     # "wide" keeps the historical 2*n_embd token/pos tables, ln_f and tied lm_head.
     # "narrow" puts them at n_embd -- the baseline's exact shapes -- and lifts /
@@ -175,6 +201,21 @@ class RevConfig:
                 "regime='vpb_baseline' freezes gamma/alpha to zero, so these flags "
                 f"have no effect: {offenders}"
             )
+        if self.regime == "relax":
+            offenders = [n for n, v in (("randn_init", self.randn_init),
+                                        ("tanh_scale", self.tanh_scale),
+                                        ("init_offset", self.init_offset)) if v]
+            if offenders:
+                raise ValueError(
+                    "regime='relax' initialises its rates at relax_rate through a "
+                    f"softplus, so these flags have no effect: {offenders}")
+            if not self.relax_rate > 0:
+                raise ValueError(f"regime='relax' needs relax_rate > 0; got {self.relax_rate}")
+        elif self.relax_rate != 3.0 or not self.relax_learn:
+            raise ValueError(
+                f"relax_rate / relax_learn only apply to regime='relax'; got "
+                f"relax_rate={self.relax_rate}, relax_learn={self.relax_learn} "
+                f"with regime={self.regime!r}")
         if self.init_offset != 0.0 and self.regime in _DAMPED_REGIMES:
             raise ValueError(
                 f"init_offset={self.init_offset} has no effect under regime="
@@ -203,8 +244,21 @@ class ReversibleBlock(nn.Module):
         self.frozen = self.regime == "vpb_baseline"
         self.damped = self.regime in _DAMPED_REGIMES
         self.use_mem = self.regime == "damped_mem"
+        self.relax = self.regime == "relax"
 
-        if self.damped:
+        if self.relax:
+            # Positive rates via softplus; raw0 = softplus^-1(rate). Named *_bias so
+            # train.py's optimizer grouping (no weight decay, rev_scale_lr_mult) and
+            # cheap_metrics' gamma/alpha logging pick them up unchanged.
+            r = float(rev_cfg.relax_rate)
+            raw0 = r if r > 20 else math.log(math.expm1(r))
+            for name in ("gamma_bias", "alpha_bias"):
+                t = torch.full((1, 1, d), raw0)
+                if rev_cfg.relax_learn:
+                    self.register_parameter(name, nn.Parameter(t))
+                else:
+                    self.register_buffer(name, t)
+        elif self.damped:
             # Per-layer contraction budget. rho -> kappa in [kappa_min,kappa_max];
             # u -> split. Init rho=-2 (sigmoid~0.12 => light kappa), u=0 (symmetric).
             self.kappa_min = float(rev_cfg.kappa_min)
@@ -237,6 +291,8 @@ class ReversibleBlock(nn.Module):
         return kd
 
     def get_gamma(self) -> torch.Tensor:
+        if self.relax:
+            return F.softplus(self.gamma_bias)
         if self.damped:
             return 0.5 * self._kappa() * (1.0 + torch.tanh(self.u))   # X-stream log-damp >= 0
         if self.use_tanh:
@@ -244,6 +300,8 @@ class ReversibleBlock(nn.Module):
         return self.gamma_bias
 
     def get_alpha(self) -> torch.Tensor:
+        if self.relax:
+            return F.softplus(self.alpha_bias)
         if self.damped:
             return 0.5 * self._kappa() * (1.0 - torch.tanh(self.u))   # Z-stream log-damp >= 0
         if self.use_tanh:
@@ -254,6 +312,9 @@ class ReversibleBlock(nn.Module):
         """gamma/alpha actually used as exponents after the configured centering."""
         gamma = self.get_gamma()
         alpha = self.get_alpha()
+        if self.relax:
+            # No centering: the rates must stay positive, and log|det| = -T*sum(g+a).
+            return gamma, alpha
         if self.regime == "vpb_scaling":
             # Self-center so sum_i (gamma_used + alpha_used) = 0 within this block.
             c = (gamma.mean() + alpha.mean()) / 2
@@ -264,7 +325,13 @@ class ReversibleBlock(nn.Module):
 
     def forward(self, y: torch.Tensor, avg=0.0) -> torch.Tensor:
         x, z = torch.split(y, y.shape[-1] // 2, dim=-1)
-        if self.frozen:
+        if self.relax:
+            # x <- e^-g x + (1 - e^-g)(z + Attn(LN_1 z)); -expm1(-g) = 1 - e^-g, accurate
+            # for small rates too.
+            g, a = self.get_gamma(), self.get_alpha()
+            x = torch.exp(-g) * x - torch.expm1(-g) * (z + self.attn(self.ln_1(z)))
+            z = torch.exp(-a) * z - torch.expm1(-a) * (x + self.mlp(self.ln_2(x)))
+        elif self.frozen:
             x = x + self.attn(self.ln_1(z))
             z = z + self.mlp(self.ln_2(x))
         else:
@@ -288,9 +355,22 @@ class ReversibleBlock(nn.Module):
         Any active dropout inside attn/mlp must draw the SAME masks the forward
         drew, or this returns a different tensor than it should -- rev_backprop
         refuses to run when that cannot be guaranteed.
+
+        relax (k_g = e^-gamma, k_a = e^-alpha):
+
+            z' = k_a z + (1-k_a)(x' + MLP(LN_2(x')))  =>  z = e^alpha (z' - (1-k_a)(x' + MLP))
+            x' = k_g x + (1-k_g)(z + Attn(LN_1(z)))   =>  x = e^gamma (x' - (1-k_g)(z + Attn))
+
+        Exact algebraically, but it re-expands the difference mode x - z by
+        e^(gamma+alpha) per block, so in floating point it is only usable for small
+        rates and few chained inverses (see the module docstring).
         """
         x, z = torch.split(y, y.shape[-1] // 2, dim=-1)      # x is x', z is z'
-        if self.frozen:
+        if self.relax:
+            g, a = self.get_gamma(), self.get_alpha()
+            z = torch.exp(a) * (z + torch.expm1(-a) * (x + self.mlp(self.ln_2(x))))
+            x = torch.exp(g) * (x + torch.expm1(-g) * (z + self.attn(self.ln_1(z))))
+        elif self.frozen:
             z = z - self.mlp(self.ln_2(x))
             x = x - self.attn(self.ln_1(z))
         else:
