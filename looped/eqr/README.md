@@ -10,7 +10,8 @@ this is a re-implementation.
 |---|---|
 | `coupled_eqr.py` | `CoupledEqRModel`: EqR's model with the state update replaced by kick / relax (installed as `models/coupled_eqr.py`) |
 | `pretrain_rate_groups.patch` | EqR `pretrain.py`: learned rates go in an optimiser group without weight decay (no-op for EqR's models) |
-| `install_overlay.sh` | copies the two files above (and the tests) into an EqR checkout |
+| `pretrain_wandb_resume.patch` | EqR `pretrain.py`: skip setting `wandb.run._step` on resume, which wandb >= 0.31 (IDUN's env) refuses, so every resume crashed |
+| `install_overlay.sh` | copies `coupled_eqr.py` (and the tests) into an EqR checkout and applies both patches |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
 | `test_coupled_eqr.py` | 19 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients, `inject_h`, `self_read` |
 | `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds, one row per checkpoint step): accuracy / residual / overthinking from the evaluate.py JSONs, the dynamics below, and the depth × breadth table |
@@ -44,8 +45,8 @@ sbatch --time=16:00:00 --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4
 sbatch --export=ALL,RUN_ROOT=$R,CKPT_STEP=20000 jobs/looped/sudoku_scaling.slurm               # depth x breadth
 ```
 
-After changing `coupled_eqr.py`, rerun `install_overlay.sh`. The training job refuses to start if the copy
-in the EqR checkout differs from this repo's.
+After changing `coupled_eqr.py` or a patch, rerun `install_overlay.sh`. The training job refuses to start if the
+copy in the EqR checkout differs from this repo's or `pretrain.py` lacks a patch.
 
 ## The port
 

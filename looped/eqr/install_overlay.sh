@@ -3,6 +3,7 @@
 #   models/coupled_eqr.py             <- looped/eqr/coupled_eqr.py
 #   tests_coupled/test_coupled_eqr.py <- looped/eqr/test_coupled_eqr.py
 #   pretrain.py                       <- + pretrain_rate_groups.patch (no weight decay on learned rates)
+#                                        + pretrain_wandb_resume.patch (resume works with wandb >= 0.31)
 #
 # Usage: bash looped/eqr/install_overlay.sh <EqR checkout>
 set -euo pipefail
@@ -14,10 +15,12 @@ mkdir -p "${EQR_DIR}/tests_coupled"
 cp "${HERE}/test_coupled_eqr.py" "${EQR_DIR}/tests_coupled/test_coupled_eqr.py"
 
 cd "${EQR_DIR}"
-if git apply --reverse --check "${HERE}/pretrain_rate_groups.patch" 2>/dev/null; then
-  echo "pretrain_rate_groups.patch already applied"
-else
-  git apply "${HERE}/pretrain_rate_groups.patch"
-  echo "applied pretrain_rate_groups.patch"
-fi
+for P in pretrain_rate_groups.patch pretrain_wandb_resume.patch; do   # in this order
+  if git apply --reverse --check "${HERE}/${P}" 2>/dev/null; then
+    echo "${P} already applied"
+  else
+    git apply "${HERE}/${P}"
+    echo "applied ${P}"
+  fi
+done
 echo "overlay installed in ${EQR_DIR} (EqR $(git rev-parse --short HEAD))"

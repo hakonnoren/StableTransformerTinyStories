@@ -1,0 +1,17 @@
+diff --git a/pretrain.py b/pretrain.py
+index 00432da..1829bc8 100644
+--- a/pretrain.py
++++ b/pretrain.py
+@@ -702,7 +702,11 @@ def launch(hydra_config: DictConfig):
+             run.config.update({"checkpoint_path": config.checkpoint_path}, allow_val_change=True)
+ 
+         if wandb.run is not None and train_state.step > 0:
+-            wandb.run._step = train_state.step
++            # [coupled_eqr overlay] wandb >= 0.31 has no Run._step and refuses to set it, which
++            # crashed every resume. Nothing depends on it: a resumed run continues W&B's own step
++            # counter, and every log carries "step", the x-axis set by define_metric above.
++            if hasattr(wandb.run, "_step"):
++                wandb.run._step = train_state.step
+ 
+         wandb_meta_for_config = {
+             "id": WANDB_RUN_ID,

@@ -48,6 +48,8 @@
 # continues). EqR's LR is constant after warmup (lr_min_ratio 1.0), so extending 20k -> 50k
 # equals a 50k run. Extend eqr, relax3_leak1 and kick_pos to EqR's paper budget:
 #   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4,6 jobs/looped/sudoku_eqr.slurm
+# (The first submission of this, 2026-11-06, crashed at resume: IDUN's wandb 0.31 refuses EqR's
+#  wandb.run._step assignment. pretrain_wandb_resume.patch fixes it; the job now checks both patches.)
 # The resumed run writes a new outputs/<run id>/<date>/<time>/ dir; summarize_sudoku.py keys
 # rows by checkpoint step, so the 20k and 50k evaluations appear as separate rows.
 #
@@ -184,6 +186,12 @@ if ! cmp -s "${REPO}/looped/eqr/coupled_eqr.py" models/coupled_eqr.py; then
   log "       Rerun: bash looped/eqr/install_overlay.sh ${EQR_DIR}  (not from inside a running array)"
   exit 1
 fi
+for P in pretrain_rate_groups.patch pretrain_wandb_resume.patch; do
+  if ! git apply --reverse --check "${REPO}/looped/eqr/${P}" 2>/dev/null; then
+    log "FATAL: ${EQR_DIR}/pretrain.py lacks ${P}; rerun bash looped/eqr/install_overlay.sh ${EQR_DIR}"
+    exit 1
+  fi
+done
 
 final_ckpt() { ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_${MAX_STEPS}_*.pth 2>/dev/null | head -1; }
 # newest checkpoint of this run id by step number (the path itself has other underscores)
