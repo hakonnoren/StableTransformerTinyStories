@@ -1,0 +1,25 @@
+diff --git a/pretrain.py b/pretrain.py
+index fd2d4f3..00432da 100644
+--- a/pretrain.py
++++ b/pretrain.py
+@@ -237,9 +237,19 @@ def create_model(
+         betas = (beta1, beta2)
+ 
+     weight_decay = config.weight_decay
++    # [coupled_eqr overlay] Models that expose rate_parameters() (models/coupled_eqr.py) get their
++    # damping rates in a second group without weight decay; EqR's own models have none, so for them
++    # this is the original single-group optimiser.
++    _core = getattr(model, "model", model)
++    _no_decay = list(_core.rate_parameters()) if hasattr(_core, "rate_parameters") else []
++    _no_decay_ids = {id(p) for p in _no_decay}
++    _param_groups: Any = [p for p in model.parameters() if id(p) not in _no_decay_ids]
++    if _no_decay:
++        _param_groups = [{"params": _param_groups}, {"params": _no_decay, "weight_decay": 0.0}]
++        rank_zero_print_info(f"[coupled_eqr] {len(_no_decay)} rate parameter(s) excluded from weight decay")
+     optimizers = [
+         AdamATan2(
+-            model.parameters(),
++            _param_groups,
+             lr=0,  # Needs to be set by scheduler
+             weight_decay=weight_decay,
+             betas=betas,
