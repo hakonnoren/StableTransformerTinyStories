@@ -13,10 +13,12 @@ this is a re-implementation.
 | `install_overlay.sh` | copies the two files above (and the tests) into an EqR checkout |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
 | `test_coupled_eqr.py` | 13 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients |
-| `summarize_sudoku.py` | per-arm table (mean ± sd over seeds) from the evaluate.py JSONs, with overthinking O and changed predictions dy |
+| `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds): accuracy / residual / overthinking from the evaluate.py JSONs, and the dynamics below |
+| `dynamics_eqr.py` | per run: learned rates at every checkpoint (+ linear-part radius); noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle fractions, overthinking, stop-signal rate); spectral radius of one iteration (JVP power iteration, checked against dense eigenvalues) |
 
-Jobs: `jobs/looped/eqr_sanity.slurm` (checks, plus the README's released-checkpoint eval) and
-`jobs/looped/sudoku_eqr.slurm` (7 arms, one seed by default; `SEEDS="0 1 2"` for more).
+Jobs: `jobs/looped/eqr_sanity.slurm` (checks, plus the README's released-checkpoint eval),
+`jobs/looped/sudoku_eqr.slurm` (7 arms, one seed by default; `SEEDS="0 1 2"` for more; runs `dynamics_eqr.py`
+after its evals) and `jobs/looped/sudoku_dynamics.slurm` (the dynamics for runs that are already trained).
 
 ## Running on IDUN
 

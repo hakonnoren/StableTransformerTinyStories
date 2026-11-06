@@ -52,8 +52,33 @@ def _run_name(run_dir):
     return os.path.basename(os.path.dirname(os.path.dirname(run_dir)))
 
 
+def _dynamics(run_dir, row):
+    f = os.path.join(run_dir, "dynamics.json")
+    if not os.path.exists(f):
+        return
+    d = json.load(open(f))
+    t = d.get("trajectory") or {}
+    get = lambda grp, k: (t.get(grp) or {}).get(str(k))
+    row["nf_exact@16"], row["nf_exact@256"] = get("exact", 16), get("exact", 256)
+    row["FP@256"], row["cyc2@256"] = get("fixed_point", "256@0.001"), get("cycle2", "256@0.001")
+    row["FP@256(1e-2)"] = get("fixed_point", "256@0.01")
+    q = (t.get("step_quantiles") or {}).get("256")
+    row["step50@256"] = q[1] if q else None
+    row["O16->256nf"] = get("overthink", 256)
+    row["stop@256"] = get("q_stop", 256)
+    row["rho"] = (d.get("rho") or {}).get("median")
+    rates = d.get("rates_by_step") or []
+    if rates:
+        last = rates[-1]
+        row["gamma"], row["alpha"] = last["gamma"]["mean"], last["alpha"]["mean"]
+        row["delta"] = (last.get("delta") or {}).get("mean")
+        row["lin_radius"] = last["linear_radius"]
+        row["rates_by_step"] = [(x["step"], round(x["gamma"]["mean"], 4), round(x["alpha"]["mean"], 4)) for x in rates]
+
+
 def summarize_run(run_dir):
     row = {"run": _run_name(run_dir)}
+    _dynamics(run_dir, row)
     m, _ = _metrics(run_dir, "full_D16")
     if m:
         row["cell@16"], row["exact@16"] = m.get("all/accuracy"), m.get("all/exact_accuracy")
@@ -79,6 +104,9 @@ def summarize_run(run_dir):
     return row
 
 
+DCOLS = ["nf_exact@16", "nf_exact@256", "FP@256", "FP@256(1e-2)", "cyc2@256", "step50@256", "O16->256nf",
+         "stop@256", "rho", "gamma", "alpha", "delta", "lin_radius"]
+
 COLS = ["cell@16", "exact@16", "cell@64s", "exact@64s", "cell@256s", "exact@256s",
         "resid@64", "resid@256", "O16->64", "O16->256", "dy16->256"]
 
@@ -100,7 +128,9 @@ def main():
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     runs = sorted({os.path.dirname(os.path.dirname(c)) for c in
-                   glob.glob(os.path.join(a.root, "outputs", "*", "*", "*", "eval_preds", "*"))})
+                   glob.glob(os.path.join(a.root, "outputs", "*", "*", "*", "eval_preds", "*"))}
+                  | {os.path.dirname(c) for c in
+                     glob.glob(os.path.join(a.root, "outputs", "*", "*", "*", "dynamics.json"))})
     rows = [summarize_run(r) for r in runs]
     by_arm = defaultdict(list)
     for r in rows:
@@ -115,6 +145,19 @@ def main():
              "batches. O16->r: share of puzzles exact at 16 iterations that are wrong at r. dy16->r: share "
              "whose prediction changed. resid@r: EqR's residual_of_r_steps (norm of the state change at "
              "iteration r; not scale-normalised).\n")
+    if any("rho" in r or "FP@256" in r for r in rows):
+        dl = ["", "Dynamics (looped/eqr/dynamics_eqr.py; noise off, first 768 test puzzles; rho on 32):", "",
+              "| arm | n | " + " | ".join(DCOLS) + " |", "|" + "---|" * (len(DCOLS) + 2)]
+        for arm in arms:
+            rs = by_arm[arm]
+            dl.append(f"| {arm} | {len(rs)} | " + " | ".join(_fmt([r.get(c) for r in rs]) for c in DCOLS) + " |")
+        dl += ["", "nf_exact: exact accuracy without noise. FP@256: share of puzzles with relative step "
+               "|s_r - s_{r-1}|/|s_r| < 1e-3 at r = 256 (also at 1e-2); cyc2: period-2 instead. step50: median "
+               "relative step at 256. O16->256nf: overthinking without noise. stop: share where the halting head "
+               "says stop (q > 0). rho: median spectral radius of one iteration at r = 256 (full, not shift-free). "
+               "gamma/alpha/delta: final learned or fixed rates; lin_radius: radius of one iteration's linear part "
+               "(forces zero).", ""]
+        text += "\n".join(dl)
     print(text)
     for r in rows:
         print(json.dumps(r))

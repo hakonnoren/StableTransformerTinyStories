@@ -44,8 +44,11 @@
 #                     and the overthinking rate O / changed predictions dy (handoff §5)
 # Then: python looped/eqr/summarize_sudoku.py ${RUN_ROOT} --out sudoku_table.md
 #
-# Not here yet (handoff §5): the fixed-point fraction and the shift-free spectral
-# radius rho_q. Both need per-puzzle trajectories rather than EqR's mean residual.
+# Then looped/eqr/dynamics_eqr.py on the final checkpoint -> <run dir>/dynamics.json: learned
+# rates at every checkpoint, the fixed-point / 2-cycle fraction out to 256 noise-free iterations,
+# overthinking, and the spectral radius of one iteration (full radius, not the shift-free quotient:
+# EqR's post-RMSNorm blocks are not shift-invariant). For runs that predate this, use
+# jobs/looped/sudoku_dynamics.slurm.
 #
 # Prerequisites: bash looped/eqr/setup_eqr.sh (login node), then a passing
 # jobs/looped/eqr_sanity.slurm, whose 200-step timings size --time below. The
@@ -184,6 +187,11 @@ run_eval() {   # tag depth [max_eval_steps]
 }
 run_eval full_D16 16
 for D in 16 64 256; do run_eval sub_D${D} ${D} ${SUB_BATCHES}; done
+
+# ── dynamics: learned rates per checkpoint, fixed points / 2-cycles to r=256, spectral radius ──────
+log "dynamics (looped/eqr/dynamics_eqr.py)"
+python "${REPO}/looped/eqr/dynamics_eqr.py" --eqr-dir "${EQR_DIR}" --ckpt "${CKPT}" 2>&1 \
+  | grep -E "^\[rates\]|^\[dynamics\]|Error|Traceback"
 
 log "task ${ID} (${NAME}) done in $(( SECONDS / 60 )) min. Summarize with:"
 log "  python ${REPO}/looped/eqr/summarize_sudoku.py ${RUN_ROOT}"
