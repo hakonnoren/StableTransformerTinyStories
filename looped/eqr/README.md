@@ -25,6 +25,9 @@ Jobs:
 - `jobs/looped/sudoku_dynamics.slurm`: the dynamics for runs that are already trained.
 - `jobs/looped/sudoku_scaling.slurm`: EqR's own test-time scaling evaluation (depth × breadth, noise 0.5,
   convergence top-4 / majority vote / any-correct) on trained runs and on EqR's released checkpoint.
+  `GRID` entries are `depth:breadth[:noise]`, so one job can sweep the test-time noise (fixed std, not
+  scaled to the state, whose size differs between arms) or go past depth 256 (the batch shrinks with
+  depth there, since evaluate.py keeps every iteration's logits when breadth > 1).
 
 ## Running on IDUN
 
@@ -43,6 +46,11 @@ sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm   
 sbatch --time=16:00:00 --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4,6 \
        jobs/looped/sudoku_eqr.slurm                                                            # extend to 50k
 sbatch --export=ALL,RUN_ROOT=$R,CKPT_STEP=20000 jobs/looped/sudoku_scaling.slurm               # depth x breadth
+sbatch --export=ALL,RUN_ROOT=$R,ARMS="eqr relax3_leak1 kick_pos",CKPT_STEP=20000,\
+       GRID="64:16:0.1 64:16:0.25 64:16:1.0" --array=0-2 jobs/looped/sudoku_scaling.slurm      # noise sweep
+sbatch --time=20:00:00 --export=ALL,RUN_ROOT=$R,ARMS="eqr relax3_leak1 kick_pos released",\
+       CKPT_STEP=20000,GRID="16:1 64:1 256:1 1024:1 1024:16" --array=0-3 \
+       jobs/looped/sudoku_scaling.slurm                                                        # depth to 1024
 ```
 
 After changing `coupled_eqr.py` or a patch, rerun `install_overlay.sh`. The training job refuses to start if the

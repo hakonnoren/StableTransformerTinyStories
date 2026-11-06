@@ -15,9 +15,11 @@ and from the subset predictions computes, per puzzle (exact = every cell right):
   dy(16->r)  = P(prediction at r != prediction at 16) (any cell changed)
 Aggregates mean ± sd over seeds per arm (the run name is <arm>_s<seed>).
 
-Scaling table (jobs/looped/sudoku_scaling.slurm: EqR's depth x breadth eval, noise 0.5, tags
-scale_D<depth>_B<breadth>): single-run exact, the most-converged run (conv1), the mean of the
-top-k most-converged runs (conv4, EqR's headline), majority vote and any-run-correct.
+Scaling table (jobs/looped/sudoku_scaling.slurm: EqR's depth x breadth eval, tags
+scale_D<depth>_B<breadth>; one row per depth, breadth and test-time noise, the noise read from
+evaluate.py's directory label ..._arch_noise_scale-<noise>_...): single-run exact, the
+most-converged run (conv1), the mean of the top-k most-converged runs (conv4, EqR's headline),
+majority vote and any-run-correct.
 """
 import argparse
 import glob
@@ -64,7 +66,8 @@ def _scaling(run_dir, step):
             continue
         x = json.load(open(path))["metrics"]
         b = int(m.group(2))
-        out.append({"D": int(m.group(1)), "B": b,
+        nm = re.search(r"noise_scale-([0-9.]+(?:e-?[0-9]+)?)(?:_|/|$)", path)
+        out.append({"D": int(m.group(1)), "B": b, "N": float(nm.group(1)) if nm else None,
                     "single": x.get("all/exact_accuracy"), "cell": x.get("all/accuracy"),
                     "conv1": x.get("convergence_top_k/cumulative_exact_acc_top1") if b > 1 else None,
                     "convk": x.get("convergence_top_k/exact_accuracy") if b > 1 else None,
@@ -172,16 +175,16 @@ def _scaling_table(arms, by_key):
         cells = defaultdict(list)
         for r in by_key[key]:
             for x in r.get("scaling", []):
-                cells[(x["D"], x["B"])].append(x)
-        for (d, b) in sorted(cells):
-            xs = cells[(d, b)]
-            rows.append(f"| {key[0]} | {_step_str(key[1])} | {d} | {b} | {len(xs)} | "
+                cells[(x["D"], x["B"], x.get("N"))].append(x)
+        for (d, b, nz) in sorted(cells, key=lambda t: (t[0], t[1], -1.0 if t[2] is None else t[2])):
+            xs = cells[(d, b, nz)]
+            rows.append(f"| {key[0]} | {_step_str(key[1])} | {d} | {b} | {'?' if nz is None else f'{nz:g}'} | {len(xs)} | "
                         + " | ".join(_fmt([x.get(c) for x in xs]) for c in SCOLS) + " |")
     if not rows:
         return ""
-    head = ["", "Depth x breadth (jobs/looped/sudoku_scaling.slurm: EqR's evaluate.py, noise 0.5, first 2048 test "
-            "puzzles by default):", "",
-            "| arm | step | depth | breadth | n | " + " | ".join(SCOLS) + " |", "|" + "---|" * (len(SCOLS) + 5)]
+    head = ["", "Depth x breadth (jobs/looped/sudoku_scaling.slurm: EqR's evaluate.py, first 2048 test puzzles by "
+            "default; noise = test-time Langevin noise std, added after every update):", "",
+            "| arm | step | depth | breadth | noise | n | " + " | ".join(SCOLS) + " |", "|" + "---|" * (len(SCOLS) + 6)]
     tail = ["", "single: exact accuracy of one noisy run (mean over the breadth). conv1: the most-converged run "
             "(smallest logit change over the last 3 iterations). convk: mean of the top-k most-converged (k = 4; "
             "EqR's headline, 98.60 for its released checkpoint at depth 64, breadth 128). vote: majority vote. "

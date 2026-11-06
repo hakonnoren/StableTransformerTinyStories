@@ -8,7 +8,7 @@
 # the answer by convergence (the top-4 runs whose logits changed least over the last 3
 # iterations). sudoku_eqr.slurm only evaluated breadth 1 at the training noise 0.01. Here,
 # per run, EqR's own evaluate.py (config/eval/depth_breadth.yaml) on the first NPUZ test
-# puzzles (2048 = EqR's "lite" smoke set) at each depth:breadth in GRID, noise NOISE:
+# puzzles (2048 = EqR's "lite" smoke set) at each depth:breadth[:noise] in GRID (noise defaults to NOISE):
 #
 #   GRID default  16:16 64:16 256:16 16:128 64:128
 #   64:128 with top-4 is EqR's paper setting; the README's released checkpoint (50k steps)
@@ -31,6 +31,20 @@
 #   sbatch --export=ALL,RUN_ROOT=...,ARMS="relax3_leak1_injL kick_pos_injL",CKPT_STEP=20000 \
 #          --array=0-1 jobs/looped/sudoku_scaling.slurm
 # Default checkpoint: the run's highest step (so after a 50k extension, the 50k one).
+#
+# Noise sweep. The noise is a fixed-std Gaussian added after every update, not scaled to the state,
+# and the arms' states differ in size (EqR ~1, kick_pos's L ~0.6, relax3_leak1 ~1.6 RMS), so one
+# noise level is a different test for each arm. A third GRID field sets the noise per point; the
+# summary table has one row per noise (read from evaluate.py's directory label):
+#   sbatch --export=ALL,RUN_ROOT=...,ARMS="eqr relax3_leak1 kick_pos",CKPT_STEP=20000,\
+#          GRID="64:16:0.1 64:16:0.25 64:16:1.0" --array=0-2 jobs/looped/sudoku_scaling.slurm
+#
+# Deeper than 256: EqR's Sudoku-Lite depth curve at breadth 1 goes to 1024 (84.3 / 90.9 / 94.6 /
+# 96.1 at depth 16 / 64 / 256 / 1024 for the paper's model). Breadth 1 keeps no trajectory and is
+# cheap; 1024:16 costs ~4x 256:16 (the batch shrinks past depth 256, see the loop), so allow time:
+#   sbatch --time=20:00:00 --export=ALL,RUN_ROOT=...,ARMS="eqr relax3_leak1 kick_pos released",\
+#          CKPT_STEP=20000,GRID="16:1 64:1 256:1 1024:1 1024:16" --array=0-3 jobs/looped/sudoku_scaling.slurm
+#   ("released" has only its 50k checkpoint; CKPT_STEP applies to the trained arms only.)
 # Then: python looped/eqr/summarize_sudoku.py ${RUN_ROOT}
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -117,17 +131,22 @@ else
   [[ -z "${CKPT}" ]] && { log "FATAL: no checkpoint for ${ARM} seed ${SEED}${CKPT_STEP:+ at step ${CKPT_STEP}} under ${RUN_ROOT}"; exit 1; }
 fi
 log "arm=${ARM} checkpoint=${CKPT}"
-log "grid=${GRID} puzzles=${NPUZ} noise=${NOISE} top-k=${TOPK}"
+log "grid=${GRID} puzzles=${NPUZ} default noise=${NOISE} top-k=${TOPK}"
 
 # ── depth x breadth ─────────────────────────────────────────────────────────────
 for DB in ${GRID}; do
-  D=${DB%%:*}; B=${DB##*:}
-  GBS=$(( SEQS / B )); (( GBS < 1 )) && GBS=1
+  IFS=: read -r D B N <<< "${DB}"; N=${N:-${NOISE}}
+  [[ -z "${D}" || -z "${B}" ]] && { log "FATAL: bad GRID entry '${DB}' (want depth:breadth[:noise])"; exit 1; }
+  # With breadth > 1, evaluate.py keeps every iteration's logits for the convergence selection, so
+  # memory grows with depth: past depth 256 the batch shrinks to keep sequences x depth at
+  # SEQS x 256, the largest combination run so far (256:16 at SEQS 4096).
+  SQ=$(( B > 1 && D > 256 ? SEQS * 256 / D : SEQS ))
+  GBS=$(( SQ / B )); (( GBS < 1 )) && GBS=1; (( GBS > NPUZ )) && GBS=${NPUZ}
   NB=$(( (NPUZ + GBS - 1) / GBS ))
-  log "eval depth ${D} breadth ${B}: ${GBS} puzzles x ${NB} batches"
+  log "eval depth ${D} breadth ${B} noise ${N}: ${GBS} puzzles x ${NB} batches"
   START=${SECONDS}
   python evaluate.py eval_yaml=config/eval/depth_breadth.yaml checkpoint="${CKPT}" \
-    halt_max_steps=${D} noise_scale=${NOISE} different_init=${B} convergence_top_k=${TOPK} \
+    halt_max_steps=${D} noise_scale=${N} different_init=${B} convergence_top_k=${TOPK} \
     global_batch_size=${GBS} max_eval_steps=${NB} suffix=scale_D${D}_B${B} \
     2>&1 | tr '\r' '\n' | grep -E "saved|Error|Traceback|coupled_eqr" | tail -3
   log "   done in $(( SECONDS - START ))s"
