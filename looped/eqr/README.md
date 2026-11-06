@@ -21,10 +21,10 @@ Jobs: `jobs/looped/eqr_sanity.slurm` (checks, plus the README's released-checkpo
 ## Running on IDUN
 
 ```bash
-bash looped/eqr/setup_eqr.sh                 # login node; EqR in $USERWORK/EqR, env in $USERWORK/conda_envs/eqr
+bash looped/eqr/setup_eqr.sh                 # login node; EqR in /cluster/work/$USER/EqR, env in .../conda_envs/eqr
 sbatch jobs/looped/eqr_sanity.slurm          # expect ~98.6% top-k exact on the released checkpoint
 sbatch jobs/looped/sudoku_eqr.slurm          # 7 tasks (seed 0)
-python looped/eqr/summarize_sudoku.py $USERWORK/eqr_runs/sudoku_<array job id>
+python looped/eqr/summarize_sudoku.py /cluster/work/$USER/eqr_runs/sudoku_<array job id>
 ```
 
 After changing `coupled_eqr.py`, rerun `install_overlay.sh`. The training job refuses to start if the copy

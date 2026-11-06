@@ -72,8 +72,12 @@
 #SBATCH --mail-user=hakon.noren@ntnu.no
 #SBATCH --mail-type=ALL
 
-set -uo pipefail
-WORK=${USERWORK:-$HOME/work}
+set -o pipefail    # no -u: Lmod's and conda's activation scripts read unset variables
+# Work area for the EqR checkout, the conda env, the HF cache and the runs. IDUN has no
+# $USERWORK; its user work area is /cluster/work/$USER (not $HOME: quota).
+if [[ -n "${USERWORK:-}" ]]; then WORK=${USERWORK}
+elif [[ -d /cluster/work/${USER} ]]; then WORK=/cluster/work/${USER}
+else WORK=${HOME}/work; fi
 EQR_DIR=${EQR_DIR:-${WORK}/EqR}
 EQR_ENV=${EQR_ENV:-${WORK}/conda_envs/eqr}
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}

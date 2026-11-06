@@ -16,17 +16,22 @@
 #   4. build adam-atan2 with its CUDA backend (EqR's optimiser; training refuses to
 #      run without it). Needs nvcc: loads $CUDA_MODULE and builds for A100 + H100.
 #   5. download EqR's data (locuslab/EqR-data) and the released Sudoku checkpoint
-#      (locuslab/EqR-model) into $EQR_DIR, with the HF cache under $USERWORK
+#      (locuslab/EqR-model) into $EQR_DIR, with the HF cache in the work area
 #   6. run the overlay unit tests on CPU
 #
+# Defaults: everything under /cluster/work/$USER (EqR/, conda_envs/eqr, hf_cache, eqr_runs/).
 # Overridable: EQR_DIR, EQR_ENV, CUDA_MODULE, TORCH_VERSION, TORCH_INDEX, HF_HOME
 # If `module load ${CUDA_MODULE}` fails, list the options with `module spider CUDA`
 # and rerun with CUDA_MODULE=<one of them> (keep the major version = torch's, 12).
 # ─────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+set -eo pipefail   # no -u: Lmod's and conda's activation scripts read unset variables
 
 EQR_COMMIT=134c7541711125860954c78463023c583b2ef21b
-WORK=${USERWORK:-$HOME/work}
+# Work area for the EqR checkout, the conda env, the HF cache and the runs. IDUN has no
+# $USERWORK; its user work area is /cluster/work/$USER (not $HOME: quota).
+if [[ -n "${USERWORK:-}" ]]; then WORK=${USERWORK}
+elif [[ -d /cluster/work/${USER} ]]; then WORK=/cluster/work/${USER}
+else WORK=${HOME}/work; fi
 EQR_DIR=${EQR_DIR:-${WORK}/EqR}
 EQR_ENV=${EQR_ENV:-${WORK}/conda_envs/eqr}
 CUDA_MODULE=${CUDA_MODULE:-CUDA/12.4.0}

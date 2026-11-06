@@ -49,7 +49,7 @@
 #SBATCH --mail-user=hakon.noren@ntnu.no
 #SBATCH --mail-type=FAIL
 
-set -uo pipefail
+set -o pipefail    # no -u: Lmod's and conda's activation scripts read unset variables
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 RESULTS=${RESULTS:-${REPO}/results/looped}
 read -r -a SEEDS <<< "${SEEDS:-1238}"
