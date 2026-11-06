@@ -86,6 +86,10 @@ else
   # JIT path for newer cards, though torch 2.6/CUDA 12.4 itself does not support 10.x (B300).
   export TORCH_CUDA_ARCH_LIST="8.0;9.0+PTX"
   log "building adam-atan2 against ${CUDA_HOME} for ${TORCH_CUDA_ARCH_LIST}"
+  # adam-atan2's setup.py takes its version from setuptools_scm; under --no-build-isolation that
+  # must be installed here, or the version falls back to 0.0.0 and pip rejects the ==0.0.3 sdist
+  # ("inconsistent version"). ninja makes torch's extension build parallel.
+  pip install -q setuptools_scm ninja
   # --no-deps: do not let pip swap the cu124 torch for a PyPI one
   pip install --no-build-isolation --no-cache-dir --force-reinstall --no-deps adam-atan2==0.0.3
   python -c "from adam_atan2 import AdamATan2; import adam_atan2_backend; print('adam_atan2_backend:', adam_atan2_backend.__file__)"
