@@ -16,14 +16,14 @@ this is a re-implementation.
 | `summarize_sudoku.py` | per-arm table (mean ± sd over seeds) from the evaluate.py JSONs, with overthinking O and changed predictions dy |
 
 Jobs: `jobs/looped/eqr_sanity.slurm` (checks, plus the README's released-checkpoint eval) and
-`jobs/looped/sudoku_eqr.slurm` (9 arms × 3 seeds).
+`jobs/looped/sudoku_eqr.slurm` (7 arms, one seed by default; `SEEDS="0 1 2"` for more).
 
 ## Running on IDUN
 
 ```bash
 bash looped/eqr/setup_eqr.sh                 # login node; EqR in $USERWORK/EqR, env in $USERWORK/conda_envs/eqr
 sbatch jobs/looped/eqr_sanity.slurm          # expect ~98.6% top-k exact on the released checkpoint
-sbatch jobs/looped/sudoku_eqr.slurm          # 27 tasks
+sbatch jobs/looped/sudoku_eqr.slurm          # 7 tasks (seed 0)
 python looped/eqr/summarize_sudoku.py $USERWORK/eqr_runs/sudoku_<array job id>
 ```
 

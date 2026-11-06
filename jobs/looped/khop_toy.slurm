@@ -7,23 +7,27 @@
 # Each task is one run_looped.py job (d=32 takes ~5-20 min on one core); the task ID
 # indexes the table built below. Print it with:   bash jobs/looped/khop_toy.slurm list
 #
-#   block  IDs      what                                                          seeds
-#   A      0-39     3-hop main table, d=32, 8000 steps, r in [3, 8]:              1238-1242
-#                   vanilla, relax3, kick_fixed (rates 0.005: the October failure),
-#                   kick_pos, relax3 delta=1/4, kick_pos+carry, relax3 delta=1/4+carry,
-#                   relax3 delta=1+carry
-#   B      40-75    width / depth: d=64 and d=128 (16000 steps), 2 core layers     1238-1240
-#                   (8000 steps) for vanilla, relax3, kick_pos+carry, relax3 delta=1/4+carry
-#   C      76-111   harder: K=4, K=5, and S=16 at K=3 (16000 steps), same 4 arms   1238-1240
-#   D      112-123  carry horizon 256, and carry on every step (prob 1), for the    1238-1240
-#                   two carry recipes
+# One seed (1238, the one drift_check.py's long-horizon analysis uses) by default; IDs
+# below are for one seed. With SEEDS="1238 1239 1240" every arm gets 3 tasks and the
+# table is 3x longer -- print it with 'list' to get the ranges.
 #
-#   sbatch jobs/looped/khop_toy.slurm                  # all 124
-#   sbatch --array=0-39 jobs/looped/khop_toy.slurm     # block A only
+#   block  IDs      what
+#   A      0-6      3-hop main table, d=32, 8000 steps, r in [3, 8]: vanilla, relax3,
+#                   kick_fixed (rates 0.005: the October failure), kick_pos,
+#                   kick_pos+carry, relax3 delta=1/4+carry, relax3 delta=1+carry
+#                   (delta=1+carry: the best toy recipe, HANDOFF.md §3 phase-4 update)
+#   B      7-18     width / depth: d=64 and d=128 (16000 steps), 2 core layers (8000
+#                   steps) for vanilla, relax3, kick_pos+carry, relax3 delta=1+carry
+#   C      19-30    harder: K=4, K=5, and S=16 at K=3 (16000 steps), same 4 arms
+#   D      31-34    carry horizon 256, and carry on every step (prob 1), for the two
+#                   carry recipes
+#
+#   sbatch jobs/looped/khop_toy.slurm                                         # all 35
+#   sbatch --array=0-6 jobs/looped/khop_toy.slurm                             # block A only
+#   sbatch --export=ALL,SEEDS="1238 1239 1240" --array=0-104 jobs/looped/khop_toy.slurm
 #
 # "carry" = --carry-max 64: with prob. 0.5 first run U{1..64} iterations without
-# gradient (the detached carry). Seeds 1238-1240 recompute the existing 3-seed
-# results; 1241-1242 are new. A task whose result JSON exists is skipped.
+# gradient (the detached carry). A task whose result JSON exists is skipped.
 #
 # Results: ${RESULTS}/<variant>/<arch><tag>_seed<S>.{json,pt} (RESULTS defaults to
 # results/looped in this checkout). Then, per variant directory:
@@ -38,7 +42,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=12:00:00
-#SBATCH --array=0-123
+#SBATCH --array=0-34
 #SBATCH --output=output_khop_toy_%A_%a.txt
 #SBATCH --error=output_khop_toy_%A_%a.err
 
@@ -48,6 +52,7 @@
 set -uo pipefail
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 RESULTS=${RESULTS:-${REPO}/results/looped}
+read -r -a SEEDS <<< "${SEEDS:-1238}"
 
 # ── task table: "<variant dir>|<run_looped.py args>" ─────────────────────────────
 K3="--task khop --K 3 --steps 8000 --r-lo 3 --r-hi 8"
@@ -57,7 +62,6 @@ ARMS_A=(
   "--arch relax3"
   "--arch kick_fixed"
   "--arch kick_pos"
-  "--arch relax3 --leak 0.25 --tag _leak4"
   "--arch kick_pos --carry-max 64 --tag _carry"
   "--arch relax3 --leak 0.25 --carry-max 64 --tag _leak4_carry"
   "--arch relax3 --leak 1.0 --carry-max 64 --tag _leak1_carry"
@@ -66,24 +70,24 @@ ARMS_4=(
   "--arch vanilla"
   "--arch relax3"
   "--arch kick_pos --carry-max 64 --tag _carry"
-  "--arch relax3 --leak 0.25 --carry-max 64 --tag _leak4_carry"
+  "--arch relax3 --leak 1.0 --carry-max 64 --tag _leak1_carry"
 )
 TASKS=()
-for arm in "${ARMS_A[@]}"; do for s in 1238 1239 1240 1241 1242; do
+for arm in "${ARMS_A[@]}"; do for s in "${SEEDS[@]}"; do
   TASKS+=("khop_K3|${K3} ${arm} --seed ${s}"); done; done
 for v in "khop_K3_d64|--task khop --K 3 ${LONG} --n-embd 64" \
          "khop_K3_d128|--task khop --K 3 ${LONG} --n-embd 128" \
          "khop_K3_core2|${K3} --n-core 2"; do
-  for arm in "${ARMS_4[@]}"; do for s in 1238 1239 1240; do TASKS+=("${v} ${arm} --seed ${s}"); done; done; done
+  for arm in "${ARMS_4[@]}"; do for s in "${SEEDS[@]}"; do TASKS+=("${v} ${arm} --seed ${s}"); done; done; done
 for v in "khop_K4|--task khop --K 4 ${LONG}" \
          "khop_K5|--task khop --K 5 ${LONG}" \
          "khop_K3_S16|--task khop --K 3 --S 16 ${LONG}"; do
-  for arm in "${ARMS_4[@]}"; do for s in 1238 1239 1240; do TASKS+=("${v} ${arm} --seed ${s}"); done; done; done
+  for arm in "${ARMS_4[@]}"; do for s in "${SEEDS[@]}"; do TASKS+=("${v} ${arm} --seed ${s}"); done; done; done
 for arm in "--arch kick_pos --carry-max 256 --tag _carry256" \
-           "--arch relax3 --leak 0.25 --carry-max 256 --tag _leak4_carry256" \
+           "--arch relax3 --leak 1.0 --carry-max 256 --tag _leak1_carry256" \
            "--arch kick_pos --carry-max 64 --carry-prob 1.0 --tag _carryp1" \
-           "--arch relax3 --leak 0.25 --carry-max 64 --carry-prob 1.0 --tag _leak4_carryp1"; do
-  for s in 1238 1239 1240; do TASKS+=("khop_K3|${K3} ${arm} --seed ${s}"); done; done
+           "--arch relax3 --leak 1.0 --carry-max 64 --carry-prob 1.0 --tag _leak1_carryp1"; do
+  for s in "${SEEDS[@]}"; do TASKS+=("khop_K3|${K3} ${arm} --seed ${s}"); done; done
 
 if [[ "${1:-}" == "list" ]]; then
   for i in "${!TASKS[@]}"; do printf '%4d  %s\n' "$i" "${TASKS[$i]}"; done

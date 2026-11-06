@@ -77,7 +77,9 @@ if python -c "import adam_atan2_backend" 2>/dev/null; then
 else
   module load "${CUDA_MODULE}"
   export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
-  export TORCH_CUDA_ARCH_LIST="8.0;9.0"          # A100, H100 (build on a GPU-less login node)
+  # sm_80 kernels also run on 8.6/8.9 (A40, L40S, RTX A6000); 9.0 covers H100/H200. +PTX keeps a
+  # JIT path for newer cards, though torch 2.6/CUDA 12.4 itself does not support 10.x (B300).
+  export TORCH_CUDA_ARCH_LIST="8.0;9.0+PTX"
   log "building adam-atan2 against ${CUDA_HOME} for ${TORCH_CUDA_ARCH_LIST}"
   # --no-deps: do not let pip swap the cu124 torch for a PyPI one
   pip install --no-build-isolation --no-cache-dir --force-reinstall --no-deps adam-atan2==0.0.3

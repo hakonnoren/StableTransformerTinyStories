@@ -23,8 +23,10 @@
 #SBATCH --account=share-ie-imf
 #SBATCH --partition=GPUQ
 #SBATCH --nodes=1
-#SBATCH --exclude=idun-07-06
-#SBATCH --gres=gpu:a100:1
+# Any GPU type; the P100/V100 pools are excluded by node (as in jobs/depth/revL12_lrsweep.slurm)
+# together with the bad A100 node idun-07-06, and the preflight below refuses anything else unfit.
+#SBATCH --exclude=idun-07-[01-03,06],idun-06-[08-12],idun-11-[01-17]
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
@@ -52,6 +54,24 @@ FAIL=0
 check() { local name=$1; shift; log "── ${name}"; if "$@"; then log "   OK ${name}"; else log "   FAILED ${name}"; FAIL=1; fi; }
 
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+# Any GPU type (faster to schedule than pinning A100s), as long as it can run this env:
+# bf16 + torch 2.6/CUDA 12.4 + adam-atan2 built for sm_80/sm_90 (sm_80 kernels also run on
+# 8.6/8.9 cards: A40, L40S, RTX A6000). So compute capability 8.x or 9.x; B300 (10.x) and
+# P100/V100 are refused. Memory floor 40 GB until eqr_sanity.slurm has measured the need.
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+GPU_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+case "${GPU_CC%%.*}" in
+  8|9) ;;
+  "") case "${GPU_NAME}" in *P100*|*V100*|*P40*|*K80*|*T4*|*B300*|*B200*)
+        echo "FATAL: unsupported GPU '${GPU_NAME}'"; exit 1 ;; esac ;;
+  *) echo "FATAL: '${GPU_NAME}' has compute capability ${GPU_CC}; this env needs 8.x or 9.x."
+     echo "       Resubmit (P100/V100 nodes are excluded; add this node to --exclude)."; exit 1 ;;
+esac
+if [[ "${GPU_MEM}" =~ ^[0-9]+$ ]] && (( GPU_MEM < 40000 )); then
+  echo "FATAL: '${GPU_NAME}' has ${GPU_MEM} MiB; EqR's batch of 768 is sized for >= 40 GB."; exit 1
+fi
+echo "GPU OK: ${GPU_NAME} (cc ${GPU_CC:-?}, ${GPU_MEM} MiB)"
 cd "${EQR_DIR}" || { log "FATAL: no ${EQR_DIR}; run looped/eqr/setup_eqr.sh first"; exit 1; }
 
 # The overlay in the EqR checkout must be the one in this repo checkout.

@@ -23,8 +23,8 @@ from collections import defaultdict
 
 import torch
 
-ARM_ORDER = ["eqr", "kick_fixed", "kick_learned", "kick_learned_ch", "relax3", "relax3_learned",
-             "relax3_leak4", "relax3_leak1", "kick_pos"]
+ARM_ORDER = ["eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak1", "relax3_leak4", "kick_pos",
+             "relax3_learned", "kick_learned_ch"]
 
 
 def _metrics(run_dir, tag):

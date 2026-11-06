@@ -98,13 +98,17 @@ learning rate 1e-3 with cosine decay, batch 64, 2000 test sequences.
    off by one hop in either direction. Weakly damped kick's errors spread over all hop counts instead.
 6. **The carry without a strong contraction hurts:** 12–33 points lost at r = 8.
 
-**Update (phase 4, local), 3-hop, seeds 1239 and 1240:** both of the following fix damped relax + carry.
-- **δ = 1 + carry:** 0.996 → 0.972, overthinking 2.5%.
-- **δ = 1/4 with carry on every step (`--carry-prob 1.0`):** accuracy *rises* with iterations, 0.933 → 0.987,
-  overthinking 1.2%.
-
-A ListOps check of both is running. The latest numbers are always in
-`StableTransformers_claude/ideas/looped/constrained_damping.md` (§5b).
+**Update (phase 4, local, 3 seeds): relax with δ = 1 + carry (`--arch relax3 --leak 1.0 --carry-max 64`) is now
+the best recipe on both tasks.**
+- ListOps: 0.954 → 0.952, overthinking 0.3%.
+- 3-hop: 0.997 → 0.980, overthinking 1.8%.
+- This beats δ = 1/4 + carry and kick + carry.
+- Carry on every step (`--carry-prob 1.0`) makes accuracy *rise* with iterations, but costs accuracy at r = 8.
+- **Sweep:**
+  - δ = 2 + carry is no better;
+  - δ = 1 without carry fixes ListOps but not 3-hop (0.971 → 0.401), so keep the carry;
+  - learned rates change nothing.
+- Latest numbers: `StableTransformers_claude/ideas/looped/constrained_damping.md` §5b.
 
 ## 4. Pitfalls (each of these bit us once)
 
@@ -157,8 +161,8 @@ relax_δ:    L ← a L + (1−a)(c H + B(H, x))          H ← b H + (1−b)(c L
 **Arms**, 3 seeds each if the budget allows:
 1. EqR, original;
 2. relax, rate 3 fixed (δ = 0; reproduces the October row);
-3. **relax, δ = 1/4**;
-4. relax, δ = 1;
+3. **relax, δ = 1** (the best toy recipe);
+4. relax, δ = 1/4;
 5. **kick, positive learned rates** (rate_min 0.05, init 1);
 6. kick, learned rates without constraint (reproduces the October failure).
 
@@ -171,7 +175,7 @@ relax_δ:    L ← a L + (1−a)(c H + B(H, x))          H ← b H + (1−b)(c L
   state shape).
 
 **Hypothesis to test:** the constrained arms (3–5) keep EqR-level accuracy while settling much harder than kick's
-residual of 201. Arm 3 may still show the "attractor not tied to the answer" failure, as on 3-hop.
+residual of 201. Arm 4 (δ = 1/4) may show the "attractor not tied to the answer" failure, as it did on 3-hop.
 
 ## 6. Larger toy experiments (server)
 
