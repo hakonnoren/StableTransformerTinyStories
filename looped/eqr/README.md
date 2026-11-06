@@ -12,21 +12,36 @@ this is a re-implementation.
 | `pretrain_rate_groups.patch` | EqR `pretrain.py`: learned rates go in an optimiser group without weight decay (no-op for EqR's models) |
 | `install_overlay.sh` | copies the two files above (and the tests) into an EqR checkout |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
-| `test_coupled_eqr.py` | 13 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients |
-| `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds): accuracy / residual / overthinking from the evaluate.py JSONs, and the dynamics below |
+| `test_coupled_eqr.py` | 18 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients, `inject_h` |
+| `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds, one row per checkpoint step): accuracy / residual / overthinking from the evaluate.py JSONs, the dynamics below, and the depth × breadth table |
 | `dynamics_eqr.py` | per run: learned rates at every checkpoint (+ linear-part radius); noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle fractions, overthinking, stop-signal rate); spectral radius of one iteration (JVP power iteration, checked against dense eigenvalues) |
 
-Jobs: `jobs/looped/eqr_sanity.slurm` (checks, plus the README's released-checkpoint eval),
-`jobs/looped/sudoku_eqr.slurm` (7 arms, one seed by default; `SEEDS="0 1 2"` for more; runs `dynamics_eqr.py`
-after its evals) and `jobs/looped/sudoku_dynamics.slurm` (the dynamics for runs that are already trained).
+Jobs:
+- `jobs/looped/eqr_sanity.slurm`: checks, plus the README's released-checkpoint eval.
+- `jobs/looped/sudoku_eqr.slurm`: 10 arms (7 from round 1, 3 from round 2), one seed by default
+  (`SEEDS="0 1 2"` for more). Runs `dynamics_eqr.py` after its evals. Resumes a run from its latest
+  checkpoint when there is none at `MAX_STEPS`, which is how runs are extended from 20k to 50k steps.
+- `jobs/looped/sudoku_dynamics.slurm`: the dynamics for runs that are already trained.
+- `jobs/looped/sudoku_scaling.slurm`: EqR's own test-time scaling evaluation (depth × breadth, noise 0.5,
+  convergence top-4 / majority vote / any-correct) on trained runs and on EqR's released checkpoint.
 
 ## Running on IDUN
 
 ```bash
 bash looped/eqr/setup_eqr.sh                 # login node; EqR in /cluster/work/$USER/EqR, env in .../conda_envs/eqr
 sbatch jobs/looped/eqr_sanity.slurm          # expect ~98.6% top-k exact on the released checkpoint
-sbatch jobs/looped/sudoku_eqr.slurm          # 7 tasks (seed 0)
+sbatch --array=0-6 jobs/looped/sudoku_eqr.slurm   # round 1 (seed 0)
 python looped/eqr/summarize_sudoku.py /cluster/work/$USER/eqr_runs/sudoku_<array job id>
+```
+
+Round 2, into round 1's run root (`JOB_TAG`), so one summary covers both:
+
+```bash
+R=/cluster/work/$USER/eqr_runs/sudoku_25939526
+sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm                 # new arms, 20k
+sbatch --time=16:00:00 --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4,6 \
+       jobs/looped/sudoku_eqr.slurm                                                            # extend to 50k
+sbatch --export=ALL,RUN_ROOT=$R,CKPT_STEP=20000 jobs/looped/sudoku_scaling.slurm               # depth x breadth
 ```
 
 After changing `coupled_eqr.py`, rerun `install_overlay.sh`. The training job refuses to start if the copy
@@ -44,6 +59,11 @@ relax:  L ← a L + (1−a)(c H + B(H + x))        H ← b H + (1−b)(c L + B(L
 ```
 
 Here a = e^−γ, b = e^−α and c = e^−δ. Readout is from H, which plays the role of EqR's z_H.
+
+`inject_h=false` (round 2) drops x from H's force, so H ← … B(L) …, as in EqR, whose z_H update has no
+input. With x in both forces and one shared B, relax's update is symmetric in (H, L), and in round 1 its
+two streams merged (cos(z_H, z_L) = 1.00 in every relax arm). Kick's update is not symmetric, and its
+streams stayed apart (cos 0.74).
 
 **What stays EqR's:**
 - the ACT carry, halting and random state reset;

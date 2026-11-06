@@ -21,6 +21,14 @@ with a = e^-gamma, b = e^-alpha, c = e^-delta (delta = common-mode damping
 the second stream L = z_L. EqR's Langevin noise is added after every
 half-step, exactly as EqR adds it after every module call.
 
+`inject_h=False` drops x from H's force (H <- ... B(L) ...), as in EqR, whose
+z_H update is B(z_H + z_L) without the input. With x in both forces and one
+shared B, the two half-steps evaluate the same function of the other stream,
+so the relax update is symmetric in (H, L) and its streams merge (Sudoku round
+1: cos(z_H, z_L) = 1.00 for every relax arm). Without x the H force differs
+from the L force and the two-state structure can survive. The update stays an
+exact shear + scaling either way.
+
 Schedule (the one free choice of the port). EqR's latent recursion updates
 z_L L_cycles times and then z_H once: L_cycles + 1 evaluations of B. Under a
 coupling the force on a stream does not depend on that stream, so repeated
@@ -81,6 +89,7 @@ class CoupledEqRConfig(EqRConfig):
     leak: float = 0.0                  # relax only: common-mode damping delta >= 0
     learn_leak: bool = False
     half_steps: Optional[int] = None   # half-steps per latent recursion; None -> L_cycles + 1
+    inject_h: bool = True              # False: H's force is B(L) without the input x (EqR's own choice)
     readout_norm: bool = True
     state_dtype: str = "float32"
     decay_rates: bool = False
@@ -183,6 +192,7 @@ class CoupledInnerNetwork(InnerNetwork):
         self.L_level = _Force(self.L_level.layers)     # same ReasoningBlocks, rule replaced
         self.rates = CouplingRates(config)
         self.kick = config.coupling == "kick"
+        self.inject_h = bool(config.inject_h)
         self.noise_scale = float(config.noise_scale)   # evaluate.py's runtime override sets this attribute
         self.state_dtype = getattr(torch, config.state_dtype)
         n = config.half_steps or (config.L_cycles + 1)
@@ -205,9 +215,13 @@ class CoupledInnerNetwork(InnerNetwork):
         )
 
     # maps ---------------------------------------------------------------------------
-    def _force(self, other: torch.Tensor, x: torch.Tensor, seq: Dict[str, CosSin]) -> torch.Tensor:
-        u = (other + x).to(self.forward_dtype)          # EqR: (hidden + injection) in forward dtype
+    def _force(self, other: torch.Tensor, x: Optional[torch.Tensor], seq: Dict[str, CosSin]) -> torch.Tensor:
+        u = other if x is None else other + x
+        u = u.to(self.forward_dtype)                    # EqR: (hidden + injection) in forward dtype
         return self.L_level(u, **seq).to(self.state_dtype)
+
+    def _force_H(self, L: torch.Tensor, x: torch.Tensor, seq: Dict[str, CosSin]) -> torch.Tensor:
+        return self._force(L, x if self.inject_h else None, seq)
 
     def _step(self, stream: str, own: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
               f: torch.Tensor) -> torch.Tensor:
@@ -226,7 +240,7 @@ class CoupledInnerNetwork(InnerNetwork):
         return self._noisy(self._step("L", L, H, self.rates.gamma(), self._force(H, x, seq)))
 
     def half_step_H(self, H, L, x, seq):
-        return self._noisy(self._step("H", H, L, self.rates.alpha(), self._force(L, x, seq)))
+        return self._noisy(self._step("H", H, L, self.rates.alpha(), self._force_H(L, x, seq)))
 
     def _unstep(self, stream: str, new: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
                 f: torch.Tensor) -> torch.Tensor:
@@ -241,7 +255,7 @@ class CoupledInnerNetwork(InnerNetwork):
     def inverse_half_step(self, stream: str, H, L, x, seq):
         if stream == "L":
             return H, self._unstep("L", L, H, self.rates.gamma(), self._force(H, x, seq))
-        return self._unstep("H", H, L, self.rates.alpha(), self._force(L, x, seq)), L
+        return self._unstep("H", H, L, self.rates.alpha(), self._force_H(L, x, seq)), L
 
     def latent_recursion(self, z_H, z_L, x, seq):
         for stream in self.schedule:
@@ -291,7 +305,8 @@ class CoupledEqRModel(EqRModel):
         self.config = CoupledEqRConfig(**config_dict)
         self.inner = CoupledInnerNetwork(self.config)
         depth = self.inner.depth_per_outer_step()
-        print(f"[coupled_eqr] coupling={self.config.coupling} schedule={''.join(self.inner.schedule)} "
+        print(f"[coupled_eqr] coupling={self.config.coupling} inject_h={self.config.inject_h} "
+              f"schedule={''.join(self.inner.schedule)} "
               f"visited={depth['visited_half_steps']} differentiated={depth['differentiated_half_steps']} "
               f"half-steps per outer iteration; learned rate params={len(self.inner.rate_parameters())}")
 

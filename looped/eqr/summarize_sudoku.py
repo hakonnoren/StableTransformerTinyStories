@@ -1,9 +1,11 @@
 """Collect the Sudoku-Extreme runs of jobs/looped/sudoku_eqr.slurm into one table.
 
-    python looped/eqr/summarize_sudoku.py <RUN_ROOT> [--out table.md]
+    python looped/eqr/summarize_sudoku.py <RUN_ROOT> [<RUN_ROOT> ...] [--out table.md] [--scaling-only]
 
 RUN_ROOT is the job's OUTPUT_ROOT (contains outputs/<run id>/<date>/<time>/). For each run
-it reads the evaluate.py results written under eval_preds/:
+directory it reads the evaluate.py results written under eval_preds/. A run extended past its
+first budget (sudoku_eqr.slurm resume) has one directory per segment; rows are keyed by
+(arm, checkpoint step), so the 20k and 50k evaluations of one run are separate rows.
 
   full_D16       whole test set (423k puzzles), 16 iterations: the headline cell/exact accuracy
   sub_D{16,64,256}  the first SUB_BATCHES test batches at 16/64/256 iterations, with predictions
@@ -12,6 +14,10 @@ and from the subset predictions computes, per puzzle (exact = every cell right):
   O(16->r)   = P(not exact at r | exact at 16)       (overthinking: correct answers lost)
   dy(16->r)  = P(prediction at r != prediction at 16) (any cell changed)
 Aggregates mean ± sd over seeds per arm (the run name is <arm>_s<seed>).
+
+Scaling table (jobs/looped/sudoku_scaling.slurm: EqR's depth x breadth eval, noise 0.5, tags
+scale_D<depth>_B<breadth>): single-run exact, the most-converged run (conv1), the mean of the
+top-k most-converged runs (conv4, EqR's headline), majority vote and any-run-correct.
 """
 import argparse
 import glob
@@ -23,16 +29,48 @@ from collections import defaultdict
 
 import torch
 
-ARM_ORDER = ["eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak1", "relax3_leak4", "kick_pos",
-             "relax3_learned", "kick_learned_ch"]
+ARM_ORDER = ["eqr-released", "eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak1", "relax3_leak4",
+             "kick_pos", "relax3_leak1_injL", "kick_pos_injL", "relax3_leak2", "relax3_learned", "kick_learned_ch"]
 
 
-def _metrics(run_dir, tag):
-    hits = glob.glob(os.path.join(run_dir, "eval_preds", f"step_*_{tag}_*", "eval_metrics_step_*.json"))
+def _metrics(run_dir, tag, step=None):
+    s = "*" if step is None else str(step)
+    hits = glob.glob(os.path.join(run_dir, "eval_preds", f"step_{s}_{tag}_*", "eval_metrics_step_*.json"))
     if not hits:
         return None, None
     path = max(hits, key=os.path.getmtime)
     return json.load(open(path))["metrics"], os.path.dirname(path)
+
+
+def _run_step(run_dir):
+    """Checkpoint step this run directory was evaluated at (the highest, if several)."""
+    steps = [int(m.group(1)) for d in glob.glob(os.path.join(run_dir, "eval_preds", "step_*"))
+             if (m := re.match(r"step_(\d+)_", os.path.basename(d)))]
+    if steps:
+        return max(steps)
+    f = os.path.join(run_dir, "dynamics.json")
+    if os.path.exists(f):
+        return json.load(open(f)).get("step")
+    return None
+
+
+def _scaling(run_dir, step):
+    """EqR depth x breadth evals (sudoku_scaling.slurm) of one run directory at one step."""
+    out = []
+    for path in glob.glob(os.path.join(run_dir, "eval_preds", f"step_{step}_scale_D*_B*_*", "eval_metrics_step_*.json")):
+        m = re.search(r"scale_D(\d+)_B(\d+)_", path)
+        if not m:
+            continue
+        x = json.load(open(path))["metrics"]
+        b = int(m.group(2))
+        out.append({"D": int(m.group(1)), "B": b,
+                    "single": x.get("all/exact_accuracy"), "cell": x.get("all/accuracy"),
+                    "conv1": x.get("convergence_top_k/cumulative_exact_acc_top1") if b > 1 else None,
+                    "convk": x.get("convergence_top_k/exact_accuracy") if b > 1 else None,
+                    "vote": x.get("majority_vote/exact_accuracy") if b > 1 else None,
+                    "any": x.get("different_init/any_correct") if b > 1 else None,
+                    "k": x.get("convergence_top_k/k"), "n": x.get("majority_vote/num_samples")})
+    return out
 
 
 def _preds(eval_dir):
@@ -77,14 +115,16 @@ def _dynamics(run_dir, row):
 
 
 def summarize_run(run_dir):
-    row = {"run": _run_name(run_dir)}
+    step = _run_step(run_dir)
+    row = {"run": _run_name(run_dir), "step": step, "dir": run_dir}
     _dynamics(run_dir, row)
-    m, _ = _metrics(run_dir, "full_D16")
+    row["scaling"] = _scaling(run_dir, step) if step is not None else []
+    m, _ = _metrics(run_dir, "full_D16", step)
     if m:
         row["cell@16"], row["exact@16"] = m.get("all/accuracy"), m.get("all/exact_accuracy")
     sub = {}
     for r in (16, 64, 256):
-        m, d = _metrics(run_dir, f"sub_D{r}")
+        m, d = _metrics(run_dir, f"sub_D{r}", step)
         if m is None:
             continue
         row[f"cell@{r}s"], row[f"exact@{r}s"] = m.get("all/accuracy"), m.get("all/exact_accuracy")
@@ -122,35 +162,76 @@ def _fmt(vals):
     return f"{mu:.3g}±{sd:.2g}"
 
 
+SCOLS = ["single", "conv1", "convk", "vote", "any", "cell"]
+
+
+def _scaling_table(arms, by_key):
+    rows = []
+    for key in arms:
+        cells = defaultdict(list)
+        for r in by_key[key]:
+            for x in r.get("scaling", []):
+                cells[(x["D"], x["B"])].append(x)
+        for (d, b) in sorted(cells):
+            xs = cells[(d, b)]
+            rows.append(f"| {key[0]} | {_step_str(key[1])} | {d} | {b} | {len(xs)} | "
+                        + " | ".join(_fmt([x.get(c) for x in xs]) for c in SCOLS) + " |")
+    if not rows:
+        return ""
+    head = ["", "Depth x breadth (jobs/looped/sudoku_scaling.slurm: EqR's evaluate.py, noise 0.5, first 2048 test "
+            "puzzles by default):", "",
+            "| arm | step | depth | breadth | n | " + " | ".join(SCOLS) + " |", "|" + "---|" * (len(SCOLS) + 5)]
+    tail = ["", "single: exact accuracy of one noisy run (mean over the breadth). conv1: the most-converged run "
+            "(smallest logit change over the last 3 iterations). convk: mean of the top-k most-converged (k = 4; "
+            "EqR's headline, 98.60 for its released checkpoint at depth 64, breadth 128). vote: majority vote. "
+            "any: some run correct. cell: per-cell accuracy of one run.", ""]
+    return "\n".join(head + rows + tail)
+
+
+def _step_str(step):
+    return "–" if step is None else (f"{step // 1000}k" if step % 1000 == 0 else str(step))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("root")
+    ap.add_argument("roots", nargs="+")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--scaling-only", action="store_true")
     a = ap.parse_args()
-    runs = sorted({os.path.dirname(os.path.dirname(c)) for c in
-                   glob.glob(os.path.join(a.root, "outputs", "*", "*", "*", "eval_preds", "*"))}
-                  | {os.path.dirname(c) for c in
-                     glob.glob(os.path.join(a.root, "outputs", "*", "*", "*", "dynamics.json"))})
-    rows = [summarize_run(r) for r in runs]
-    by_arm = defaultdict(list)
+    runs = set()
+    for root in a.roots:
+        runs |= {os.path.dirname(os.path.dirname(c)) for c in
+                 glob.glob(os.path.join(root, "outputs", "*", "*", "*", "eval_preds", "*"))}
+        runs |= {os.path.dirname(c) for c in glob.glob(os.path.join(root, "outputs", "*", "*", "*", "dynamics.json"))}
+    rows = [summarize_run(r) for r in sorted(runs)]
+    by_key = defaultdict(list)                      # (arm, checkpoint step) -> runs (seeds)
     for r in rows:
-        by_arm[re.sub(r"_s\d+$", "", r["run"])].append(r)
-    arms = [x for x in ARM_ORDER if x in by_arm] + sorted(set(by_arm) - set(ARM_ORDER))
-    lines = ["| arm | n | " + " | ".join(COLS) + " |", "|" + "---|" * (len(COLS) + 2)]
-    for arm in arms:
-        rs = by_arm[arm]
-        lines.append(f"| {arm} | {len(rs)} | " + " | ".join(_fmt([r.get(c) for r in rs]) for c in COLS) + " |")
+        by_key[(re.sub(r"_s\d+$", "", r["run"]), r["step"])].append(r)
+    rank = lambda arm: ARM_ORDER.index(arm) if arm in ARM_ORDER else len(ARM_ORDER)
+    keys = sorted(by_key, key=lambda k: (rank(k[0]), k[0], k[1] if k[1] is not None else -1))
+    scaling = _scaling_table(keys, by_key)
+    if a.scaling_only:
+        print(scaling or "no scaling evals found")
+        return
+    main_keys = [k for k in keys if any(any(c in r for c in COLS) for r in by_key[k])]
+    lines = ["| arm | step | n | " + " | ".join(COLS) + " |", "|" + "---|" * (len(COLS) + 3)]
+    for key in main_keys:
+        rs = by_key[key]
+        lines.append(f"| {key[0]} | {_step_str(key[1])} | {len(rs)} | "
+                     + " | ".join(_fmt([r.get(c) for r in rs]) for c in COLS) + " |")
     text = "\n".join(lines)
     text += ("\n\ncell/exact@16: whole test set; columns ending in s, resid and O/dy: the first SUB_BATCHES test "
              "batches. O16->r: share of puzzles exact at 16 iterations that are wrong at r. dy16->r: share "
              "whose prediction changed. resid@r: EqR's residual_of_r_steps (norm of the state change at "
              "iteration r; not scale-normalised).\n")
     if any("rho" in r or "FP@256" in r for r in rows):
+        dkeys = [k for k in keys if any("rho" in r or "FP@256" in r for r in by_key[k])]
         dl = ["", "Dynamics (looped/eqr/dynamics_eqr.py; noise off, first 768 test puzzles; rho on 32):", "",
-              "| arm | n | " + " | ".join(DCOLS) + " |", "|" + "---|" * (len(DCOLS) + 2)]
-        for arm in arms:
-            rs = by_arm[arm]
-            dl.append(f"| {arm} | {len(rs)} | " + " | ".join(_fmt([r.get(c) for r in rs]) for c in DCOLS) + " |")
+              "| arm | step | n | " + " | ".join(DCOLS) + " |", "|" + "---|" * (len(DCOLS) + 3)]
+        for key in dkeys:
+            rs = by_key[key]
+            dl.append(f"| {key[0]} | {_step_str(key[1])} | {len(rs)} | "
+                      + " | ".join(_fmt([r.get(c) for r in rs]) for c in DCOLS) + " |")
         dl += ["", "nf_exact: exact accuracy without noise. FP@256: share of puzzles with relative step "
                "|s_r - s_{r-1}|/|s_r| < 1e-3 at r = 256 (also at 1e-2); cyc2: period-2 instead. step50: median "
                "relative step at 256. O16->256nf: overthinking without noise. stop: share where the halting head "
@@ -158,9 +239,10 @@ def main():
                "gamma/alpha/delta: final learned or fixed rates; lin_radius: radius of one iteration's linear part "
                "(forces zero).", ""]
         text += "\n".join(dl)
+    text += scaling
     print(text)
     for r in rows:
-        print(json.dumps(r))
+        print(json.dumps({k: v for k, v in r.items() if k not in ("scaling", "dir")}))
     if a.out:
         with open(a.out, "w") as f:
             f.write(text)

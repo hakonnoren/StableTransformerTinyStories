@@ -20,15 +20,31 @@
 #   relax3_leak1      relax, rate 3, common-mode damping delta = 1    NEW / 3 (best toy recipe)
 #   relax3_leak4      relax, rate 3, delta = 1/4                      NEW / 4
 #   kick_pos          kick, gamma = 0.05 + softplus, learned, init 1  NEW / 5
+#   -- round two (after round 1 = array job 25939526) --
+#   relax3_leak1_injL relax3_leak1, input x only in L's force          H <- ... B(L), as in EqR
+#   kick_pos_injL     kick_pos, input x only in L's force
+#   relax3_leak2      relax, rate 3, delta = 2 (c = 0.14)              more damping than delta = 1
+#   Why x only in L: with x in both forces and one shared B, relax's update is symmetric in
+#   (H, L) and its streams merged in round 1 (cos 1.00). EqR's own H update has no x.
 #
 # Left out to keep the sweep small (both were in the first version of this job):
 #   kick_learned_ch (per-channel learned kick; the PDF has it equal to the scalar one)
 #   relax3_learned  (relax rates learned from 3; the PDF's single-run row, and on the toy
 #                    tasks learned rates changed nothing -- HANDOFF.md §3, phase-4 update)
 #
-# 7 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
-#   sbatch jobs/looped/sudoku_eqr.slurm                                   # 7 tasks, seed 0
-#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-20 jobs/looped/sudoku_eqr.slurm   # 3 seeds
+# 10 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
+#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 10 arms, seed 0
+#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-29 jobs/looped/sudoku_eqr.slurm   # 3 seeds
+# Round two, into round 1's run root (one summary table; W&B ids <arm>-s0-25939526):
+#   sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm
+#
+# Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
+# latest one (EqR restores weights, optimiser, EMA, carry, RNG and data position; the W&B run
+# continues). EqR's LR is constant after warmup (lr_min_ratio 1.0), so extending 20k -> 50k
+# equals a 50k run. Extend eqr, relax3_leak1 and kick_pos to EqR's paper budget:
+#   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4,6 jobs/looped/sudoku_eqr.slurm
+# The resumed run writes a new outputs/<run id>/<date>/<time>/ dir; summarize_sudoku.py keys
+# rows by checkpoint step, so the 20k and 50k evaluations appear as separate rows.
 #
 # Recipe (the PDF's): config/train/eqr_sudoku.yaml unchanged except max_steps =
 # MAX_STEPS (20000; EqR's paper budget is 50000 -- export MAX_STEPS=50000 for that).
@@ -68,7 +84,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --array=0-6
+#SBATCH --array=0-9
 #SBATCH --output=output_sudoku_eqr_%A_%a.txt
 #SBATCH --error=output_sudoku_eqr_%A_%a.err
 
@@ -101,7 +117,8 @@ WANDB_PROJECT=${WANDB_PROJECT:-looped-eqr-sudoku}
 WANDB_ENTITY=${WANDB_ENTITY:-hakon-noren-ntnu}
 
 COUPLED="arch.name=coupled_eqr@CoupledEqRModel arch.short_name=Coupled"
-ARMS=(eqr kick_fixed kick_learned relax3 relax3_leak1 relax3_leak4 kick_pos)
+ARMS=(eqr kick_fixed kick_learned relax3 relax3_leak1 relax3_leak4 kick_pos
+      relax3_leak1_injL kick_pos_injL relax3_leak2)
 ARM_ARGS=(
   ""
   "${COUPLED} ++arch.coupling=kick ++arch.rate=0.005"
@@ -110,6 +127,9 @@ ARM_ARGS=(
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0"
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=0.25"
   "${COUPLED} ++arch.coupling=kick ++arch.rate=1.0 ++arch.rate_constraint=positive ++arch.rate_min=0.05 ++arch.learn_rates=true"
+  "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0 ++arch.inject_h=false"
+  "${COUPLED} ++arch.coupling=kick ++arch.rate=1.0 ++arch.rate_constraint=positive ++arch.rate_min=0.05 ++arch.learn_rates=true ++arch.inject_h=false"
+  "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=2.0"
 )
 
 ID=${SLURM_ARRAY_TASK_ID:?submit as an array: sbatch jobs/looped/sudoku_eqr.slurm}
@@ -160,14 +180,25 @@ if ! cmp -s "${REPO}/looped/eqr/coupled_eqr.py" models/coupled_eqr.py; then
 fi
 
 final_ckpt() { ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_${MAX_STEPS}_*.pth 2>/dev/null | head -1; }
+# newest checkpoint of this run id by step number (the path itself has other underscores)
+latest_ckpt() {
+  ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_*_*.pth 2>/dev/null \
+    | awk '{f=$0; sub(/.*\/step_/, "", f); split(f, a, "_"); print a[1], $0}' | sort -n | tail -1 | cut -d' ' -f2-
+}
 
-# ── train (skipped if this run id already has its final checkpoint) ─────────────
+# ── train (skipped if this run id already has its final checkpoint; resumed if it has an earlier one) ──
 if [[ -z "$(final_ckpt)" ]]; then
+  RESUME_ARGS=()
+  RESUME=$(latest_ckpt)
+  if [[ -n "${RESUME}" ]]; then
+    log "resuming from ${RESUME} (to step ${MAX_STEPS})"
+    RESUME_ARGS=("++load_checkpoint='${RESUME}'")    # quoted for Hydra's override grammar
+  fi
   # shellcheck disable=SC2086  (intentional word-splitting of ARM_ARGS)
   WANDB_RUN_ID=${RUN_ID} python pretrain.py --config-name train/eqr_sudoku \
     ++max_steps=${MAX_STEPS} ++seed=${SEED} eval_interval_steps=${EVAL_INTERVAL} \
     ++project_name=${WANDB_PROJECT} ++entity=${WANDB_ENTITY} ++run_name=${NAME} \
-    ${ARM_ARGS[$A]} 2>&1 | tr '\r' '\n' | grep -v "it/s\]$\|s/it\]$"
+    ${ARM_ARGS[$A]} "${RESUME_ARGS[@]}" 2>&1 | tr '\r' '\n' | grep -v "it/s\]$\|s/it\]$"
   RC=${PIPESTATUS[0]}
   (( RC != 0 )) && { log "training FAILED (exit ${RC})"; exit "${RC}"; }
 fi

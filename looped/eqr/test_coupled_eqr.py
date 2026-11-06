@@ -71,6 +71,8 @@ def test_schedule_and_depth():
     dict(coupling="relax", rate=3.0),
     dict(coupling="relax", rate=3.0, leak=0.25),
     dict(coupling="relax", rate=0.7, rate_h=1.3, per_channel=True, learn_rates=True),
+    dict(coupling="relax", rate=3.0, leak=1.0, inject_h=False),
+    dict(coupling="kick", rate=1.0, rate_constraint="positive", rate_min=0.05, learn_rates=True, inject_h=False),
 ])
 def test_update_formula_and_exact_inverse(kw):
     m = _coupled(**kw)
@@ -93,7 +95,7 @@ def test_update_formula_and_exact_inverse(kw):
         else:
             ref = torch.exp(-g) * L + (1 - torch.exp(-g)) * (c * H + fH)
         assert (L1 - ref).abs().max() < 1e-12
-        fL = inner.L_level(L1 + x, **seq)
+        fL = inner.L_level(L1 + x if kw.get("inject_h", True) else L1, **seq)
         H1 = inner.half_step_H(H, L1, x, seq)
         if kw["coupling"] == "kick":
             ref = torch.exp(-a) * H + fL
@@ -108,7 +110,8 @@ def test_update_formula_and_exact_inverse(kw):
 
 
 @pytest.mark.parametrize("kw", [dict(coupling="kick", rate=0.3), dict(coupling="relax", rate=1.0, leak=0.5),
-                                dict(coupling="relax", rate=2.0, per_channel=True, learn_rates=True)])
+                                dict(coupling="relax", rate=2.0, per_channel=True, learn_rates=True),
+                                dict(coupling="relax", rate=1.0, leak=0.5, inject_h=False)])
 def test_log_det_of_a_recursion(kw):
     torch.manual_seed(0)
     m = CoupledEqRModel(dict(_cfg(**kw), hidden_size=8, num_heads=2, seq_len=4, board_height=2, board_width=2))
@@ -130,6 +133,30 @@ def test_log_det_of_a_recursion(kw):
     # EqR's rms_norm runs in float32 internally, so the autograd Jacobian of the force is only
     # float32-accurate; a wrong volume formula would be off by O(1), not by 1e-8 relative.
     assert abs(logdet - expected) < 1e-6 * abs(expected), (logdet, expected)
+
+
+@pytest.mark.parametrize("inject_h", [True, False])
+def test_inject_h_breaks_the_stream_symmetry(inject_h):
+    """With x in both forces, relax's L and H half-steps are the same map of (own, other): from H = L
+    they give the same state, which is why round-1 relax streams merged. Without x in H's force they
+    differ, and H's half-step no longer depends on x."""
+    m = _coupled(coupling="relax", rate=3.0, leak=1.0, inject_h=inject_h)
+    inner = m.inner
+    torch.manual_seed(5)
+    S = torch.randn(4, 9, 16, dtype=torch.float64)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    with torch.no_grad():
+        L1 = inner.half_step_L(S, S, x, seq)
+        H1 = inner.half_step_H(S, S, x, seq)
+        H1_other_x = inner.half_step_H(S, S, torch.randn_like(x), seq)
+    if inject_h:
+        assert (L1 - H1).abs().max() < 1e-12
+        assert (H1 - H1_other_x).abs().max() > 1e-3
+    else:
+        assert (L1 - H1).abs().max() > 1e-3
+        assert torch.equal(H1, H1_other_x)
 
 
 def test_act_forward_and_gradients_through_loss_head():
