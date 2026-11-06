@@ -14,6 +14,7 @@ this is a re-implementation.
 | `install_overlay.sh` | copies `coupled_eqr.py` (and the tests) into an EqR checkout and applies both patches |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
 | `test_coupled_eqr.py` | 24 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedules, ACT gradients, `inject_h`, `self_read`, `twin_l` and EqR's order |
+| `export_for_analysis.py` | copies stripped checkpoints (model + EMA weights + config) and the first N test puzzles out of a run root, small enough to rsync for local analysis |
 | `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds, one row per checkpoint step): accuracy / residual / overthinking from the evaluate.py JSONs, the dynamics below, and the depth × breadth table |
 | `dynamics_eqr.py` | per run: learned rates at every checkpoint (+ linear-part radius); noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle fractions, overthinking, stop-signal rate); spectral radius of one iteration (JVP power iteration, checked against dense eigenvalues) |
 
