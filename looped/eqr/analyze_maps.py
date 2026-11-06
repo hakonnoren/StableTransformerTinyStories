@@ -189,7 +189,7 @@ def inner_fixed_point(inner, zH, zL, x, seq, iters=64):
     """L-type updates repeated with H frozen (EqR: L <- L_level(L, H + x); coupled: its L half-step(s)).
     Returns per-iteration relative changes (tensor [iters, b]) and the final L."""
     rel = lambda new, old: ((new - old).flatten(1).norm(dim=1) / new.flatten(1).norm(dim=1).clamp_min(1e-30))
-    steps = []
+    steps, steps2, prev2 = [], [], None
     for _ in range(iters):
         if not is_coupled(inner):
             new = inner.L_level(zL, zH + x, **seq)
@@ -201,8 +201,9 @@ def inner_fixed_point(inner, zH, zL, x, seq, iters=64):
         else:
             new = inner.half_step_L(zH, zL, x, seq)
         steps.append(rel(new, zL))
-        zL = new
-    return torch.stack(steps), zL
+        steps2.append(rel(new, prev2) if prev2 is not None else torch.full_like(steps[-1], float("nan")))
+        prev2, zL = zL, new
+    return torch.stack(steps), zL, torch.stack(steps2)
 
 
 def participation_ratio(x):
@@ -222,12 +223,14 @@ def multistart_chunk(inner, batch, B, R, rec, noise, units, device):
     mc.set_noise(inner, noise)
     carry = mc.random_carry(inner, n * B, device)
     prev = mc.flat_state(carry)
+    prev2 = None
     sres_buf, logit_buf, out = [], [], {}
     for t in range(1, R + 1):
         carry, logits, q = inner(carry, big)
         s = mc.flat_state(carry)
         sres_buf = (sres_buf + [(s - prev).norm(dim=1) / s.norm(dim=1).clamp_min(1e-30)])[-3:]
-        prev = s
+        sres2 = (s - prev2).norm(dim=1) / s.norm(dim=1).clamp_min(1e-30) if prev2 is not None else None
+        prev2, prev = prev, s
         logit_buf = (logit_buf + [logits.float()])[-4:]
         if t in rec:
             lg = torch.stack(logit_buf)
@@ -238,6 +241,8 @@ def multistart_chunk(inner, batch, B, R, rec, noise, units, device):
             out[t] = {"exact": ex.cpu(), "cell": cell.cpu(), "pred": pred.to(torch.uint8).cpu(),
                       "E": E.cpu(), "clash": clash.cpu(), "lscore": lscore.cpu(),
                       "sres": torch.stack(sres_buf).mean(0).cpu(), "q": q.float().cpu(),
+                      "sres_last": sres_buf[-1].cpu(),
+                      "sres2": (sres2 if sres2 is not None else torch.full_like(sres_buf[-1], float("nan"))).cpu(),
                       "rms": {k: float(v.float().pow(2).mean().sqrt()) for k, v in views.items()}}
     # endpoint path independence: mean pairwise cosine of the B final states per puzzle
     sn = F.normalize(mc.flat_state(carry).view(n, B, -1), dim=-1)
@@ -275,6 +280,12 @@ def per_puzzle(rec_out, n, B):
         "delta_pi": float((mass_t - ex[:, 0].float()).abs().mean()),
         "auroc": {"lscore": auroc(rec_out["lscore"], rec_out["exact"]), "sres": auroc(rec_out["sres"], rec_out["exact"]),
                   "neg_q": auroc(-rec_out["q"], rec_out["exact"]), "E": auroc(rec_out["E"].float(), rec_out["exact"])},
+        # outer-iteration dynamics at this r: fixed point (step < 1e-4), 2-cycle (step >= 1e-3, 2-step < step/10), else moving
+        "outer_fixed": float((rec_out["sres_last"] < 1e-4).float().mean()),
+        "outer_2cycle": float(((rec_out["sres_last"] >= 1e-3) & (rec_out["sres2"] < 0.1 * rec_out["sres_last"])).float().mean()),
+        "outer_dyn_by_class": {cls: ({"fixed": float((rec_out["sres_last"][m] < 1e-4).float().mean()),
+                                      "step_median": float(rec_out["sres_last"][m].median())} if m.any() else None)
+                               for cls, m in (("correct", rec_out["exact"]), ("wrong", ~rec_out["exact"]))},
         "by_class": {cls: {k: (float(rec_out[k][m].float().median()) if m.any() else None) for k in ("lscore", "sres", "q", "E")}
                      for cls, m in (("correct", rec_out["exact"]), ("wrong", ~rec_out["exact"]))},
         "rms": rec_out["rms"],
@@ -445,7 +456,7 @@ def main():
                     steps += st
                 if t in marks:
                     prof[str(t)] = [[name, float(v.median())] for name, v in steps]
-            fp_steps, l_star = inner_fixed_point(inner, zH, zL, x, seq, iters=64)
+            fp_steps, l_star, fp_steps2 = inner_fixed_point(inner, zH, zL, x, seq, iters=64)
             # distance of the scheduled L (after one recursion from the endpoint) from the frozen-H fixed point
             zH1, zL1, _ = trace_recursion(inner, zH, zL, x, seq)
         ok = (fp_steps[1:] > 1e-6) & (fp_steps[:-1] > 1e-6)                # below ~1e-6 it is float32 round-off
@@ -453,6 +464,10 @@ def main():
         res["trace"] = {"profile_median": prof,
                         "inner_fp_rel_step_median": [float(v) for v in fp_steps.median(1).values[[0, 1, 2, 5, 10, 20, 40, 63]]],
                         "inner_contraction_median": float(ratios[5:40].nanmedian()) if ok[5:40].any() else 0.0,
+                        # period-2 check: relative change over two inner updates (small while 1-step stays large = 2-cycle)
+                        "inner_fp_rel_step2_median": [float(v) for v in fp_steps2[1:].nanmedian(1).values[[0, 1, 4, 9, 19, 39, 62]]],
+                        "inner_2cycle_frac": float(((fp_steps[-1] > 1e-3) & (fp_steps2[-1] < 0.1 * fp_steps[-1])).float().mean()),
+                        "inner_fixed_frac": float((fp_steps[-1] < 1e-4).float().mean()),
                         "scheduled_L_vs_inner_fp": float(((zL - l_star).flatten(1).norm(dim=1) / l_star.flatten(1).norm(dim=1)).median())}
         print(f"[trace] last profile {prof[str(marks[-1])][:8]} ... inner contraction {res['trace']['inner_contraction_median']:.3f}  ({time.time() - t0:.0f}s)", flush=True)
 

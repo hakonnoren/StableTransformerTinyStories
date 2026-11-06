@@ -77,10 +77,11 @@ def main():
             pi = ms.get("path_independence", {})
             rows.append([lab(arm, step), f(m["single"]), f(m["any"]), f(m["vote"]), f(m["conv1"]), f(m["sres1"]), f(m["q1"]),
                          f(m["verifier"]), f(m["distinct_mean"], 2), f(m["frac_puzzles_mixed"]), f(m["delta_pi"]),
-                         f(pi.get("cos_mean")), f(au["lscore"]), f(au["sres"]), f(au["neg_q"])])
+                         f(pi.get("cos_mean")), f(au["lscore"]), f(au["sres"]), f(au["neg_q"]),
+                         f(m.get("outer_fixed")), f(m.get("outer_2cycle"))])
         print(f"\n## Multistart, {nk.replace('_', ' ')}, iteration {a.r or 'last'} (B random starts per puzzle)\n")
         print(table(["arm", "single", "any", "vote", "conv1", "step1", "q1", "verifier", "distinct", "mixed", "ΔPI",
-                     "endpoint cos", "AUROC conv", "AUROC step", "AUROC q"], rows))
+                     "endpoint cos", "AUROC conv", "AUROC step", "AUROC q", "fixed pt", "2-cycle"], rows))
     print("\nsingle: mean exact of one start. any / vote: some start right / plurality right. conv1: EqR's most-converged "
           "(logit change); step1: smallest relative state step; q1: largest halting logit; verifier: a start that is a valid "
           "Sudoku agreeing with the givens (label-free). distinct: mean number of different answers over the starts; mixed: "
@@ -120,9 +121,10 @@ def main():
         prof = t["profile_median"]
         first, last = prof[min(prof, key=int)], prof[max(prof, key=int)]
         short = lambda p: " ".join(f"{n}{v:.0e}" for n, v in p[: len(p) // max(1, (r['arch'].get('H_cycles') or 3))])
-        rows.append([lab(arm, step), f(t.get("inner_contraction_median")), f(t.get("scheduled_L_vs_inner_fp")), short(first), short(last)])
+        rows.append([lab(arm, step), f(t.get("inner_contraction_median")), f(t.get("inner_fixed_frac")), f(t.get("inner_2cycle_frac")),
+                     f(t.get("scheduled_L_vs_inner_fp")), short(first), short(last)])
     print("\n## Within one recursion (median relative change per update; first and last traced outer iteration)\n")
-    print(table(["arm", "inner contraction", "L vs inner fixed point", "first iteration", "last iteration"], rows))
+    print(table(["arm", "inner contraction", "inner fixed", "inner 2-cycle", "L vs inner fixed point", "first iteration", "last iteration"], rows))
 
 
 if __name__ == "__main__":
