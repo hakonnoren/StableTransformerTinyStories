@@ -109,7 +109,7 @@ python - <<'PY'
 import json
 for split in ("train", "test"):
     m = json.load(open(f"data/sudoku-extreme-1k-aug-1000/{split}/dataset.json"))
-    print(split, {k: m[k] for k in ("total_groups", "total_samples", "seq_len", "vocab_size")})
+    print(split, {k: m.get(k) for k in ("total_groups", "total_samples", "seq_len", "vocab_size")})
 PY
 
 # 6. overlay tests (CPU) --------------------------------------------------------
