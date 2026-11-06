@@ -31,8 +31,9 @@ from collections import defaultdict
 
 import torch
 
-ARM_ORDER = ["eqr-released", "eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak1", "relax3_leak4",
-             "kick_pos", "relax3_leak1_injL", "relax3_leak1_injL_self", "kick_pos_injL", "relax3_leak2",
+ARM_ORDER = ["eqr-released", "eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak4", "relax3_leak1",
+             "relax3_leak2", "relax3_leak3", "kick_pos", "relax3_leak1_injL", "relax3_leak1_injL_self",
+             "kick_pos_injL", "twinL_leak1", "twinL_leak2", "innerL_self_leak1",
              "relax3_learned", "kick_learned_ch"]
 
 
@@ -108,6 +109,7 @@ def _dynamics(run_dir, row):
     row["step50@256"] = q[1] if q else None
     row["O16->256nf"] = get("overthink", 256)
     row["stop@256"] = get("q_stop", 256)
+    row["twin_cos@256"] = get("twin_cos", 256)
     row["rho"] = (d.get("rho") or {}).get("median")
     rates = d.get("rates_by_step") or []
     if rates:
@@ -149,7 +151,7 @@ def summarize_run(run_dir):
 
 
 DCOLS = ["nf_exact@16", "nf_exact@256", "FP@256", "FP@256(1e-2)", "cyc2@256", "step50@256", "O16->256nf",
-         "stop@256", "rho", "gamma", "alpha", "delta", "lin_radius"]
+         "stop@256", "rho", "gamma", "alpha", "delta", "lin_radius", "twin_cos@256"]
 
 COLS = ["cell@16", "exact@16", "cell@64s", "exact@64s", "cell@256s", "exact@256s",
         "resid@64", "resid@256", "O16->64", "O16->256", "dy16->256"]
@@ -241,7 +243,8 @@ def main():
                "relative step at 256. O16->256nf: overthinking without noise. stop: share where the halting head "
                "says stop (q > 0). rho: median spectral radius of one iteration at r = 256 (full, not shift-free). "
                "gamma/alpha/delta: final learned or fixed rates; lin_radius: radius of one iteration's linear part "
-               "(forces zero).", ""]
+               "(forces zero). twin_cos: twin_l arms, mean cosine between the twins L and L' at r = 256 "
+               "(1 = merged).", ""]
         text += "\n".join(dl)
     text += scaling
     print(text)

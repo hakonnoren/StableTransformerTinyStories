@@ -63,6 +63,12 @@ def test_schedule_and_depth():
     torch.manual_seed(0)
     assert "".join(CoupledEqRModel(dict(_cfg(), L_cycles=6)).inner.schedule) == "HLHLHLH"
     assert "".join(_coupled(half_steps=4).inner.schedule) == "LHLH"
+    assert "".join(_coupled(schedule="eqr").inner.schedule) == "LLH"                 # EqR's order
+    assert "".join(_coupled(schedule="eqr", twin_l=True).inner.schedule) == "LMH"     # M = twin L'
+    torch.manual_seed(0)
+    m6 = CoupledEqRModel(dict(_cfg(schedule="eqr", twin_l=True), L_cycles=6))
+    assert "".join(m6.inner.schedule) == "LMLMLMH"
+    assert m6.inner.depth_per_outer_step() == {"visited_half_steps": 14, "differentiated_half_steps": 7}
 
 
 @pytest.mark.parametrize("kw", [
@@ -182,6 +188,87 @@ def test_self_read_diagnostic_formula_and_no_inverse():
         inner.log_volume_per_recursion(9)
 
 
+def _relax(own, cross, f, rate, c):
+    k = torch.exp(-rate)
+    return k * own + (1 - k) * (c * cross + f)
+
+
+@pytest.mark.parametrize("leak", [1.0, 2.0])
+def test_twin_update_formula(leak):
+    """twin_l: L and L' read each other where EqR's L reads itself, H reads their mean, EqR's order."""
+    torch.manual_seed(0)
+    m = CoupledEqRModel(dict(_cfg(coupling="relax", rate=3.0, leak=leak, inject_h=False, schedule="eqr",
+                                  twin_l=True), L_cycles=4))
+    inner = m.inner
+    assert "".join(inner.schedule) == "LMLMH"
+    carry = inner.empty_carry(4)
+    assert carry.z_H.shape == (4, 9, 16) and carry.z_L.shape == (4, 18, 16)        # [L, L'] along seq
+    torch.manual_seed(9)
+    H, L, M = (torch.randn(4, 9, 16, dtype=torch.float64) for _ in range(3))
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    B = lambda u: inner.L_level(u, **seq)
+    with torch.no_grad():
+        g, a, c = inner.rates.gamma().double(), inner.rates.alpha().double(), inner.rates.c().double()
+        assert abs(float(c) - math.exp(-leak)) < 1e-7                                # rates are float32 buffers
+        h, l, mm = H, L, M
+        for s in "LMLM":
+            if s == "L":
+                l = _relax(l, mm, B(mm + h + x), g, c)
+            else:
+                mm = _relax(mm, l, B(l + h + x), g, c)
+        avg = 0.5 * (l + mm)
+        h = _relax(h, avg, B(avg), a, c)                                             # no x in H's force
+        H1, Z1 = inner.latent_recursion(H, torch.cat([L, M], dim=1), x, seq)
+    assert (H1 - h).abs().max() < 1e-12
+    assert (Z1 - torch.cat([l, mm], dim=1)).abs().max() < 1e-12
+    with pytest.raises(RuntimeError):
+        inner.log_volume_per_recursion(9)
+
+
+def test_eqr_schedule_self_read_formula():
+    """schedule='eqr' + self_read: EqR's inner loop (L_cycles L updates reading L, then H) in relax form."""
+    torch.manual_seed(0)
+    m = CoupledEqRModel(dict(_cfg(coupling="relax", rate=3.0, leak=1.0, inject_h=False, self_read=True,
+                                  schedule="eqr"), L_cycles=3))
+    inner = m.inner
+    torch.manual_seed(4)
+    H, L = torch.randn(4, 9, 16, dtype=torch.float64), torch.randn(4, 9, 16, dtype=torch.float64)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    B = lambda u: inner.L_level(u, **seq)
+    with torch.no_grad():
+        g, a, c = inner.rates.gamma().double(), inner.rates.alpha().double(), inner.rates.c().double()
+        l = L
+        for _ in range(3):
+            l = _relax(l, H, B(l + H + x), g, c)
+        h = _relax(H, l, B(H + l), a, c)
+        H1, L1 = inner.latent_recursion(H, L, x, seq)
+    assert (L1 - l).abs().max() < 1e-12 and (H1 - h).abs().max() < 1e-12
+
+
+@pytest.mark.parametrize("kw", [dict(schedule="eqr", twin_l=True, leak=1.0, inject_h=False),
+                                dict(schedule="eqr", self_read=True, leak=1.0, inject_h=False)])
+def test_act_forward_and_gradients_new_schedules(kw):
+    """Full ACT steps through EqR's loss head (carry, random reset, z_H/z_L metrics) for the round-three arms."""
+    from models.losses import ACTLossHead
+    m = _coupled(coupling="relax", rate=3.0, dtype="float32", noise_scale=0.01, **kw)
+    head = ACTLossHead(m, loss_type="stablemax_cross_entropy")
+    head.train()
+    batch = _batch()
+    carry = head.initial_carry(batch)
+    for _ in range(3):
+        carry, loss, metrics, _, done = head(carry=carry, batch=batch, return_keys=[])
+        loss.backward()
+    n_l = 18 if kw.get("twin_l") else 9
+    assert carry.inner_carry.z_L.shape == (4, n_l, 16)
+    assert torch.isfinite(loss) and all(torch.isfinite(v).all() for v in metrics.values())
+    grads = [p.grad for p in m.parameters() if p.requires_grad and p.grad is not None]
+    assert grads and all(torch.isfinite(gr).all() for gr in grads)
+
+
 def test_act_forward_and_gradients_through_loss_head():
     from models.losses import ACTLossHead
     m = _coupled(coupling="kick", rate=1.0, rate_constraint="positive", rate_min=0.05, learn_rates=True,
@@ -208,6 +295,7 @@ def test_small_kick_rate_survives_in_float32_state():
 def test_config_validation():
     for kw in (dict(coupling="nope"), dict(coupling="kick", leak=0.1), dict(coupling="relax", rate=0.0),
                dict(coupling="kick", rate=0.04, rate_constraint="positive", rate_min=0.05),
-               dict(rate_constraint="bounded", rate=3.0, rate_min=0.1, rate_max=2.0)):
+               dict(rate_constraint="bounded", rate=3.0, rate_min=0.1, rate_max=2.0),
+               dict(schedule="nope"), dict(twin_l=True), dict(schedule="eqr", half_steps=4)):
         with pytest.raises(Exception):
             _coupled(**kw)

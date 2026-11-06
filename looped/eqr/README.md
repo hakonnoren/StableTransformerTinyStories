@@ -13,13 +13,13 @@ this is a re-implementation.
 | `pretrain_wandb_resume.patch` | EqR `pretrain.py`: skip setting `wandb.run._step` on resume, which wandb >= 0.31 (IDUN's env) refuses, so every resume crashed |
 | `install_overlay.sh` | copies `coupled_eqr.py` (and the tests) into an EqR checkout and applies both patches |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
-| `test_coupled_eqr.py` | 19 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients, `inject_h`, `self_read` |
+| `test_coupled_eqr.py` | 24 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedules, ACT gradients, `inject_h`, `self_read`, `twin_l` and EqR's order |
 | `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds, one row per checkpoint step): accuracy / residual / overthinking from the evaluate.py JSONs, the dynamics below, and the depth × breadth table |
 | `dynamics_eqr.py` | per run: learned rates at every checkpoint (+ linear-part radius); noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle fractions, overthinking, stop-signal rate); spectral radius of one iteration (JVP power iteration, checked against dense eigenvalues) |
 
 Jobs:
 - `jobs/looped/eqr_sanity.slurm`: checks, plus the README's released-checkpoint eval.
-- `jobs/looped/sudoku_eqr.slurm`: 11 arms (7 from round 1, 4 from round 2), one seed by default
+- `jobs/looped/sudoku_eqr.slurm`: 15 arms (7 from round 1, 4 from round 2, 4 from round 3), one seed by default
   (`SEEDS="0 1 2"` for more). Runs `dynamics_eqr.py` after its evals. Resumes a run from its latest
   checkpoint when there is none at `MAX_STEPS`, which is how runs are extended from 20k to 50k steps.
 - `jobs/looped/sudoku_dynamics.slurm`: the dynamics for runs that are already trained.
@@ -42,7 +42,8 @@ Round 2, into round 1's run root (`JOB_TAG`), so one summary covers both:
 
 ```bash
 R=/cluster/work/$USER/eqr_runs/sudoku_25939526
-sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm                 # new arms, 20k
+sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm                 # round 2, 20k
+sbatch --export=ALL,JOB_TAG=25939526 --array=9,11-14 jobs/looped/sudoku_eqr.slurm             # round 3, 20k
 sbatch --time=16:00:00 --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --array=0,4,6 \
        jobs/looped/sudoku_eqr.slurm                                                            # extend to 50k
 sbatch --export=ALL,RUN_ROOT=$R,CKPT_STEP=20000 jobs/looped/sudoku_scaling.slurm               # depth x breadth
@@ -79,6 +80,15 @@ updates, as EqR's force does (L ← … B(L + H + x) …, H ← … B(H + L) …
 that does not depend on the stream it updates, so with fast rates L becomes a function of H and the
 inner L iteration of EqR/HRM disappears. Arm `relax3_leak1_injL_self` differs from `relax3_leak1_injL`
 only in this, so the pair measures what the constraint costs.
+
+Round three (invertibility no longer required) puts the inner loop back. `schedule=eqr` runs EqR's order,
+L_cycles updates of L and then one of H, instead of the alternation. `twin_l=true` doubles L into twins
+L, L′ that read each other where EqR's L reads itself (L ← aL + (1−a)(cL′ + B(L′ + H + x)), and the same
+for L′); H reads their mean, without x. If the twins merge, the pair acts as one L that reads itself. The
+twins sit in the carry's z_L, stacked along the sequence axis, so EqR's carry, reset and evaluator are
+unchanged; `dynamics_eqr.py` reports their cosine (`twin_cos`). Arms: `twinL_leak1`, `twinL_leak2`, the
+non-invertible reference `innerL_self_leak1` (EqR's order with self-reading forces, i.e. EqR plus relax's
+cross term c · other), and `relax3_leak3` (with `relax3_leak2`) for the damping trend.
 
 **What stays EqR's:**
 - the ACT carry, halting and random state reset;

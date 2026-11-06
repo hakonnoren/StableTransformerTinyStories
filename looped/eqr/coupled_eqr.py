@@ -37,6 +37,26 @@ EqR/HRM's inner L iteration given H disappears; comparing an arm with and withou
 self_read measures what that constraint costs. inverse_half_step and
 log_volume_per_recursion refuse to run when it is set.
 
+`schedule="eqr"` runs EqR's own order inside a recursion: L_cycles updates of L, then one of H
+(LLLLLLH for L_cycles = 6), instead of the alternation below. Repeated L updates only do work
+when L's force changes between them, i.e. with self_read (L reads itself) or twin_l.
+
+`twin_l=True` (needs schedule="eqr") doubles L into L and its twin L' and lets each read the
+other where EqR's L reads itself; H reads their mean m = (L + L')/2:
+
+    relax:  L  <- a L  + (1-a)(c L' + B(L' + H + x))
+            L' <- a L' + (1-a)(c L  + B(L  + H + x))
+            H  <- b H  + (1-b)(c m  + B(m [+ x if inject_h]))
+    schedule per recursion: L, L', L, L', L, L', H      (L_cycles + 1 = 7 evaluations, as EqR)
+
+(kick likewise: L <- a(L + B(L' + H + x)), H <- bH + B(m ...)). The L pair now changes between
+its updates, so EqR's inner L iteration given H comes back; if the twins merge (L = L') the
+pair acts like one L that reads itself with retention a + (1-a)c. Every update still reads only
+streams it does not change, but no inverse is implemented for it. The twins live in the carry's
+z_L, stacked along the sequence axis (z_L is [batch, 2 seq, hidden]), so EqR's carry, random
+reset, evaluator and z_H/z_L metrics (which compare the first seq positions, i.e. H with L)
+need no changes.
+
 Schedule (the one free choice of the port). EqR's latent recursion updates
 z_L L_cycles times and then z_H once: L_cycles + 1 evaluations of B. Under a
 coupling the force on a stream does not depend on that stream, so repeated
@@ -78,6 +98,7 @@ from models.eqr import EqRConfig, EqRModel, InnerNetwork, LatentCarry
 from models.layers import CosSin, rms_norm
 
 COUPLINGS = ("kick", "relax")
+SCHEDULES = ("alternate", "eqr")
 CONSTRAINTS = ("default", "positive", "bounded")
 
 
@@ -99,6 +120,8 @@ class CoupledEqRConfig(EqRConfig):
     half_steps: Optional[int] = None   # half-steps per latent recursion; None -> L_cycles + 1
     inject_h: bool = True              # False: H's force is B(L) without the input x (EqR's own choice)
     self_read: bool = False            # diagnostic: forces also read their own stream (NOT invertible)
+    schedule: str = "alternate"        # 'alternate' (H,L,...,H) | 'eqr' (L x L_cycles, then H)
+    twin_l: bool = False               # L doubled into L, L' that read each other (needs schedule='eqr')
     readout_norm: bool = True
     state_dtype: str = "float32"
     decay_rates: bool = False
@@ -120,7 +143,25 @@ class CoupledEqRConfig(EqRConfig):
             raise ValueError("leak (common-mode damping) must be >= 0 and needs coupling='relax'")
         if self.half_steps is not None and self.half_steps < 1:
             raise ValueError("half_steps must be >= 1")
+        if self.schedule not in SCHEDULES:
+            raise ValueError(f"schedule={self.schedule!r}; choices {SCHEDULES}")
+        if self.schedule == "eqr" and self.half_steps is not None:
+            raise ValueError("half_steps applies to schedule='alternate'; 'eqr' runs L_cycles L updates + 1 H")
+        if self.twin_l and self.schedule != "eqr":
+            raise ValueError("twin_l needs schedule='eqr' (the twins' inner loop)")
         return self
+
+
+def schedule_of(cfg: Any) -> Tuple[str, ...]:
+    """Half-step order of one latent recursion: 'L' / 'H' (and 'M' = the twin L' when twin_l).
+    alternate: half_steps (default L_cycles + 1) alternating, ending on the readout stream H.
+    eqr      : L_cycles L-type updates (alternating L, L' with twin_l), then H -- EqR's own order."""
+    if getattr(cfg, "schedule", "alternate") == "eqr":
+        n_l = int(cfg.L_cycles)
+        twin = bool(getattr(cfg, "twin_l", False))
+        return tuple("M" if twin and i % 2 else "L" for i in range(n_l)) + ("H",)
+    n = getattr(cfg, "half_steps", None) or (int(cfg.L_cycles) + 1)
+    return tuple("H" if (n - 1 - i) % 2 == 0 else "L" for i in range(n))
 
 
 class CouplingRates(nn.Module):
@@ -203,11 +244,10 @@ class CoupledInnerNetwork(InnerNetwork):
         self.kick = config.coupling == "kick"
         self.inject_h = bool(config.inject_h)
         self.self_read = bool(config.self_read)
+        self.twin_l = bool(config.twin_l)
         self.noise_scale = float(config.noise_scale)   # evaluate.py's runtime override sets this attribute
         self.state_dtype = getattr(torch, config.state_dtype)
-        n = config.half_steps or (config.L_cycles + 1)
-        # alternate, ending on the readout stream H
-        self.schedule: Tuple[str, ...] = tuple("H" if (n - 1 - i) % 2 == 0 else "L" for i in range(n))
+        self.schedule: Tuple[str, ...] = schedule_of(config)
 
     # bookkeeping --------------------------------------------------------------------
     def rate_parameters(self) -> List[nn.Parameter]:
@@ -219,9 +259,10 @@ class CoupledInnerNetwork(InnerNetwork):
 
     def empty_carry(self, batch_size: int, device: Optional[torch.device] = None) -> LatentCarry:
         shape = (batch_size, self.config.seq_len, self.config.hidden_size)
+        shape_l = (batch_size, 2 * self.config.seq_len, self.config.hidden_size) if self.twin_l else shape
         return LatentCarry(
             z_H=torch.empty(shape, dtype=self.state_dtype, device=device),
-            z_L=torch.empty(shape, dtype=self.state_dtype, device=device),
+            z_L=torch.empty(shape_l, dtype=self.state_dtype, device=device),   # twin_l: [L, L'] along seq
         )
 
     # maps ---------------------------------------------------------------------------
@@ -241,6 +282,8 @@ class CoupledInnerNetwork(InnerNetwork):
         if self.self_read:
             raise RuntimeError("self_read=True: the force reads the updated stream, so the update is not invertible "
                                "and its Jacobian determinant is state-dependent")
+        if self.twin_l:
+            raise RuntimeError("twin_l=True: no inverse / log-volume implemented for the twin-stream update")
 
     def _step(self, stream: str, own: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
               f: torch.Tensor) -> torch.Tensor:
@@ -259,7 +302,14 @@ class CoupledInnerNetwork(InnerNetwork):
         return self._noisy(self._step("L", L, H, self.rates.gamma(), self._force(H, x, seq, own=L)))
 
     def half_step_H(self, H, L, x, seq):
+        """H's update reading L (for twin_l, pass the twins' mean)."""
         return self._noisy(self._step("H", H, L, self.rates.alpha(), self._force_H(L, x, seq, H=H)))
+
+    def half_step_twin(self, own, twin, H, x, seq):
+        """twin_l: update of L (or L') reading its twin where EqR's L reads itself:
+        relax own <- a own + (1-a)(c twin + B(twin + H + x)); kick own <- a (own + B(twin + H + x))."""
+        f = self._force(twin + H, x, seq, own=own)
+        return self._noisy(self._step("L", own, twin, self.rates.gamma(), f))
 
     def _unstep(self, stream: str, new: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
                 f: torch.Tensor) -> torch.Tensor:
@@ -278,6 +328,16 @@ class CoupledInnerNetwork(InnerNetwork):
         return self._unstep("H", H, L, self.rates.alpha(), self._force_H(L, x, seq)), L
 
     def latent_recursion(self, z_H, z_L, x, seq):
+        if self.twin_l:
+            L, M = z_L.chunk(2, dim=1)                   # L and its twin L'
+            for stream in self.schedule:
+                if stream == "L":
+                    L = self.half_step_twin(L, M, z_H, x, seq)
+                elif stream == "M":
+                    M = self.half_step_twin(M, L, z_H, x, seq)
+                else:
+                    z_H = self.half_step_H(z_H, 0.5 * (L + M), x, seq)
+            return z_H, torch.cat([L, M], dim=1)
         for stream in self.schedule:
             if stream == "L":
                 z_L = self.half_step_L(z_H, z_L, x, seq)
@@ -327,7 +387,7 @@ class CoupledEqRModel(EqRModel):
         self.inner = CoupledInnerNetwork(self.config)
         depth = self.inner.depth_per_outer_step()
         print(f"[coupled_eqr] coupling={self.config.coupling} inject_h={self.config.inject_h} "
-              f"self_read={self.config.self_read} "
+              f"self_read={self.config.self_read} twin_l={self.config.twin_l} "
               f"schedule={''.join(self.inner.schedule)} "
               f"visited={depth['visited_half_steps']} differentiated={depth['differentiated_half_steps']} "
               f"half-steps per outer iteration; learned rate params={len(self.inner.rate_parameters())}")

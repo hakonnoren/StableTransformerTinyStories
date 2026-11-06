@@ -9,8 +9,8 @@ iteration is a deterministic map and "fixed point" is well defined):
 1. rates_by_step  (coupled models) the damping actually learned, read from every checkpoint of the
    run (EMA weights when present, as evaluate.py uses): gamma / alpha (mean, min, max over channels),
    leak delta, and the radius of one outer iteration's LINEAR part (forces set to zero; product of
-   the half-step 2x2 maps over the schedule and H_cycles; < 1 means bounded forces give a bounded
-   state). EqR's own model has no rates.
+   the half-step maps on (L, H[, L']) over the schedule and H_cycles; < 1 means bounded forces give
+   a bounded state). EqR's own model has no rates.
 
 2. trajectory  the first --n test puzzles from EqR's random state reset, iterated to --r-max outer
    iterations (one iteration = one EqR ACT step). Per puzzle and iteration r:
@@ -19,7 +19,8 @@ iteration is a deterministic map and "fixed point" is well defined):
    Reported: exact / cell accuracy at r in R_GRID; the fixed-point fraction (step_r < tol) and
    2-cycle fraction (step_r >= tol but step2_r < tol) at r = 64 and r_max for tol 1e-3 and 1e-2;
    step quantiles; state RMS; overthinking O(16->r) = P(wrong at r | exact at 16) and changed
-   predictions dy(16->r); the halting head's "stop" rate (q > 0).
+   predictions dy(16->r); the halting head's "stop" rate (q > 0); for twin_l models the mean
+   per-token cosine between the twins L and L' (1 = merged).
 
 3. rho  spectral radius of one outer iteration's Jacobian at the final state s_{r_max}, for the first
    --n-rho puzzles: power iteration with Jacobian-vector products (torch.func.jvp), geometric mean of
@@ -71,28 +72,38 @@ def _arch_ns(arch):
 
 
 def _schedule(arch):
-    n = arch.get("half_steps") or (int(arch["L_cycles"]) + 1)
-    return ["H" if (n - 1 - i) % 2 == 0 else "L" for i in range(n)] * int(arch["H_cycles"])
+    """Half-steps of one outer iteration (the model's own schedule_of, repeated H_cycles times)."""
+    from models.coupled_eqr import schedule_of
+    return list(schedule_of(SimpleNamespace(**arch))) * int(arch["H_cycles"])
 
 
-def linear_radius(g, a, c, kick, schedule):
+def linear_radius(g, a, c, kick, schedule, twin=False):
     """Spectral radius of one outer iteration with the forces set to zero, max over channels.
-    State (L, H) per channel; half-steps relax: L <- aL + (1-a)cH, H <- bH + (1-b)cL; kick: diagonal."""
+    State (L, H) per channel, plus the twin L' when twin; relax half-steps: L <- aL + (1-a)c*H
+    (twin: c*L'), L' <- aL' + (1-a)c*L, H <- bH + (1-b)c*L (twin: c*(L + L')/2); kick: diagonal."""
     g, a = torch.as_tensor(g, dtype=torch.float64).flatten(), torch.as_tensor(a, dtype=torch.float64).flatten()
     d = max(g.numel(), a.numel())
     g, a = g.expand(d), a.expand(d)
     c = torch.ones(d, dtype=torch.float64) if c is None else torch.as_tensor(c, dtype=torch.float64).flatten().expand(d)
     kl, kh = torch.exp(-g), torch.exp(-a)
-    eye = torch.eye(2, dtype=torch.float64).expand(d, 2, 2).clone()
-    ML, MH = eye.clone(), eye.clone()
+    n = 3 if twin else 2                                  # indices: L = 0, H = 1, L' = 2
+    eye = torch.eye(n, dtype=torch.float64).expand(d, n, n).clone()
+    ML, MH, MM = eye.clone(), eye.clone(), eye.clone()
     ML[:, 0, 0] = kl
     MH[:, 1, 1] = kh
+    if twin:
+        MM[:, 2, 2] = kl
     if not kick:
-        ML[:, 0, 1] = (1 - kl) * c
-        MH[:, 1, 0] = (1 - kh) * c
+        if twin:
+            ML[:, 0, 2] = (1 - kl) * c
+            MM[:, 2, 0] = (1 - kl) * c
+            MH[:, 1, 0] = MH[:, 1, 2] = 0.5 * (1 - kh) * c
+        else:
+            ML[:, 0, 1] = (1 - kl) * c
+            MH[:, 1, 0] = (1 - kh) * c
     P = eye.clone()
     for s in schedule:
-        P = (ML if s == "L" else MH) @ P
+        P = {"L": ML, "H": MH, "M": MM}[s] @ P
     return float(torch.linalg.eigvals(P).abs().max())
 
 
@@ -118,7 +129,8 @@ def rates_of_checkpoint(path):
     return {"step": int(ck.get("step", -1)), "gamma": stat(g), "alpha": stat(a),
             "delta": None if c is None else stat(-torch.log(c)),
             "keep_L": float(torch.exp(-g).mean()), "keep_H": float(torch.exp(-a).mean()),
-            "linear_radius": linear_radius(g, a, c, arch.get("coupling") == "kick", _schedule(arch))}
+            "linear_radius": linear_radius(g, a, c, arch.get("coupling") == "kick", _schedule(arch),
+                                           twin=bool(arch.get("twin_l")))}
 
 
 # ---------------------------------------------------------------------------------------- dynamics
@@ -142,6 +154,9 @@ def trajectory(model, batch, r_max, device):
     flat = lambda c: torch.cat([c.z_H, c.z_L], dim=1).flatten(1).float()
     hist = [flat(carry)]
     steps, steps2, preds, out = {}, {}, {}, {"acc": {}, "exact": {}, "state_rms": {}, "q_stop": {}}
+    twin = bool(getattr(inner, "twin_l", False))
+    if twin:
+        out["twin_cos"] = {}
     for r in range(1, r_max + 1):
         carry, logits, q = inner(carry, batch)
         s = flat(carry)
@@ -158,6 +173,9 @@ def trajectory(model, batch, r_max, device):
             out["exact"][r] = float(ok.all(-1).float().mean())
             out["state_rms"][r] = float((s.pow(2).mean(1)).sqrt().mean())
             out["q_stop"][r] = float((q > 0).float().mean())
+            if twin:
+                l1, l2 = carry.z_L.float().chunk(2, dim=1)
+                out["twin_cos"][r] = float(torch.nn.functional.cosine_similarity(l1, l2, dim=-1).mean())
     ok16 = ((preds[16] == labels) | ~mask).all(-1)
     out["overthink"], out["changed"] = {}, {}
     for r in (64, 128, 256, r_max):
@@ -191,22 +209,25 @@ def spectral_radius(model, batch, carry, n_rho, device, iters=60, keep=20):
         seq = {"cos_sin": inner._cos_sin()}
         shape = zH.shape
 
+        n_h = zH.shape[1]                                 # z_L may be longer (twin_l: [L, L'])
+
         def f(s):
-            h, l = s[:, 0], s[:, 1]
+            h, l = s[:, :n_h], s[:, n_h:]
             for _ in range(inner.config.H_cycles):
                 h, l = inner.latent_recursion(h, l, x, seq)
-            return torch.stack([h, l], dim=1)
+            return torch.cat([h, l], dim=1)
 
-        s = torch.stack([zH, zL], dim=1)
+        s = torch.cat([zH, zL], dim=1)
+        bcast = lambda t: t.view(-1, *([1] * (s.dim() - 1)))
         v = torch.randn_like(s)
-        v = v / v.flatten(1).norm(dim=1).view(-1, 1, 1, 1)
+        v = v / bcast(v.flatten(1).norm(dim=1))
         logs = []
         for k in range(iters):
             _, jv = torch.func.jvp(f, (s,), (v,))
             n = jv.flatten(1).norm(dim=1).clamp_min(1e-30)
             if k >= iters - keep:
                 logs.append(torch.log(n))
-            v = jv / n.view(-1, 1, 1, 1)
+            v = jv / bcast(n)
         rho = torch.exp(torch.stack(logs).mean(0)).detach().cpu()
     finally:
         inner.forward_dtype = old_fd
@@ -259,6 +280,8 @@ def main():
         print(f"[dynamics] fixed point {traj['fixed_point']}  2-cycle {traj['cycle2']}")
         print(f"[dynamics] step quantiles (10/50/90%) {traj['step_quantiles']}  state rms {traj['state_rms']}")
         print(f"[dynamics] overthink {traj['overthink']}  changed {traj['changed']}  stop-signal {traj['q_stop']}")
+        if "twin_cos" in traj:
+            print(f"[dynamics] twin cos(L, L') {traj['twin_cos']}")
         print(f"[dynamics] rho {res['rho']}")
 
     out = a.out or os.path.join(run_dir, "dynamics.json")
