@@ -29,6 +29,14 @@ so the relax update is symmetric in (H, L) and its streams merge (Sudoku round
 from the L force and the two-state structure can survive. The update stays an
 exact shear + scaling either way.
 
+`self_read=True` is a DIAGNOSTIC, not an invertible coupling: each force also
+reads the stream it updates (L <- ... B(L + H + x) ..., H <- ... B(H + L) ...),
+as EqR's force reads its own state. Invertibility requires a stream's force not to
+depend on that stream, so for fast rates L becomes an explicit function of H and
+EqR/HRM's inner L iteration given H disappears; comparing an arm with and without
+self_read measures what that constraint costs. inverse_half_step and
+log_volume_per_recursion refuse to run when it is set.
+
 Schedule (the one free choice of the port). EqR's latent recursion updates
 z_L L_cycles times and then z_H once: L_cycles + 1 evaluations of B. Under a
 coupling the force on a stream does not depend on that stream, so repeated
@@ -90,6 +98,7 @@ class CoupledEqRConfig(EqRConfig):
     learn_leak: bool = False
     half_steps: Optional[int] = None   # half-steps per latent recursion; None -> L_cycles + 1
     inject_h: bool = True              # False: H's force is B(L) without the input x (EqR's own choice)
+    self_read: bool = False            # diagnostic: forces also read their own stream (NOT invertible)
     readout_norm: bool = True
     state_dtype: str = "float32"
     decay_rates: bool = False
@@ -193,6 +202,7 @@ class CoupledInnerNetwork(InnerNetwork):
         self.rates = CouplingRates(config)
         self.kick = config.coupling == "kick"
         self.inject_h = bool(config.inject_h)
+        self.self_read = bool(config.self_read)
         self.noise_scale = float(config.noise_scale)   # evaluate.py's runtime override sets this attribute
         self.state_dtype = getattr(torch, config.state_dtype)
         n = config.half_steps or (config.L_cycles + 1)
@@ -215,13 +225,22 @@ class CoupledInnerNetwork(InnerNetwork):
         )
 
     # maps ---------------------------------------------------------------------------
-    def _force(self, other: torch.Tensor, x: Optional[torch.Tensor], seq: Dict[str, CosSin]) -> torch.Tensor:
+    def _force(self, other: torch.Tensor, x: Optional[torch.Tensor], seq: Dict[str, CosSin],
+               own: Optional[torch.Tensor] = None) -> torch.Tensor:
         u = other if x is None else other + x
+        if self.self_read:
+            u = own + u                                 # diagnostic: EqR-style self-reading force
         u = u.to(self.forward_dtype)                    # EqR: (hidden + injection) in forward dtype
         return self.L_level(u, **seq).to(self.state_dtype)
 
-    def _force_H(self, L: torch.Tensor, x: torch.Tensor, seq: Dict[str, CosSin]) -> torch.Tensor:
-        return self._force(L, x if self.inject_h else None, seq)
+    def _force_H(self, L: torch.Tensor, x: torch.Tensor, seq: Dict[str, CosSin],
+                 H: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self._force(L, x if self.inject_h else None, seq, own=H)
+
+    def _check_invertible(self) -> None:
+        if self.self_read:
+            raise RuntimeError("self_read=True: the force reads the updated stream, so the update is not invertible "
+                               "and its Jacobian determinant is state-dependent")
 
     def _step(self, stream: str, own: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
               f: torch.Tensor) -> torch.Tensor:
@@ -237,10 +256,10 @@ class CoupledInnerNetwork(InnerNetwork):
         return s + torch.randn_like(s) * self.noise_scale if self.noise_scale > 0 else s
 
     def half_step_L(self, H, L, x, seq):
-        return self._noisy(self._step("L", L, H, self.rates.gamma(), self._force(H, x, seq)))
+        return self._noisy(self._step("L", L, H, self.rates.gamma(), self._force(H, x, seq, own=L)))
 
     def half_step_H(self, H, L, x, seq):
-        return self._noisy(self._step("H", H, L, self.rates.alpha(), self._force_H(L, x, seq)))
+        return self._noisy(self._step("H", H, L, self.rates.alpha(), self._force_H(L, x, seq, H=H)))
 
     def _unstep(self, stream: str, new: torch.Tensor, other: torch.Tensor, rate: torch.Tensor,
                 f: torch.Tensor) -> torch.Tensor:
@@ -253,6 +272,7 @@ class CoupledInnerNetwork(InnerNetwork):
         return torch.exp(rate) * (new + torch.expm1(-rate) * (cross + f))
 
     def inverse_half_step(self, stream: str, H, L, x, seq):
+        self._check_invertible()
         if stream == "L":
             return H, self._unstep("L", L, H, self.rates.gamma(), self._force(H, x, seq))
         return self._unstep("H", H, L, self.rates.alpha(), self._force_H(L, x, seq)), L
@@ -267,6 +287,7 @@ class CoupledInnerNetwork(InnerNetwork):
 
     def log_volume_per_recursion(self, n_tokens: int) -> torch.Tensor:
         """log|det| of one latent recursion on n_tokens positions (state-independent)."""
+        self._check_invertible()
         d = self.config.hidden_size
         g = self.rates.gamma().double().expand(d).sum()
         a = self.rates.alpha().double().expand(d).sum()
@@ -306,6 +327,7 @@ class CoupledEqRModel(EqRModel):
         self.inner = CoupledInnerNetwork(self.config)
         depth = self.inner.depth_per_outer_step()
         print(f"[coupled_eqr] coupling={self.config.coupling} inject_h={self.config.inject_h} "
+              f"self_read={self.config.self_read} "
               f"schedule={''.join(self.inner.schedule)} "
               f"visited={depth['visited_half_steps']} differentiated={depth['differentiated_half_steps']} "
               f"half-steps per outer iteration; learned rate params={len(self.inner.rate_parameters())}")

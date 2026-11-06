@@ -23,7 +23,11 @@
 #   -- round two (after round 1 = array job 25939526) --
 #   relax3_leak1_injL relax3_leak1, input x only in L's force          H <- ... B(L), as in EqR
 #   kick_pos_injL     kick_pos, input x only in L's force
-#   relax3_leak2      relax, rate 3, delta = 2 (c = 0.14)              more damping than delta = 1
+#   relax3_leak2      relax, rate 3, delta = 2 (c = 0.14)              more damping (submitted, then killed)
+#   relax3_leak1_injL_self  relax3_leak1_injL whose forces also read their own stream, as EqR's do
+#                     (NOT invertible; diagnostic): L <- ... B(L + H + x) ..., H <- ... B(H + L) ...
+#                     Differs from relax3_leak1_injL only in self-reading, so the pair measures what
+#                     the invertibility constraint (a force may not read the stream it updates) costs.
 #   Why x only in L: with x in both forces and one shared B, relax's update is symmetric in
 #   (H, L) and its streams merged in round 1 (cos 1.00). EqR's own H update has no x.
 #
@@ -32,11 +36,12 @@
 #   relax3_learned  (relax rates learned from 3; the PDF's single-run row, and on the toy
 #                    tasks learned rates changed nothing -- HANDOFF.md §3, phase-4 update)
 #
-# 10 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
-#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 10 arms, seed 0
-#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-29 jobs/looped/sudoku_eqr.slurm   # 3 seeds
+# 11 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
+#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 11 arms, seed 0
+#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-32 jobs/looped/sudoku_eqr.slurm   # 3 seeds
 # Round two, into round 1's run root (one summary table; W&B ids <arm>-s0-25939526):
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm
+#   sbatch --export=ALL,JOB_TAG=25939526 --array=10 jobs/looped/sudoku_eqr.slurm   # self-read diagnostic
 #
 # Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
 # latest one (EqR restores weights, optimiser, EMA, carry, RNG and data position; the W&B run
@@ -84,7 +89,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --array=0-9
+#SBATCH --array=0-10
 #SBATCH --output=output_sudoku_eqr_%A_%a.txt
 #SBATCH --error=output_sudoku_eqr_%A_%a.err
 
@@ -118,7 +123,7 @@ WANDB_ENTITY=${WANDB_ENTITY:-hakon-noren-ntnu}
 
 COUPLED="arch.name=coupled_eqr@CoupledEqRModel arch.short_name=Coupled"
 ARMS=(eqr kick_fixed kick_learned relax3 relax3_leak1 relax3_leak4 kick_pos
-      relax3_leak1_injL kick_pos_injL relax3_leak2)
+      relax3_leak1_injL kick_pos_injL relax3_leak2 relax3_leak1_injL_self)
 ARM_ARGS=(
   ""
   "${COUPLED} ++arch.coupling=kick ++arch.rate=0.005"
@@ -130,6 +135,7 @@ ARM_ARGS=(
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0 ++arch.inject_h=false"
   "${COUPLED} ++arch.coupling=kick ++arch.rate=1.0 ++arch.rate_constraint=positive ++arch.rate_min=0.05 ++arch.learn_rates=true ++arch.inject_h=false"
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=2.0"
+  "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0 ++arch.inject_h=false ++arch.self_read=true"
 )
 
 ID=${SLURM_ARRAY_TASK_ID:?submit as an array: sbatch jobs/looped/sudoku_eqr.slurm}

@@ -12,13 +12,13 @@ this is a re-implementation.
 | `pretrain_rate_groups.patch` | EqR `pretrain.py`: learned rates go in an optimiser group without weight decay (no-op for EqR's models) |
 | `install_overlay.sh` | copies the two files above (and the tests) into an EqR checkout |
 | `setup_eqr.sh` | one-time IDUN setup on the login node: pinned clone, overlay, conda env, adam-atan2 CUDA build, data + released checkpoint |
-| `test_coupled_eqr.py` | 18 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients, `inject_h` |
+| `test_coupled_eqr.py` | 19 tests: same parameters/init as EqR, update formulas, exact inverses, log-det, schedule, ACT gradients, `inject_h`, `self_read` |
 | `summarize_sudoku.py` | per-arm tables (mean ± sd over seeds, one row per checkpoint step): accuracy / residual / overthinking from the evaluate.py JSONs, the dynamics below, and the depth × breadth table |
 | `dynamics_eqr.py` | per run: learned rates at every checkpoint (+ linear-part radius); noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle fractions, overthinking, stop-signal rate); spectral radius of one iteration (JVP power iteration, checked against dense eigenvalues) |
 
 Jobs:
 - `jobs/looped/eqr_sanity.slurm`: checks, plus the README's released-checkpoint eval.
-- `jobs/looped/sudoku_eqr.slurm`: 10 arms (7 from round 1, 3 from round 2), one seed by default
+- `jobs/looped/sudoku_eqr.slurm`: 11 arms (7 from round 1, 4 from round 2), one seed by default
   (`SEEDS="0 1 2"` for more). Runs `dynamics_eqr.py` after its evals. Resumes a run from its latest
   checkpoint when there is none at `MAX_STEPS`, which is how runs are extended from 20k to 50k steps.
 - `jobs/looped/sudoku_dynamics.slurm`: the dynamics for runs that are already trained.
@@ -64,6 +64,12 @@ Here a = e^−γ, b = e^−α and c = e^−δ. Readout is from H, which plays th
 input. With x in both forces and one shared B, relax's update is symmetric in (H, L), and in round 1 its
 two streams merged (cos(z_H, z_L) = 1.00 in every relax arm). Kick's update is not symmetric, and its
 streams stayed apart (cos 0.74).
+
+`self_read=true` is a diagnostic, not an invertible coupling: each force also reads the stream it
+updates, as EqR's force does (L ← … B(L + H + x) …, H ← … B(H + L) …). Exact invertibility needs a force
+that does not depend on the stream it updates, so with fast rates L becomes a function of H and the
+inner L iteration of EqR/HRM disappears. Arm `relax3_leak1_injL_self` differs from `relax3_leak1_injL`
+only in this, so the pair measures what the constraint costs.
 
 **What stays EqR's:**
 - the ACT carry, halting and random state reset;

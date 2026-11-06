@@ -159,6 +159,29 @@ def test_inject_h_breaks_the_stream_symmetry(inject_h):
         assert torch.equal(H1, H1_other_x)
 
 
+def test_self_read_diagnostic_formula_and_no_inverse():
+    """self_read: the forces also read the updated stream (EqR-style), so there is no exact inverse."""
+    m = _coupled(coupling="relax", rate=3.0, leak=1.0, inject_h=False, self_read=True)
+    inner = m.inner
+    torch.manual_seed(7)
+    H, L = torch.randn(4, 9, 16, dtype=torch.float64), torch.randn(4, 9, 16, dtype=torch.float64)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    with torch.no_grad():
+        g, a, c = inner.rates.gamma().double(), inner.rates.alpha().double(), inner.rates.c().double()
+        L1 = inner.half_step_L(H, L, x, seq)
+        ref = torch.exp(-g) * L + (1 - torch.exp(-g)) * (c * H + inner.L_level(L + H + x, **seq))
+        assert (L1 - ref).abs().max() < 1e-12
+        H1 = inner.half_step_H(H, L1, x, seq)
+        ref = torch.exp(-a) * H + (1 - torch.exp(-a)) * (c * L1 + inner.L_level(H + L1, **seq))
+        assert (H1 - ref).abs().max() < 1e-12
+    with pytest.raises(RuntimeError):
+        inner.inverse_half_step("L", H, L1, x, seq)
+    with pytest.raises(RuntimeError):
+        inner.log_volume_per_recursion(9)
+
+
 def test_act_forward_and_gradients_through_loss_head():
     from models.losses import ACTLossHead
     m = _coupled(coupling="kick", rate=1.0, rate_constraint="positive", rate_min=0.05, learn_rates=True,
