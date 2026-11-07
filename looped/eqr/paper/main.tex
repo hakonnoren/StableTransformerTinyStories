@@ -14,6 +14,10 @@
 \usepackage{microtype}
 \usepackage{enumitem}
 \usepackage[section]{placeins}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,decorations.pathreplacing}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
 
 \newtheorem{proposition}{Proposition}
 \newtheorem{lemma}[proposition]{Lemma}
@@ -32,7 +36,7 @@
 \newcommand{\Bk}{\mathcal{B}}
 \makeatletter\newcommand{\tabinput}[1]{\@@input #1 }\makeatother
 
-\title{Damped two-stream couplings in equilibrium reasoners:\\
+\title{Damped two-stream and twin couplings in equilibrium reasoners:\\
 attractor geometry, inner loops and test-time scaling on Sudoku-Extreme}
 \author{H\aa kon Noren}
 \date{Working note, \today}
@@ -45,21 +49,28 @@ Equilibrium Reasoners (EqR) iterate one shared block on two latent states and re
 Sudoku-Extreme by spending test-time compute: more iterations (depth), more random starts (breadth), and
 Langevin noise. We replace EqR's self-reading update by two-stream \emph{kick} and \emph{relax} couplings in which
 each stream is driven only by the other, so that every update is an invertible shear followed by a constant
-scaling, and we study which properties of the resulting maps decide accuracy, depth scaling, breadth and the effect of noise.
+scaling. We add a \emph{twin} coupling, in which the low-level state is doubled into two copies that read each other;
+it restores EqR's inner fixed-point iteration while every update still reads only streams it does not change.
+We study which properties of the resulting maps decide accuracy, depth scaling, breadth and the effect of noise.
 On the theory side we show that (i) the force block has unit per-token RMS, so the state at a fixed point is
 an exact, rate-determined multiple of a unit vector, which fixes the scale against which test noise acts;
 (ii) the volume constraint of the coupled maps is not binding for any trained model except one with near-identity rates;
 (iii) symmetric relaxation without common-mode damping has an exactly neutral mode, and damping it is what makes relax work;
-(iv) alternating couplings have no implicit inner fixed-point problem, while EqR's inner loop does; and
-(v) a relaxed self-map with strong negative feedback undergoes a period-doubling (flip) bifurcation, which a
-two-copy (``twin'') coupling turns back into a fixed point.
+(iv) alternating couplings have no implicit inner fixed-point problem, while EqR's inner loop does;
+(v) a relaxed self-map with strong negative feedback undergoes a period-doubling (flip) bifurcation; and
+(vi) the twin's inner loop is a lag-two recurrence on one interleaved sequence, whose fixed points are the fixed points
+\emph{and} 2-cycles of the self-reading map, so a flip of the self-map becomes a symmetry-breaking pitchfork of the twins.
 Numerically, on 14 checkpoints we measure Jacobian spectra, path independence, selection, and escape under noise.
 Right answers are attracting fixed points and wrong end states are not, in every working model, so convergence-based
 selection is nearly perfect and accuracy is limited by \emph{coverage}. Test noise helps by selectively
-destabilising wrong attractors below an arm-specific breakdown level. EqR differs from the coupled maps in being near
+destabilising wrong attractors below an arm-specific breakdown level. EqR differs from the alternating couplings in being near
 critical at its answers ($\rho\approx 0.93$--$0.97$ per outer iteration against $0.53$--$0.73$), in being more path
 independent, and in an inner loop that, with training, goes through a flip bifurcation into an exact 2-cycle.
-With training to 50k steps, EqR pulls ahead of the coupled maps on every metric.
+After 20k training steps the twin coupling with damping $\delta=2$ is the best test-time scaler we measured:
+$98.2\%$ exact at depth 1024 and $99.6\%$ top-4 with 128 starts at depth 64, above EqR's released 50k-step checkpoint
+($97.6\%$, $98.6\%$), although it is the weakest working arm at 16 iterations and its gain comes from test noise.
+Trained to 50k steps it generalises like EqR (training and test accuracy within one point, against gaps of 15--26 points for the
+alternating couplings, which fit the 1000 training puzzles), but loses part of its noise-driven depth scaling, and EqR leads at 50k.
 All results are single-seed.
 \end{abstract}
 
@@ -82,7 +93,14 @@ integrators \cite{mclachlan2001conformal,franca2020conformal} and momentum netwo
 \textbf{relax:}&\quad L \leftarrow aL + (1-a)\bigl(cH + \Bk(H+x)\bigr), && H \leftarrow bH + (1-b)\bigl(cL + \Bk(L+x)\bigr),
 \end{align*}
 with $a=e^{-\gamma}$, $b=e^{-\alpha}$, $c=e^{-\delta}$. Each stream is driven only by the other stream, so every
-update is invertible with a state-independent Jacobian determinant. We then compare these maps with EqR in
+update is invertible with a state-independent Jacobian determinant. The price is that $L$, given $H$, is one explicit
+layer: EqR's inner iteration disappears (Prop.~\ref{prop:explicit}). The \emph{twin} coupling (\S\ref{sec:twindef}) brings it back
+without giving up invertibility by doubling $L$ into two copies that read each other, $L$ reading $L'$ where EqR's $\zL$ reads itself:
+\begin{align*}
+\textbf{twin:}&\quad L \leftarrow aL + (1-a)\bigl(cL' + \Bk(L'+H+x)\bigr), && L' \leftarrow aL' + (1-a)\bigl(cL + \Bk(L+H+x)\bigr),\\
+&\quad H \leftarrow bH + (1-b)\bigl(cm + \Bk(m)\bigr), &&
+\end{align*}
+with $m=\frac12(L+L')$. We compare these maps with EqR in
 accuracy (\S\ref{sec:acc}), test-time scaling (\S\ref{sec:tts}) and a direct dynamical analysis of trained
 checkpoints (\S\ref{sec:maps}), guided by a small amount of theory (\S\ref{sec:theory}).
 
@@ -105,9 +123,17 @@ answers (1.6 per puzzle at 50k against 2.6 for relax and 3.2 for kick).
 checkpoint, to $\approx-2$. The cycle is invisible to the readout: odd inner-loop lengths work as well as even ones.
 \item \textbf{Damping matters, volume does not.} The volume bound of the coupled maps (Prop.~\ref{prop:volume}) is irrelevant for all
 trained models except a near-identity kick; relax without common-mode damping has an exactly neutral mode (Prop.~\ref{prop:neutral})
-and fails, and accuracy improves monotonically as the merged-state retention falls from $1$ to $\approx0.2$ (\S\ref{sec:acc}).
-\item \textbf{Training length favours EqR.} At 20k steps relax ties EqR with enough test-time compute; at 50k EqR leads on every metric
-(depth 1024: $97.1$ vs.\ $92.5$; depth 64 with 128 starts: $98.7$ vs.\ $96.6$).
+and fails, and early-training accuracy improves as the merged-state retention falls from $1$ to $\approx0.2$ (\S\ref{sec:acc}).
+\item \textbf{Training length favours EqR over the alternating couplings.} At 20k steps relax ties EqR with enough test-time compute;
+at 50k EqR leads on every metric (depth 1024: $97.1$ vs.\ $92.5$; depth 64 with 128 starts: $98.7$ vs.\ $96.6$).
+\item \textbf{Explicit inner equilibria fit the training puzzles.} At 50k the alternating couplings reach $93$--$97\%$ on training batches
+but $71$--$79\%$ on the test set, and relax $\delta=2$ declines after 35k steps. EqR, the twin and the self-reading inner loop, the three arms
+with an implicit inner problem, have no such gap (\S\ref{sec:acc}).
+\item \textbf{A twin inner loop gives the best test-time scaling at 20k.} The twin with $\delta=2$ is the weakest working arm at 16
+iterations ($52.3\%$ at $\sigma=0.5$) but its error falls 26-fold by depth 1024 ($98.2\%$), and with 128 starts at depth 64 it reaches
+$99.6\%$ top-4 and $99.8\%$ by vote, above EqR's released 50k checkpoint ($98.6$, $98.7$). The gain comes from test noise: at the
+training noise it reaches only $65.2\%$ at depth 256. At 50k it is accurate without noise ($84.6\%$ at 16 iterations, EqR $85.8$) and
+$\sigma=0.5$ costs it three points (\S\ref{sec:tts3}).
 \end{enumerate}
 
 %=====================================================================================================
@@ -143,7 +169,7 @@ A recursion is the alternating sequence $H,L,H,L,H,L,H$ (7 evaluations); three r
 
 \noindent Variants (Table~\ref{tab:arms}): \emph{$x\to L$ only} drops $x$ from $H$'s force (EqR's choice); \emph{self-read} adds the updated
 stream to its own force input ($L\leftarrow\dots\Bk(L+H+x)$), which breaks invertibility; \emph{inner loop} uses EqR's order
-($L^6H$) with self-read; \emph{twin} doubles $L$ into $L,L'$ that read each other (\S\ref{sec:twin}).
+($L^6H$) with self-read; \emph{twin} doubles $L$ into $L,L'$ that read each other (\S\ref{sec:twindef}).
 
 \begin{table}[t]
 \centering\small
@@ -159,12 +185,108 @@ relax, $\delta\in\{0,\tfrac14,1\}$ & relax & $\gamma=\alpha=3$ & yes & 1 \\
 relax / kick, $x\to L$ only & no $x$ in $H$'s force & as above & yes & 2 \\
 relax $\delta{=}1$, $x\to L$, self-read & forces read own stream & $\gamma=\alpha=3$ & no & 2 \\
 relax, $\delta\in\{2,3\}$ & relax & $\gamma=\alpha=3$ & yes & 3 \\
-twin $L$, $\delta\in\{1,2\}$ & $L,L'$ read each other, order $LL'LL'LL'H$ & $\gamma=\alpha=3$ & yes$^\ast$ & 3 \\
+twin $L$, $\delta\in\{1,2\}$ & $L,L'$ read each other, order $LL'LL'LL'H$, $x\to L$ only & $\gamma=\alpha=3$ & yes$^\ast$ & 3 \\
 inner loop, self-read & self-read relax, order $L^6H$ & $\gamma=\alpha=3$, $\delta=1$ & no & 3 \\
 \bottomrule
 \end{tabular}\\[2pt]
-{\footnotesize $^\ast$Every update reads only streams it does not change; no inverse is implemented.}
+{\footnotesize $^\ast$Every update reads only streams it does not change, so the inverse is explicit (Prop.~\ref{prop:twinprops});
+it is not implemented in code.}
 \end{table}
+
+\subsection{The twin coupling}\label{sec:twindef}
+
+Proposition~\ref{prop:explicit} below shows what the alternating couplings give up: because $L$'s force does not read $L$, repeated $L$
+updates with $H$ fixed converge to an explicit function of $H$, one block evaluation, and EqR's inner iteration
+$\zL\leftarrow0.05\,\zL+0.95\,\Bk(\zL+\zH+x)$, which solves an implicit equation for $\zL$, is gone. Letting the force read the updated stream
+(the self-read and inner-loop arms) brings the iteration back but breaks invertibility. The twin coupling keeps both: it doubles $L$ into
+two copies, and each copy's force reads the \emph{other} copy where EqR's force reads $\zL$ itself.
+
+\begin{definition}[Twin coupling]\label{def:twin}
+The state is $(H,L,L')\in(\R^{n\times d})^3$. Let $a=e^{-\gamma}$, $b=e^{-\alpha}$, $c=e^{-\delta}$ and, for the current $H$,
+\[
+G_H(z)=c\,z+\Bk(z+H+x).
+\]
+The three half-steps are
+\begin{align*}
+T_L:&\quad L\leftarrow aL+(1-a)\,G_H(L') = aL+(1-a)\bigl(cL'+\Bk(L'+H+x)\bigr),\\
+T_{L'}:&\quad L'\leftarrow aL'+(1-a)\,G_H(L) = aL'+(1-a)\bigl(cL+\Bk(L+H+x)\bigr),\\
+T_H:&\quad H\leftarrow bH+(1-b)\bigl(cm+\Bk(m)\bigr),\qquad m=\tfrac12(L+L').
+\end{align*}
+A latent recursion is $T_L,T_{L'},T_L,T_{L'},T_L,T_{L'},T_H$: EqR's order $L^6H$, with the six $L$-type updates alternating between the
+copies (Figure~\ref{fig:twin}). Fresh noise $\xi\sim\mathcal N(0,\sigma^2I)$ is added to the updated stream after every half-step. An outer
+iteration is three recursions (21 block evaluations, the last 7 differentiated) and the readout decodes $N(H)$, as for the other couplings.
+\end{definition}
+
+\noindent\textbf{The arm with $\delta=2$.} The rates are fixed (not learned): $\gamma=\alpha=3$ and $\delta=2$, so $a=b=e^{-3}=0.0498$ and
+$c=e^{-2}=0.135$. Written out,
+\begin{align*}
+L &\leftarrow 0.050\,L + 0.129\,L' + 0.950\,\Bk(L'+H+x), & H &\leftarrow 0.050\,H + 0.129\,m + 0.950\,\Bk(m),\\
+L' &\leftarrow 0.050\,L' + 0.129\,L + 0.950\,\Bk(L+H+x), &&
+\end{align*}
+next to EqR's $\zL\leftarrow0.05\,\zL+0.95\,\Bk(\zL+\zH+x)$ and $\zH\leftarrow0.05\,\zH+0.95\,\Bk(\zH+\zL)$. The keep-rate $a=0.0498$ is
+EqR's $1-\lambda=0.05$ to three digits, so the twin changes EqR's update in three places only:
+\begin{enumerate}[label=(\roman*),leftmargin=*,itemsep=1pt]
+\item each copy's force reads the other copy ($\Bk(L'+H+x)$ where EqR has $\Bk(\zL+\zH+x)$);
+\item each copy also receives a cross term $(1-a)c\,L'=0.129\,L'$, the common-mode damping of relax (Prop.~\ref{prop:neutral}). If the copies
+coincide the update is the self-reading map $L\leftarrow rL+(1-a)\Bk(L+H+x)$ with retention $r=a+(1-a)c=0.178$; with $\delta=1$, $r=0.40$;
+\item $H$'s force reads only the copies' mean, $\Bk(m)$, not $H$ itself (EqR's reads $\zH+\zL$), plus the cross term $0.129\,m$. As in EqR, $x$
+enters only through the $L$ updates.
+\end{enumerate}
+\noindent\textbf{Everything else is EqR's.} The block $\Bk$ is EqR's L-level module (two post-norm layers, each a token-mixing MLP and
+a SwiGLU with expansion 4, $d=512$, no positional encoding) with EqR's initialisation and parameter count; the input embedding, the 16
+puzzle-embedding slots, the output head and the halting head are EqR's. The coupled model keeps its states in float32 and evaluates $\Bk$ in bfloat16,
+and its heads read $N(H)$ (RMS normalisation without gain), the only changes common to all coupled arms. The copies are stored side by
+side as one $\zL\in\R^{2n\times d}$ (concatenated along the token axis, $\zL=[L;L']$), so EqR's carry, ACT halting
+(at most 16 steps in training), detached carry between outer iterations, random reset and evaluator need no change; at a reset $H$, $L$
+and $L'$ are drawn independently (truncated normal, std 1). Training is EqR's recipe (Adam-atan2 with $\beta=(0.9,0.95)$, learning rate $10^{-4}$
+constant after 2000 warm-up steps, weight decay 1.0, batch 768, EMA 0.999, halting exploration 0.1) at $\sigma=0.01$. Per outer iteration the twin
+evaluates $\Bk$ 21 times on $n=97$ tokens, exactly as EqR; it carries $3nd$ state numbers instead of $2nd$.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=1.32cm,y=0.92cm,
+  blk/.style={draw,rounded corners=1.5pt,fill=white,inner sep=1.5pt,minimum width=0.82cm,minimum height=0.46cm,font=\footnotesize},
+  lane/.style={line width=0.8pt,gray!65},
+  rd/.style={-{Stealth[length=3.2pt,width=2.8pt]},line width=0.55pt},
+  ctx/.style={-{Stealth[length=2.6pt,width=2.2pt]},line width=0.35pt,gray,densely dashed}]
+  \foreach \y/\n in {2/L,1/L',0/H}{
+    \draw[lane] (0.35,\y) -- (7.7,\y);
+    \node[anchor=east,font=\small] at (0.3,\y) {$\n$};
+  }
+  \foreach \k in {1,3,5}{\node[blk] (b\k) at (\k,2) {$T_L$};}
+  \foreach \k in {2,4,6}{\node[blk] (b\k) at (\k,1) {$T_{L'}$};}
+  \node[blk] (b7) at (7,0) {$T_H$};
+  \foreach \k in {1,3,5}{\draw[rd] (\k-0.62,1) to[out=75,in=-115] ([xshift=-3pt]b\k.south);}
+  \foreach \k in {2,4,6}{\draw[rd] (\k-0.62,2) to[out=-75,in=115] ([xshift=-3pt]b\k.north);}
+  \foreach \k in {1,3,5}{\draw[ctx] (\k+0.12,0) -- ([xshift=4pt]b\k.south);}
+  \foreach \k in {2,4,6}{\draw[ctx] (\k+0.12,0) -- ([xshift=4pt]b\k.south);}
+  \draw[rd] (6.45,2) to[out=-80,in=125] ([xshift=-5pt]b7.north);
+  \draw[rd] (6.6,1) to[out=-70,in=105] ([xshift=1pt]b7.north);
+  \node[font=\scriptsize,anchor=west] at (7.3,0.66) {reads $m=\tfrac12(L+L')$};
+  \draw[rd] (7.7,0) -- (8.1,0) node[anchor=west,font=\scriptsize] {readout $N(H)$};
+  \draw[decorate,decoration={brace,amplitude=3pt}] (0.65,2.42) -- (7.35,2.42)
+    node[midway,above=3pt,font=\scriptsize] {one latent recursion: 7 evaluations of $\Bk$; an outer iteration is three recursions};
+\end{tikzpicture}
+\caption{One latent recursion of the twin coupling. Time runs left to right; each box updates the stream on whose line it sits.
+Solid arrows: the copy that the update reads (its force is $\Bk(\text{copy}+H+x)$, plus the cross term $c\cdot$copy). Dashed: the
+current $H$, read by every $L$-type update. $T_H$ reads only the mean of the copies. No update reads the stream it changes.}\label{fig:twin}
+\end{figure}
+
+\begin{algorithm}[t]
+\caption{One outer iteration (ACT step) of the twin coupling}\label{alg:twin}
+\begin{algorithmic}[1]
+\Require carry $(H,L,L')$, input embedding $x$, noise $\sigma$; $a=e^{-\gamma}$, $b=e^{-\alpha}$, $c=e^{-\delta}$
+\For{$r=1,2,3$} \Comment{latent recursions; gradients flow only through $r=3$}
+  \For{$k=1,2,3$}
+    \State $L\gets aL+(1-a)\bigl(cL'+\Bk(L'+H+x)\bigr)+\xi$ \Comment{$\xi\sim\mathcal N(0,\sigma^2I)$, fresh each time}
+    \State $L'\gets aL'+(1-a)\bigl(cL+\Bk(L+H+x)\bigr)+\xi$ \Comment{reads the $L$ just computed}
+  \EndFor
+  \State $m\gets\frac12(L+L')$
+  \State $H\gets bH+(1-b)\bigl(cm+\Bk(m)\bigr)+\xi$
+\EndFor
+\State \Return cell logits and halting logit from $N(H)$; carry $(H,L,L')$ forward, detached
+\end{algorithmic}
+\end{algorithm}
 
 \subsection{Evaluation}
 \emph{Depth} $D$ is the number of outer iterations; \emph{breadth} $B$ is the number of random starts per puzzle. For $B>1$ an answer
@@ -281,6 +403,58 @@ normal-form result for a simple eigenvalue crossing $-1$.\end{proof}
 and the measured values for EqR are drawn in Figure~\ref{fig:flip}; damping of this kind is also the mechanism behind the
 fixed-point reasoners of \cite{movahedi2026fixedpoint}.
 
+\subsection{The twin coupling as a lag-two recurrence}\label{sec:twintheory}
+
+\begin{proposition}[Invertibility, volume and scale of the twin]\label{prop:twinprops}
+For the twin coupling (Definition~\ref{def:twin}):
+\begin{enumerate}[label=(\alph*),itemsep=0pt]
+\item each half-step is invertible, with $L=\bigl(L_{\rm new}-(1-a)G_H(L')\bigr)/a$, $L'=\bigl(L'_{\rm new}-(1-a)G_H(L)\bigr)/a$ and
+$H=\bigl(H_{\rm new}-(1-b)(cm+\Bk(m))\bigr)/b$, since $T_L$ does not change $L'$ or $H$, $T_{L'}$ does not change $L$ or $H$, and $T_H$ does not change $m$;
+\item the Jacobian determinant is constant, $\log|\det J|=-nd\,(18\gamma+3\alpha)$ per outer iteration on the $3nd$-dimensional state, so the
+geometric mean of the eigenvalue moduli is $e^{-(18\gamma+3\alpha)/3}=e^{-21}\approx8\times10^{-10}$ at $\gamma=\alpha=3$; the volume bound
+(Prop.~\ref{prop:volume}) is not binding;
+\item at a noise-free fixed point with $H$ frozen, the copies satisfy $p=G_H(q)$, $q=G_H(p)$, and their per-token RMS lies in
+$\bigl[\tfrac{1-2c}{1-c},\tfrac1{1-c}\bigr]$, i.e.\ $[0.84,1.16]$ for $\delta=2$ and $[0.42,1.58]$ for $\delta=1$; if the copies coincide it equals
+$\tfrac{1}{1-c}$ exactly ($1.16$ for $\delta=2$), as for merged relax (Prop.~\ref{prop:scale}c).
+\end{enumerate}
+\end{proposition}
+\begin{proof}(a) Each update is affine in the stream it changes, with slope $a$ or $b$, and its other terms are functions of unchanged
+streams. (b) Each $T_L,T_{L'}$ scales $nd$ coordinates by $a$ and each $T_H$ scales $nd$ by $b$; an outer iteration has 18 of the former and
+3 of the latter. (c) The fixed-point equations follow as in Proposition~\ref{prop:twin}. Per token, $p=cq+f$ with $\rms(f)=1$ (Lemma~\ref{lem:unit}), so
+$|\rms(p)-1|\le c\,\rms(q)$ and symmetrically; hence $\rms(p)\le1+c+c^2\rms(p)$, giving $\rms(p)\le\frac1{1-c}$, and then
+$\rms(p)\ge1-\frac{c}{1-c}$. For $p=q$, $(1-c)p=f$.\end{proof}
+
+\begin{proposition}[Lag-two recurrence]\label{prop:lag2}
+Fix $H$ and write the copies' values as one interleaved sequence: before a recursion $(L,L')=(z_{-1},z_0)$, and the $j$-th $L$-type update
+writes $z_j$ (into $L$ for odd $j$, into $L'$ for even $j$). Then the six $L$-type updates of a recursion are
+\[
+z_{j+1}=a\,z_{j-1}+(1-a)\,G_H(z_j),\qquad j=0,\dots,5,
+\]
+and $T_H$ reads $m=\frac12(z_5+z_6)$, the mean of the last two iterates. In particular:
+\begin{enumerate}[label=(\alph*),itemsep=0pt]
+\item for $a=0$ the inner loop is plain iteration $z_{j+1}=G_H(z_j)$ of the self-reading map, i.e.\ EqR's inner loop with $\lambda=1$ and a
+cross term $cz$; the twin's $a=0.0498$ relaxes towards the iterate \emph{two} steps back instead of the previous one;
+\item at a fixed point $z^\ast=G_H(z^\ast)$ (coinciding copies), along an eigenvector of $DG_H(z^\ast)$ with real eigenvalue $\mu$ the
+per-update multipliers $s$ solve $s^2-(1-a)\mu\,s-a=0$. Both roots lie in $(-1,1)$ if and only if $-1<\mu<1$, and their product is $-a$, the
+volume constraint of Proposition~\ref{prop:twinprops}(b);
+\item at $\mu=-1$ the roots are $-1$ and $a$. The critical mode alternates in sign along the sequence, so it is antisymmetric in the
+copies ($\delta L=-\delta L'$), and over one $(T_L,T_{L'})$ sweep its multiplier is $s^2=1$. The period doubling of the self-map (Prop.~\ref{prop:flip}) therefore appears in the
+twin state as a symmetry-breaking pitchfork: the copies separate, $(L,L')\to(p,q)$ with $p\ne q$ a 2-cycle of $G_H$ (Prop.~\ref{prop:twin}), and
+$H$ reads the stationary mean $\frac12(p+q)$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}The recurrence is $T_L$ and $T_{L'}$ rewritten in the interleaved indices. (b) Linearising, $e_{j+1}=(1-a)\mu e_j+ae_{j-1}$. With
+$f(s)=s^2-(1-a)\mu s-a$, $f(0)=-a<0$, $f(1)=(1-a)(1-\mu)$ and $f(-1)=(1-a)(1+\mu)$, so there is one root in each of $(-1,0)$ and $(0,1)$ iff
+$-1<\mu<1$; the product of the roots is $f(0)=-a$. (c) $f(s)=(s+1)(s-a)$ at $\mu=-1$; the eigen-solution $e_j\propto(-1)^j$ puts opposite signs
+on consecutive iterates, i.e.\ on $L$ and $L'$.\end{proof}
+
+\noindent The step $(z_{j-1},z_j)\mapsto(z_j,z_{j+1})$ is the additive coupling of reversible residual networks \cite{gomez2017revnet} with a
+scaling $a$, and the same device that makes momentum ResNets invertible \cite{sander2021momentum}: a first-order self-map that cannot be
+inverted is made invertible by carrying two consecutive iterates. The merged fixed point of the twin loses stability at
+$\mu(DG_H)=-1$, i.e.\ at $\mu(D\Bk)=-1-c=-1.14$ for $\delta=2$, close to EqR's flip threshold $1-\frac2\lambda=-1.105$; but what forms then is a
+stationary pair rather than an oscillation, and $H$ sees both phases through $m$. Whether trained twins sit on the diagonal $L=L'$ or off it
+has not been measured yet (the dynamical analysis of \S\ref{sec:maps} covers rounds one and two only).
+
 \subsection{Certification and noise}
 
 EqR bounds the distance to a fixed point by the residual under local contraction ($\|z-z^\ast\|\le\|R(z)\|/(1-L)$) and turns this into a
@@ -296,7 +470,7 @@ retrieval states \cite{amit1985storing,coolen2000statics}; noise then selects th
 \begin{table}[t]
 \centering\small
 \caption{Accuracy at training noise ($\sigma=0.01$), one start. Exact@16: whole test set; @64/@256: first 49{,}152 puzzles.
-$O$: right at 16 but wrong at 256; $\Delta y$: prediction changed between 16 and 256.}\label{tab:main}
+$O$: right at 16 but wrong at 256; $\Delta y$: prediction changed between 16 and 256 (not computed for round three, last block).}\label{tab:main}
 \setlength{\tabcolsep}{4.5pt}
 \begin{tabular}{@{}llrrrrrr@{}}
 \toprule
@@ -315,8 +489,9 @@ EqR by about six points at 16 iterations; the gap does not close with training (
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_training.pdf}
-\caption{(a) In-training evaluation (whole test set, 16 iterations) of the three arms extended to 50k steps. (b) All round-three
-arms and references at 20k: evaluation at 14k (filled) and training-batch accuracy averaged over steps 18--20k (open).}\label{fig:training}
+\caption{(a) In-training evaluation (whole test set, 16 iterations, $\sigma=0.01$) of the six arms trained to 50k steps. The twin
+($\delta=2$) starts slowly and nearly reaches EqR; relax $\delta=2$ peaks at 35k. (b) Test accuracy at 49k (filled) against
+training-batch accuracy averaged over steps 48--50k (open), with the mean number of ACT steps on training batches at the right.}\label{fig:training}
 \end{figure}
 
 \paragraph{Round two: input injection and self-reading.} Giving $x$ only to $L$ (as EqR does) costs $12$ points for relax and $7$ for kick.
@@ -324,11 +499,38 @@ For relax it separates the streams ($\cos(H,L)$ $1.00\to0.77$) but each stream i
 recovers $10$ of the $12$ points ($51.7\to61.7$), but only to the level of plain merged relax ($63.9$), which already reads itself in
 effect (its streams coincide). Self-reading without an inner loop is therefore not what EqR has over relax.
 
-\paragraph{Round three: damping and inner loops (20k, preliminary).} Table~\ref{tab:round3} and Figure~\ref{fig:retention}.
-Lowering the merged-state retention from $0.40$ ($\delta=1$) to $0.18$ ($\delta=2$) gains seven points at 14k, and $\delta=3$ ($r=0.10$) is
-slightly worse. The twins keep $H$ apart from $L$ ($\cos=0.25$--$0.45$) but are not better than relax $\delta=1$ at 14k; the inner-loop
-reference is the best new arm at 14k. Whether an inner loop pays off may only show later in training, as EqR's own advantage grew
-between 20k and 50k; three arms are being extended to 50k.
+\paragraph{Round three: damping and inner loops.} Tables~\ref{tab:main}, \ref{tab:round3} and \ref{tab:ext50}, Figures~\ref{fig:training}
+and \ref{fig:retention}. At 20k and the training noise, lowering the merged-state retention from $0.40$ ($\delta=1$) to $0.18$ ($\delta=2$)
+gives the best coupled arm at 16 iterations ($65.8$, against $63.9$), and $\delta=3$ ($r=0.10$) is worse again. The twins keep $H$ apart from $L$
+($\cos=0.25$--$0.45$) but are not better than relax at 20k ($62.8$, $61.4$), and only the inner-loop arm gains clearly with depth
+($65.2\to76.0$ from 16 to 256 iterations; EqR $69.5\to75.8$). Three arms were trained on to 50k, and there the order changes
+(Figure~\ref{fig:training}a): the twin with $\delta=2$ rises from $62.3$ at 21k to $85.0$ at 49k, against EqR's $85.9$, and the inner loop
+reaches $80.6$, while relax $\delta=2$ peaks at $74.5$ at 35k and falls to $71.1$. At 50k the twin's depth curve at the training noise is within
+$1.5$ points of EqR's ($84.6/90.7/93.7$ against $85.8/92.1/95.0$ at 16/64/256 iterations), the closest any coupling has come.
+
+\begin{table}[t]
+\centering\small
+\caption{Generalisation at 50k (W\&B). Test: in-training evaluation (whole test set, 16 iterations, $\sigma=0.01$) at 49k and its maximum
+over the evaluations every 7k steps. Train: exact accuracy of training batches averaged over steps 48--50k; it counts sequences that halt,
+so it depends on the halting head. ACT: mean outer iterations per training sequence. $\cos(H,L)$ over the same window.}\label{tab:ext50}
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+arm & test 49k & best test & train 48--50k & train$-$test & ACT & $\cos(H,L)$\\
+\midrule
+\tabinput{tables/tab_ext50.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Generalisation.} Table~\ref{tab:ext50} and Figure~\ref{fig:training}b. The training set of Sudoku-Extreme-1k is 1000 puzzles
+(each with 1000 augmentations), so a model can fit it. At 48--50k the alternating couplings are right on $93$--$97\%$ of training batches but on
+$71$--$79\%$ of test puzzles, and relax $\delta=2$ halts after $2.0$ outer iterations on training puzzles, the fewest of all arms, while its test
+accuracy falls. EqR and the twin show gaps of about one point ($87.2$ against $85.9$; $86.0$ against $85.0$) and halt after $5.4$--$5.6$ iterations.
+The self-reading inner loop is right less often on training batches than on the test set ($70.1$ against $80.6$, with $8.3$ ACT steps), which
+says more about its halting head than about fitting. At 20k all gaps were small (EqR $+1$, relax $\delta=1$ $+3$ points), so the gap opens with
+training. The arms whose inner equilibrium is a single explicit layer (Prop.~\ref{prop:explicit}) thus fit the training puzzles, and the three arms
+with an implicit inner problem (EqR, twin, inner loop) do not. This is a correlation across six single-seed runs, not a controlled test.
 
 \begin{figure}[t]
 \centering
@@ -368,7 +570,8 @@ EqR's released checkpoint. (b) The error of relax falls like a power of depth; E
 \begin{table}[t]
 \centering\small
 \caption{Test-time scaling at $\sigma=0.5$, first 2048 test puzzles. Left: one start at depth $D$. Right: depth 64 with 128 starts, by
-selection rule (best in bold). The released EqR gives 98.6 top-4, as in EqR's README.}\label{tab:scaling}
+selection rule (best non-oracle rule in bold; ``any'' is the oracle). The released EqR gives 98.6 top-4, as in EqR's README. Lower block:
+round three; ``--'': depth 64 with 128 starts at 50k still running.}\label{tab:scaling}
 \begin{tabular}{@{}llrrrr|rrrr@{}}
 \toprule
 & & \multicolumn{4}{c|}{one run, depth $D$} & \multicolumn{4}{c}{depth 64, 128 starts}\\
@@ -379,27 +582,93 @@ arm & steps & 16 & 64 & 256 & 1024 & converged & top-4 & vote & any \\
 \end{tabular}
 \end{table}
 
-Figure~\ref{fig:depth} and Table~\ref{tab:scaling}. All working models improve steadily with depth. At 20k, relax ties EqR once compute is
-large (depth 1024: $90.4$ vs.\ $91.4$; depth 64 with 128 starts, most converged: $95.9$ vs.\ $95.7$). At 50k EqR leads everywhere. Relax's
-error decays like $D^{-0.39}$ without saturating, so it would need more than an order of magnitude more iterations to match EqR at 50k.
+Figure~\ref{fig:depth} and Table~\ref{tab:scaling} (upper block). All working models improve steadily with depth. At 20k, relax ties EqR
+once compute is large (depth 1024: $90.4$ vs.\ $91.4$; depth 64 with 128 starts, most converged: $95.9$ vs.\ $95.7$). At 50k EqR leads
+everywhere. Relax's error decays like $D^{-0.39}$ without saturating, so it would need more than an order of magnitude more iterations to
+match EqR at 50k. Round three, and the twin in particular, is in \S\ref{sec:tts3}.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_breadth.pdf}
-\caption{Depth 64, 128 starts, $\sigma=0.5$: accuracy by selection rule. At 20k positive kick has the best vote and ``any'' but the worst
-single run and convergence selection; by 50k this has reversed.}\label{fig:breadth}
+\caption{Depth 64, 128 starts, $\sigma=0.5$: accuracy by selection rule (conv.: most converged start; top-4: mean of the four most
+converged; any: some start right). (a) 20k, round-one arms open, round-three arms filled: the twin with $\delta=2$ is best under every selection rule (EqR has the better
+single run).
+Among the round-one arms positive kick has the best vote and ``any'' but the worst single run and convergence selection; (b) by 50k this has
+reversed. The round-three arms at 50k are still being evaluated.}\label{fig:breadth}
 \end{figure}
 
 Positive kick at 20k is the outlier (Figure~\ref{fig:breadth}): at $\sigma=0.5$ a single run is right only $37\%$ of the time, yet some start is right
-for $99.1\%$ of puzzles and a plurality vote over 128 starts reaches $96.8\%$, the best of the 20k models. Its relative noise is about $1.6$ times
+for $99.1\%$ of puzzles and a plurality vote over 128 starts reaches $96.8\%$, the best of the round-one 20k models. Its relative noise is about $1.6$ times
 EqR's (Corollary~1), which pushes it into a high-diversity regime; at noise $0.25$ its single run is $69\%$. By 50k its $L$ stream has grown (Prop.~\ref{prop:scale})
 and the regime is gone (any $93.8$, vote $87.9$).
+
+\subsection{Round three: the twin coupling scales best at 20k}\label{sec:tts3}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_r3_depth.pdf}
+\caption{Round three: one-run error against depth at $\sigma=0.5$ (first 2048 test puzzles), log--log. Dotted: EqR's released 50k
+checkpoint in both panels. (a) At 20k the twin with $\delta=2$ starts worst and ends best: its error falls 26-fold from depth 16 to 1024
+($D^{-0.78}$), against 3.6-fold for EqR at 20k and 10-fold for the released checkpoint. (b) At 50k the twin is faster at short depth but its
+curve flattens ($D^{-0.47}$); EqR at 50k leads at every depth.}\label{fig:r3depth}
+\end{figure}
+
+Figure~\ref{fig:r3depth} and the lower block of Table~\ref{tab:scaling}. At 20k the twin with $\delta=2$ has the worst single run at 16
+iterations of all working arms ($52.3\%$) and the steepest depth curve we have measured: error $47.7\%\to20.4\%\to7.4\%\to1.8\%$ at depths
+16, 64, 256 and 1024, a power law with exponent $-0.78$ (EqR at 20k: $-0.31$; the released EqR: $-0.56$; relax $\delta=1$: $-0.35$). At depth
+1024 it is right on $98.2\%$ of puzzles, against $91.4\%$ for EqR at 20k and $97.6\%$ for EqR's released 50k checkpoint. In EqR's headline
+setting, depth 64 with 128 starts, it reaches $99.6\%$ top-4, $99.6\%$ for the most converged start and $99.8\%$ by plurality vote (released
+EqR: $98.6$, $99.2$, $98.7$); some start is right for $99.9\%$ of puzzles, and convergence finds it. On 2048 puzzles that is about 4 wrong by
+vote against 27. The twin with $\delta=1$ is in between: $91.6\%$ at depth 1024, level with EqR at 20k, and $95.5\%$ top-4. So for the twins
+stronger common-mode damping pays at depth. For relax under test noise it does not: at depth 1024, $\delta=1,2,3$ give $90.4$, $88.3$ and
+$78.4\%$, with depth exponents $-0.35$, $-0.30$ and $-0.20$, although $\delta=2$ was the best relax arm at the training noise.
+
+\begin{table}[t]
+\centering\small
+\caption{Exact accuracy (\%) of one run at the training noise $\sigma=0.01$ (Table~\ref{tab:main}; depth 16 on the whole test set, depth
+256 on 49{,}152 puzzles) and at the test noise $\sigma=0.5$ (Table~\ref{tab:scaling}; first 2048 puzzles). $\Delta$: effect of the test noise at
+depth 256. The puzzle sets differ, so differences below about one point are not meaningful.}\label{tab:noisedep}
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+& & \multicolumn{2}{c}{depth 16} & \multicolumn{3}{c}{depth 256} & depth 1024\\
+\cmidrule(lr){3-4}\cmidrule(lr){5-7}\cmidrule(l){8-8}
+arm & steps & $\sigma=0.01$ & $0.5$ & $\sigma=0.01$ & $0.5$ & $\Delta$ & $\sigma=0.5$\\
+\midrule
+\tabinput{tables/tab_noisedep.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.6\textwidth]{figures/fig_noisedep.pdf}
+\caption{Depth-256 accuracy at the training noise against the test noise $\sigma=0.5$; open: 20k, filled: 50k, arrows join the two
+checkpoints of one arm. Above the diagonal noise helps. At 20k the twins and relax $\delta=1$ gain most; by 50k every arm is near or below
+the diagonal, and relax $\delta=2$ collapses (off scale).}\label{fig:noisedep}
+\end{figure}
+
+\paragraph{The gain comes from test noise.} Table~\ref{tab:noisedep} and Figure~\ref{fig:noisedep}. At the training noise the 20k twin is a
+weak model ($65.2\%$ at depth 256, below relax $\delta=2$); at $\sigma=0.5$ it is right on $92.6\%$ at the same depth, a gain of 27 points, the largest
+we have measured. Twin $\delta=1$ and relax $\delta=1$ gain about 18 points, EqR 12. The noise does not help the self-reading inner loop at all
+($76.0$ against $75.8$), so that arm's strong depth scaling at the training noise (\S\ref{sec:acc}) does not carry over to EqR's protocol: at
+$\sigma=0.5$ it is the second-weakest round-three arm ($81.8\%$ at depth 1024). Positive kick loses from noise at every checkpoint. By the escape
+analysis (\S\ref{sec:escape}), noise below an arm's breakdown level $\sigma^\star$ destabilises wrong end states without losing right ones;
+a gain as large as the twin's means that at 20k many of its wrong end states are shallow while its right ones survive $\sigma=0.5$. We have not
+yet run the escape analysis on twin checkpoints, so this is an inference from the accuracies.
+
+\paragraph{Longer training removes the need for noise.} At 50k every arm is accurate at the training noise, and $\sigma=0.5$ helps EqR by
+$0.3$ points and hurts all others: the twin by $3.1$, the inner loop by $3.7$, kick by $25$, and relax $\delta=2$ collapses ($2.6\%$ exact at every
+depth), the collapse that relax $\delta=1$ showed at $\sigma=0.75$ (Figure~\ref{fig:noise}) now at a lower noise. The 50k twin is better than the
+20k twin at short depth ($68.0$ against $52.3\%$ at 16 iterations) but worse at large depth ($95.4$ against $98.2\%$ at 1024; most converged of
+16 starts at depth 64: $96.0$ against $98.3\%$), and EqR at 50k leads it at every depth. A fixed $\sigma$ is a different test for each checkpoint
+(Corollary~1 and \S\ref{sec:escape}); whether the 50k twin recovers its depth scaling at a smaller test noise is the first thing to measure next.
 
 %=====================================================================================================
 \section{Dynamics of the trained maps}\label{sec:maps}
 
 All quantities in this section use the noise-free map unless stated, in float32, on the first 256 test puzzles with 16 random starts and 256
-outer iterations, at the checkpoints' EMA weights.
+outer iterations, at the checkpoints' EMA weights. The analysis covers the round-one and round-two checkpoints; the round-three
+checkpoints (twin, inner loop, relax $\delta\in\{2,3\}$) have not been analysed yet.
 
 \subsection{Selection is solved; coverage is not}\label{sec:select}
 
@@ -567,8 +836,9 @@ checkpoint & $L$=4 & 5 & 6 & 7 & 8\\
 
 The cycle carries no information the readout uses: odd inner-loop lengths, which make $\zH$ read alternating phases, are as accurate as even
 ones (Table~\ref{tab:lcycles}; $\pm2.5$ points at 128 puzzles). We read the period doubling as a by-product of strong negative feedback in the block
-combined with EqR's light damping, not as a computational mechanism. By Proposition~\ref{prop:twin} a twin coupling would hold such a cycle as a fixed
-point with $L\ne L'$; the twins' merge cosine is therefore a direct readout of whether the twin arms learn the same structure.
+combined with EqR's light damping, not as a computational mechanism. By Propositions~\ref{prop:twin} and \ref{prop:lag2} a twin coupling holds
+such a cycle as a fixed point with $L\ne L'$; the cosine between the copies is therefore a direct readout of whether the twin arms learn the
+same structure, and it is the first quantity to measure on the twin checkpoints.
 
 %=====================================================================================================
 \section{Discussion}
@@ -581,17 +851,28 @@ halting essentially free. Models without it (relax $\delta=0$, $\frac14$; fixed 
 \item \emph{A margin between the noise that breaks wrong attractors and the noise that breaks right ones.} It exists for all working models; its
 location $\sigma^\star$ is set by the state scale (exactly predictable, Prop.~\ref{prop:scale}) and by contraction strength, and it moves with training.
 \item \emph{Damping of the common mode}, not the volume constraint. The undamped mode of relax is fatal; strong but not maximal damping is best.
-\item \emph{An inner equilibrium problem and near-critical contraction} distinguish EqR. The coupled maps contract harder, have an explicit inner
-equilibrium, and gain less from training. Whether restoring an implicit inner problem (twin, inner loop) closes the gap is the open question of round three.
+\item \emph{An implicit inner equilibrium problem.} EqR has one; the alternating couplings, whose inner equilibrium is a single explicit layer,
+fit the 1000 training puzzles and stop improving on the test set (train$-$test gaps of 15--26 points at 50k). Restoring the inner problem
+without self-reading, by the twin's two copies, removes the gap (one point at 50k) and brings the twin to within $1$--$1.5$ points of EqR at the
+training noise. This suggests that invertibility is not what costs the alternating couplings accuracy, and that the missing inner loop is.
+\item \emph{Noise-driven exploration that pays off with depth}, which depends on the checkpoint. At 20k the twin gains 27 points from test noise
+at depth 256 and beats EqR's released 50k checkpoint at depth 1024 and with 128 starts; the self-reading inner loop, which also has an implicit
+inner problem, gains nothing. At 50k noise $\sigma=0.5$ helps only EqR. What makes a map profit from noise is not yet measured; the
+twin's lag-two structure (Prop.~\ref{prop:lag2}) and the escape and spectral analysis of its checkpoints are where to look.
 \end{enumerate}
 
-\paragraph{Limitations.} All runs use one seed; test-time numbers use 2048 puzzles ($\pm0.5$ points) and the dynamical analysis 256 puzzles
-($\pm1$--$2$ points). Spectra use 16 right and 16 wrong end states per arm, and Ritz values from 30 Arnoldi steps approximate only the leading
-spectrum. GPU traces ran with TF32 matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The
-round-three results are from training curves only.
+\paragraph{Limitations.} All runs use one seed; in particular the twin's $99.6\%$ at depth 64 with 128 starts has not been replicated. Test-time
+numbers use 2048 puzzles ($\pm0.5$ points; $\pm0.2$ near $99\%$) and the dynamical analysis 256 puzzles ($\pm1$--$2$ points). Spectra use 16
+right and 16 wrong end states per arm, and Ritz values from 30 Arnoldi steps approximate only the leading spectrum. GPU traces ran with TF32
+matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The round-three checkpoints have
+test-time results but no dynamical analysis, and their depth-64, 128-start evaluation at 50k is still running. All test-time comparisons use
+EqR's $\sigma=0.5$, which is not the best noise for every checkpoint. Training-batch accuracy depends on halting, so the generalisation gaps
+are indicative.
 
-\paragraph{Next.} Round three at 50k (relax $\delta=2$, twin $\delta=2$, inner loop), with depth$\times$breadth evaluation and the same dynamical
-analysis; a per-checkpoint choice of test noise below $\sigma^\star$; a schedule without consecutive $H$ updates; and seeds.
+\paragraph{Next.} (i) Seeds 1 and 2 of the twin ($\delta=2$) and EqR at 20k, with depth 1024 and depth 64 $\times$ 128 starts. (ii) A test-noise
+sweep at 50k ($\sigma\in\{0.1,0.25,0.75\}$) for the twin, the inner loop, relax $\delta=2$ and EqR. (iii) The dynamical analysis of the twin
+checkpoints at 20k and 50k: whether the copies coincide, spectra at right and wrong end states, and escape under noise. (iv) Twins with larger
+$\delta$ or learned rates, and a schedule without consecutive $H$ updates for the alternating couplings.
 
 \appendix
 \section{Rates, scales and dimensionality}

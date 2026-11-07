@@ -33,8 +33,8 @@ W = 6.3          # text width (in)
 
 C = {"eqr": "C0", "eqr-released": "C4", "relax3_leak1": "C1", "kick_pos": "C2", "relax3_leak4": "C8",
      "relax3": "C7", "kick_learned": "C9", "kick_fixed": "C5", "relax3_leak1_injL": "C3",
-     "relax3_leak1_injL_self": "C6", "kick_pos_injL": "C3", "relax3_leak2": "C1", "relax3_leak3": "C1",
-     "twinL_leak1": "C4", "twinL_leak2": "C4", "innerL_self_leak1": "C6"}
+     "relax3_leak1_injL_self": "C6", "kick_pos_injL": "C3", "relax3_leak2": "C9", "relax3_leak3": "C7",
+     "twinL_leak1": "C5", "twinL_leak2": "C3", "innerL_self_leak1": "C6"}
 LABEL = {"eqr": "EqR", "eqr-released": "EqR (released)", "relax3_leak1": r"relax $\delta{=}1$",
          "kick_pos": "kick (pos.)", "relax3_leak4": r"relax $\delta{=}1/4$", "relax3": r"relax $\delta{=}0$",
          "kick_learned": "kick (learned)", "kick_fixed": "kick (fixed)", "relax3_leak1_injL": r"relax $\delta{=}1$, $x\!\to\!L$",
@@ -74,28 +74,32 @@ def lab(arm, step):
 
 # --------------------------------------------------------------------------------------------- training
 def fig_training():
-    fig, (a, b) = plt.subplots(1, 2, figsize=(W, 2.35), gridspec_kw={"width_ratios": [1.25, 1]})
-    for arm in ("eqr", "relax3_leak1", "kick_pos"):
+    ext = ["eqr", "twinL_leak2", "innerL_self_leak1", "relax3_leak1", "kick_pos", "relax3_leak2"]
+    fig, (a, b) = plt.subplots(1, 2, figsize=(W, 2.45), gridspec_kw={"width_ratios": [1.2, 1]})
+    for arm in ext:
         ev = np.array(WB[arm]["eval"])
-        a.plot(ev[:, 0] / 1000, ev[:, 1], "o-", color=C[arm], label=LABEL[arm])
+        a.plot(ev[:, 0] / 1000, ev[:, 1], "o-", color=C[arm], label=LABEL[arm], ms=3.2)
     a.axvline(20, color="0.6", lw=0.6, ls=":")
     a.set_xlabel("training step (thousands)")
     a.set_ylabel("exact accuracy (16 it., test)")
     a.set_ylim(0, 0.92)
-    a.legend(loc="lower right")
-    a.set_title("(a) in-training evaluation")
-    rows = sorted(T.ROUND3, key=lambda r: r[1])
-    y = np.arange(len(rows))
-    for i, r in enumerate(rows):
-        b.plot([r[1]], [i], "o", color=C[r[0]], ms=5)
-        b.plot([r[2]], [i], "D", color=C[r[0]], mfc="white", ms=4)
-    b.set_yticks(y, [LABEL[r[0]] for r in rows])
+    a.legend(loc="lower right", fontsize=6.6)
+    a.set_title("(a) in-training evaluation, arms trained to 50k")
+    rows = sorted(T.EXT50, key=lambda r: r[1])
+    for i, (arm, ev, _, tr, act, _) in enumerate(rows):
+        b.plot([ev, tr], [i, i], color=C[arm], lw=1.0)
+        b.plot([ev], [i], "o", color=C[arm], ms=5)
+        b.plot([tr], [i], "D", color=C[arm], mfc="white", ms=4)
+        b.text(1.005, i, f"{act:.1f}", va="center", fontsize=7, transform=b.get_yaxis_transform())
+    b.text(1.005, len(rows) - 0.55, "ACT", va="bottom", fontsize=7, transform=b.get_yaxis_transform())
+    b.set_yticks(range(len(rows)), [LABEL[r[0]] for r in rows])
+    b.set_ylim(-0.6, len(rows) + 0.75)
     b.set_xlabel("exact accuracy")
-    b.set_xlim(0.3, 0.8)
-    b.plot([], [], "o", color="0.3", label="eval, 14k")
-    b.plot([], [], "D", color="0.3", mfc="white", label="train batch, 18–20k")
-    b.legend(loc="upper left", handletextpad=0.2)
-    b.set_title("(b) all arms at 20k (W\\&B)".replace("\\&", "&"))
+    b.set_xlim(0.65, 1.0)
+    b.plot([], [], "o", color="0.3", label="test (eval at 49k)")
+    b.plot([], [], "D", color="0.3", mfc="white", label="train batches, 48k to 50k")
+    b.legend(loc="upper left", handletextpad=0.2, fontsize=6.6)
+    b.set_title("(b) train vs. test at 50k; ACT steps")
     fig.tight_layout(w_pad=1.0)
     save(fig, "fig_training")
 
@@ -142,7 +146,7 @@ def fig_depth():
     a.set_title(r"(a) depth scaling, noise $\sigma=0.5$")
     b.set_yscale("log")
     b.set_ylabel("error rate, one run")
-    b.set_title("(b) error, log–log")
+    b.set_title("(b) error, log-log")
     # power-law guides: slope estimated on relax 50k
     d, s = _depth_curve("relax3_leak1", 50000)
     k = np.polyfit(np.log(d), np.log(1 - s), 1)[0]
@@ -154,25 +158,96 @@ def fig_depth():
 
 
 def fig_breadth():
-    rules = [("single", "one run"), ("conv1", "converged"), ("convk", "top-4"), ("vote", "vote"), ("any", "any right")]
-    fig, axes = plt.subplots(1, 2, figsize=(W, 2.3), sharey=True)
+    rules = [("single", "one run"), ("conv1", "conv."), ("convk", "top-4"), ("vote", "vote"), ("any", "any")]
+    fig, axes = plt.subplots(1, 2, figsize=(W, 2.45), sharey=True, gridspec_kw={"width_ratios": [1.35, 1]})
     for ax, step in zip(axes, (20000, 50000)):
-        arms = ["eqr", "relax3_leak1", "kick_pos"] + (["eqr-released"] if step == 50000 else [])
-        off = np.linspace(-0.24, 0.24, len(arms))
+        arms = ["eqr", "relax3_leak1", "kick_pos"]
+        arms += ["relax3_leak2", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"] if step == 20000 else ["eqr-released"]
+        off = np.linspace(-0.3, 0.3, len(arms))
         for j, arm in enumerate(arms):
             st = 50000 if arm == "eqr-released" else step
             r = [x for x in SC if x["arm"] == arm and x["step"] == st and x["D"] == 64 and x["B"] == 128 and x["noise"] == 0.5][0]
             vals = [r[k] for k, _ in rules]
-            ax.plot(np.arange(len(rules)) + off[j], vals, "o", color=C[arm], label=LABEL[arm], ms=5,
-                    mfc="white" if step == 20000 and arm != "eqr-released" else None)
+            ax.plot(np.arange(len(rules)) + off[j], vals, "o", color=C[arm], label=LABEL[arm], ms=4.2,
+                    mfc="white" if arm in ("eqr", "relax3_leak1", "kick_pos") and step == 20000 else None)
         ax.set_xticks(range(len(rules)), [n for _, n in rules])
         ax.set_title(f"({'ab'[step == 50000]}) {step // 1000}k steps, depth 64, 128 starts, " + r"$\sigma=0.5$")
-        ax.set_ylim(0.3, 1.0)
+        ax.set_ylim(0.3, 1.01)
         ax.grid(axis="y", color="0.9", lw=0.5)
+        ax.legend(loc="lower right", fontsize=6.3, handletextpad=0.1)
     axes[0].set_ylabel("exact accuracy")
-    axes[1].legend(loc="lower right")
     fig.tight_layout(w_pad=0.8)
     save(fig, "fig_breadth")
+
+
+def _err_axes(ax):
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.set_xticks([16, 64, 256, 1024], ["16", "64", "256", "1024"])
+    ax.set_yticks([0.01, 0.02, 0.05, 0.1, 0.2, 0.5], ["1%", "2%", "5%", "10%", "20%", "50%"])
+    ax.set_ylim(0.012, 0.75)
+    ax.set_xlabel("depth $D$ (outer iterations)")
+    ax.grid(color="0.92", lw=0.5, which="major")
+
+
+def fig_r3_depth():
+    """Round three: one-run error against depth at sigma = 0.5, 20k and 50k."""
+    fig, (a, b) = plt.subplots(1, 2, figsize=(W, 2.75), sharey=True)
+    sets = {
+        a: (20000, ["eqr", "relax3_leak1", "relax3_leak2", "relax3_leak3", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"]),
+        b: (50000, ["eqr", "relax3_leak1", "kick_pos", "twinL_leak2", "innerL_self_leak1"]),
+    }
+    for ax, (step, arms) in sets.items():
+        d, s_ = _depth_curve("eqr-released", 50000)
+        ax.plot(d, 1 - s_, ":", marker="D", ms=3, color=C["eqr-released"], label=LABEL["eqr-released"])
+        for arm in arms:
+            d, s_ = _depth_curve(arm, step)
+            ax.plot(d, 1 - s_, marker="o", color=C[arm], label=LABEL[arm], lw=1.6 if arm in ("eqr", "twinL_leak2") else 1.0,
+                    mfc="white" if step == 20000 else None, ms=3.5)
+        _err_axes(ax)
+        ax.legend(loc="lower left", fontsize=6.3, handletextpad=0.3)
+    a.set_ylabel(r"error rate, one run ($\sigma=0.5$)")
+    a.set_title("(a) 20k steps")
+    b.set_title("(b) 50k steps")
+    b.text(0.97, 0.03, "relax $\\delta{=}2$, 50k: error 97% at every depth", transform=b.transAxes, ha="right", va="bottom", fontsize=6.6,
+           color=C["relax3_leak2"])
+    fig.tight_layout(w_pad=0.6)
+    save(fig, "fig_r3_depth")
+
+
+def fig_noisedep():
+    """Depth-256 accuracy at the training noise against sigma = 0.5; arrows 20k -> 50k."""
+    main = {(r[0], r[1]): r[5] for r in T.MAIN}
+    hi = {(r["arm"], r["step"]): r["single"] for r in SC if r["D"] == 256 and r["B"] == 1 and r["noise"] == 0.5}
+    arms = ["eqr", "relax3_leak1", "kick_pos", "relax3_leak2", "relax3_leak3", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"]
+    fig, a = plt.subplots(figsize=(3.6, 3.1))
+    lo_, hi_ = 0.5, 1.0
+    a.plot([lo_, hi_], [lo_, hi_], color="0.5", lw=0.6, ls="--")
+    floor = 0.515
+    for arm in arms:
+        pts = [(st, main.get((arm, st)), hi.get((arm, st))) for st in (20000, 50000)]
+        pts = [p for p in pts if p[1] is not None and p[2] is not None]
+        for st, x, y in pts:
+            yy = max(y, floor)
+            a.plot([x], [yy], "o" if y >= floor else "v", color=C[arm], ms=5.5 if st == 50000 else 5,
+                   mfc="white" if st == 20000 else None, zorder=3)
+        if len(pts) == 2:
+            (_, x0, y0), (_, x1, y1) = pts
+            a.annotate("", xy=(x1, max(y1, floor)), xytext=(x0, y0),
+                       arrowprops=dict(arrowstyle="-|>", color=C[arm], lw=0.8, shrinkA=3, shrinkB=3, mutation_scale=7))
+        a.plot([], [], "o", color=C[arm], label=LABEL[arm])
+    a.text(0.765, 0.517, "relax $\\delta{=}2$, 50k:\n2.6% (off scale)", fontsize=6.3, color=C["relax3_leak2"], ha="left")
+    a.text(0.53, 0.60, "noise helps", fontsize=7, color="0.4", ha="left")
+    a.text(0.80, 0.70, "noise hurts", fontsize=7, color="0.4")
+    a.set_xlim(lo_, hi_)
+    a.set_ylim(lo_, hi_)
+    a.set_xlabel(r"exact, depth 256, training noise $\sigma=0.01$")
+    a.set_ylabel(r"exact, depth 256, test noise $\sigma=0.5$")
+    a.plot([], [], "o", color="0.3", mfc="white", label="20k")
+    a.plot([], [], "o", color="0.3", label="50k")
+    a.legend(loc="upper left", fontsize=6.0, handletextpad=0.1, ncol=1)
+    fig.tight_layout()
+    save(fig, "fig_noisedep")
 
 
 # --------------------------------------------------------------------------------------------- multistart (maps)
@@ -415,7 +490,7 @@ def fig_scale():
 
 
 if __name__ == "__main__":
-    for f in (fig_training, fig_retention, fig_depth, fig_breadth, fig_noise, fig_escape, fig_auroc, fig_spectral, fig_ritz,
+    for f in (fig_training, fig_retention, fig_depth, fig_breadth, fig_r3_depth, fig_noisedep, fig_noise, fig_escape, fig_auroc, fig_spectral, fig_ritz,
               fig_recursion, fig_inner, fig_flip, fig_scale):
         f()
         print("ok", f.__name__)

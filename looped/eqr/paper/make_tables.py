@@ -59,12 +59,13 @@ def last(ms):
 
 def tab_main():
     order = ["eqr", "relax3_leak1", "kick_pos", "relax3_leak4", "kick_learned", "relax3", "kick_fixed",
-             "relax3_leak1_injL", "relax3_leak1_injL_self", "kick_pos_injL"]
+             "relax3_leak1_injL", "relax3_leak1_injL_self", "kick_pos_injL",
+             "relax3_leak2", "relax3_leak3", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"]
     rows = sorted(T.MAIN, key=lambda r: (order.index(r[0]), r[1]))
     lines = []
     prev = None
     for arm, step, cell16, e16, e64, e256, o256, dy in rows:
-        if prev is not None and arm in ("relax3_leak4", "relax3_leak1_injL") and prev != arm:
+        if prev is not None and arm in ("relax3_leak4", "relax3_leak1_injL", "relax3_leak2") and prev != arm:
             lines.append(r"\midrule")
         lines.append(f"{NAME[arm]} & {k(step)} & {pct(e16)} & {pct(cell16)} & {pct(e64)} & {pct(e256)} & {pct(o256)} & {pct(dy)} \\\\")
         prev = arm
@@ -74,17 +75,57 @@ def tab_main():
 def tab_scaling():
     rows = T.scaling_rows()
     keys = [("eqr", 20000), ("eqr", 50000), ("eqr-released", 50000), ("relax3_leak1", 20000), ("relax3_leak1", 50000),
-            ("kick_pos", 20000), ("kick_pos", 50000)]
+            ("kick_pos", 20000), ("kick_pos", 50000), None,
+            ("relax3_leak2", 20000), ("relax3_leak2", 50000), ("relax3_leak3", 20000), ("twinL_leak1", 20000),
+            ("twinL_leak2", 20000), ("twinL_leak2", 50000), ("innerL_self_leak1", 20000), ("innerL_self_leak1", 50000)]
     get = lambda arm, step, D, B, key: next((r[key] for r in rows if r["arm"] == arm and r["step"] == step and r["D"] == D
                                            and r["B"] == B and r["noise"] == 0.5), None)
     lines = []
-    for arm, step in keys:
+    for key in keys:
+        if key is None:
+            lines.append(r"\midrule")
+            continue
+        arm, step = key
         single = [get(arm, step, D, 1, "single") for D in (16, 64, 256, 1024)]
         sel = [get(arm, step, 64, 128, kk) for kk in ("conv1", "convk", "vote", "any")]
-        best = max(v for v in sel if v is not None)
-        cells = [pct(v) for v in single] + [(r"\textbf{" + pct(v) + "}") if v == best and v is not None else pct(v) for v in sel]
+        best = max((v for v in sel[:3] if v is not None), default=None)     # best non-oracle rule
+        cells = [pct(v) for v in single] + [(r"\textbf{" + pct(v) + "}") if i < 3 and v == best and v is not None else pct(v)
+                                    for i, v in enumerate(sel)]
         lines.append(f"{NAME[arm]} & {k(step)} & " + " & ".join(cells) + r" \\")
     write("tab_scaling", "\n".join(lines))
+
+
+def tab_noisedep():
+    """Depth 16 / 256 at the training noise (MAIN, evaluate.py sub/full sets) vs. sigma = 0.5 (scaling, 2048 puzzles)."""
+    rows = T.scaling_rows()
+    main = {(r[0], r[1]): r for r in T.MAIN}
+    get = lambda arm, step, D: next((r["single"] for r in rows if r["arm"] == arm and r["step"] == step and r["D"] == D
+                                     and r["B"] == 1 and r["noise"] == 0.5), None)
+    keys = [("eqr", 20000), ("eqr", 50000), ("relax3_leak1", 20000), ("relax3_leak1", 50000), ("kick_pos", 20000),
+            ("kick_pos", 50000), None, ("relax3_leak2", 20000), ("relax3_leak2", 50000), ("relax3_leak3", 20000),
+            ("twinL_leak1", 20000), ("twinL_leak2", 20000), ("twinL_leak2", 50000), ("innerL_self_leak1", 20000),
+            ("innerL_self_leak1", 50000)]
+    lines = []
+    for key in keys:
+        if key is None:
+            lines.append(r"\midrule")
+            continue
+        arm, step = key
+        m = main[(arm, step)]
+        lo16, lo256 = m[3], m[5]
+        hi16, hi256, hi1024 = get(arm, step, 16), get(arm, step, 256), get(arm, step, 1024)
+        gain = None if hi256 is None else hi256 - lo256
+        g = "--" if gain is None else f"${100 * gain:+.1f}$"
+        lines.append(f"{NAME[arm]} & {k(step)} & {pct(lo16)} & {pct(hi16)} & {pct(lo256)} & {pct(hi256)} & {g} & {pct(hi1024)} \\\\")
+    write("tab_noisedep", "\n".join(lines))
+
+
+def tab_ext50():
+    lines = []
+    for arm, ev, (evmax, stmax), tr, act, cos in T.EXT50:
+        peak = pct(evmax) + ("" if stmax == 49000 else f" ({stmax // 1000}k)")
+        lines.append(f"{NAME[arm]} & {pct(ev)} & {peak} & {pct(tr)} & ${100 * (tr - ev):+.1f}$ & {num(act, 1)} & {num(cos)} \\\\")
+    write("tab_ext50", "\n".join(lines))
 
 
 def tab_rates():
@@ -178,6 +219,7 @@ def tab_round3():
 
 
 if __name__ == "__main__":
-    for f in (tab_main, tab_scaling, tab_rates, tab_select, tab_spectral, tab_escape, tab_lcycles, tab_round3):
+    for f in (tab_main, tab_scaling, tab_noisedep, tab_ext50, tab_rates, tab_select, tab_spectral, tab_escape,
+              tab_lcycles, tab_round3):
         f()
         print("ok", f.__name__)
