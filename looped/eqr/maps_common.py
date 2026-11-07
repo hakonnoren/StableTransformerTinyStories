@@ -38,6 +38,9 @@ def load_model(ckpt_path, data_dir, device, dtype="float32"):
     from pretrain import init_train_state
     from utils.checkpoint import load_ema, load_model_state_dict
 
+    # EqR's evaluate.py / pretrain.py set TF32 matmuls on import ("high"): round-off ~1e-4 instead of float32's
+    # ~1e-7, which hides how far a state has settled. The analysis wants full float32.
+    torch.set_float32_matmul_precision("highest")
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ck["config"]["arch"]["forward_dtype"] = dtype
     config = _base_config(EvalConfig(global_batch_size=64), ck, ckpt_path, rank=0)
