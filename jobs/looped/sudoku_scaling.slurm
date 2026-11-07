@@ -45,6 +45,10 @@
 #   sbatch --time=20:00:00 --export=ALL,RUN_ROOT=...,ARMS="eqr relax3_leak1 kick_pos released",\
 #          CKPT_STEP=20000,GRID="16:1 64:1 256:1 1024:1 1024:16" --array=0-3 jobs/looped/sudoku_scaling.slurm
 #   ("released" has only its 50k checkpoint; CKPT_STEP applies to the trained arms only.)
+# Skyscrapers-7 (sudoku_eqr.slurm with TASK=skyscrapers): the same job on its run root; the data path comes
+# from the checkpoint, and "released" (a Sudoku checkpoint) does not apply:
+#   sbatch --export=ALL,RUN_ROOT=/cluster/work/$USER/eqr_runs/skyscrapers10k_<JOB>,ARMS="eqr twinL_leak2",\
+#          GRID="16:1 64:1 256:1 1024:1 64:16 64:128" --array=0-1 jobs/looped/sudoku_scaling.slurm
 # Then: python looped/eqr/summarize_sudoku.py ${RUN_ROOT}
 # ─────────────────────────────────────────────────────────────────────────────
 

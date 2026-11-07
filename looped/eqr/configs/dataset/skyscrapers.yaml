@@ -1,0 +1,7 @@
+# Skyscrapers-7 on Sudoku's 9x9 board (looped/eqr/skyscrapers.py; built by looped/eqr/build_skyscrapers_dataset.py).
+# Installed into the EqR checkout by looped/eqr/install_overlay.sh. Training-set size: override
+# dataset.data_path (sudoku_eqr.slurm: SKY_DATA=skyscrapers7-1k-aug-8 | skyscrapers7-10k-aug-8).
+name: Skyscrapers-7
+data_path: data/skyscrapers7-10k-aug-8
+
+evaluators: []

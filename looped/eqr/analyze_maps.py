@@ -59,12 +59,39 @@ def sudoku_units(device):
 
 def verify(pred, inputs, units):
     """Conflict count E (Ren & Liu Eq. 7: sum over units/digits of ReLU(count - 1), plus non-digit cells) and the
-    number of changed givens. Tokens: 1 = blank, 2..10 = digits. Valid solution iff both are 0."""
+    number of changed givens. Tokens: 1 = blank, 2..10 = digits. Valid solution iff both are 0.
+    units=None: Skyscrapers-7 (verify_skyscrapers)."""
+    if units is None:
+        return verify_skyscrapers(pred, inputs)
     digit = (pred >= 2) & (pred <= 10)
     oh = F.one_hot((pred - 2).clamp(0, 8), 9) * digit[..., None]
     cnt = oh[:, units].sum(2)
     E = (cnt - 1).clamp(min=0).sum((1, 2)) + (~digit).sum(1)
     clash = ((pred != inputs) & (inputs != 1)).sum(1)
+    return E, clash
+
+
+def verify_skyscrapers(pred, inputs, n=7):
+    """Skyscrapers-7 on the 9x9 board (looped/eqr/skyscrapers.py). E = Latin conflicts of the inner grid (as for
+    Sudoku, rows and columns) + non-height cells + clues whose visible count differs; clash = changed givens.
+    Tokens: 1 = blank / no clue, 2..8 = 1..7. The border of `pred` is ignored (its labels are)."""
+    b = n + 2
+    p = pred.view(-1, b, b)[:, 1:-1, 1:-1].long() - 1                       # heights 1..7 where valid
+    x = inputs.view(-1, b, b).long() - 1                                     # 0 = blank / no clue
+    ok = (p >= 1) & (p <= n)
+    h = torch.where(ok, p, torch.zeros_like(p))
+    oh = F.one_hot(h, n + 1)[..., 1:]                                        # [m, 7, 7, 7]; invalid cells all zero
+    E = (oh.sum(1) - 1).clamp(min=0).sum((1, 2)) + (oh.sum(2) - 1).clamp(min=0).sum((1, 2)) + (~ok).sum((1, 2))
+
+    def seen(lines):                                                         # [m, k, 7] -> buildings seen from index 0
+        prev = torch.cummax(lines, dim=-1).values
+        prev = torch.cat([torch.zeros_like(prev[..., :1]), prev[..., :-1]], dim=-1)
+        return (lines > prev).sum(-1)
+    for vis, clue in ((seen(h), x[:, 1:-1, 0]), (seen(h.flip(-1)), x[:, 1:-1, -1]),
+                      (seen(h.transpose(1, 2)), x[:, 0, 1:-1]), (seen(h.transpose(1, 2).flip(-1)), x[:, -1, 1:-1])):
+        E = E + ((clue > 0) & (vis != clue)).sum(1)
+    given = x[:, 1:-1, 1:-1]
+    clash = ((given > 0) & (p != given)).sum((1, 2))
     return E, clash
 
 
@@ -388,7 +415,8 @@ def main():
     device = mc.pick_device(a.device)
     torch.manual_seed(a.seed)
     inner, config, step = mc.load_model(ckpt, data, device)
-    units = sudoku_units(device)
+    vocab = json.load(open(os.path.join(data, "test", "dataset.json"))).get("vocab_size")
+    units = None if vocab == 9 else sudoku_units(device)          # 9 tokens: Skyscrapers-7 (verify_skyscrapers)
     rec = sorted({int(r) for r in cfg["rec"].split(",")} | {cfg["R"]})
     noises = [0.0] + [float(s) for s in str(cfg["noise"]).split(",") if s]
     res = {"ckpt": ckpt, "run_name": config.run_name, "step": step, "device": str(device), "cfg": cfg,

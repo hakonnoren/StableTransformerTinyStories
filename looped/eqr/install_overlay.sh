@@ -4,6 +4,9 @@
 #   tests_coupled/test_coupled_eqr.py <- looped/eqr/test_coupled_eqr.py
 #   pretrain.py                       <- + pretrain_rate_groups.patch (no weight decay on learned rates)
 #                                        + pretrain_wandb_resume.patch (resume works with wandb >= 0.31)
+#   config/{dataset,train}/*.yaml     <- looped/eqr/configs/ (Skyscrapers-7: dataset/skyscrapers.yaml,
+#                                        train/eqr_skyscrapers.yaml; build the data with
+#                                        looped/eqr/build_skyscrapers_dataset.py --out-root <EqR>/data)
 #
 # Usage: bash looped/eqr/install_overlay.sh <EqR checkout>
 set -euo pipefail
@@ -13,6 +16,9 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cp "${HERE}/coupled_eqr.py" "${EQR_DIR}/models/coupled_eqr.py"
 mkdir -p "${EQR_DIR}/tests_coupled"
 cp "${HERE}/test_coupled_eqr.py" "${EQR_DIR}/tests_coupled/test_coupled_eqr.py"
+for D in dataset train; do
+  for F in "${HERE}/configs/${D}"/*.yaml; do cp "${F}" "${EQR_DIR}/config/${D}/"; done
+done
 
 cd "${EQR_DIR}"
 for P in pretrain_rate_groups.patch pretrain_wandb_resume.patch; do   # in this order

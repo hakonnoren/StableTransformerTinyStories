@@ -75,6 +75,16 @@
 # with CKPT_STEP=20000); arms 15-18, seed 0:
 #   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --time=16:00:00 --array=15-18 jobs/looped/sudoku_eqr.slurm
 #
+# Second task, Skyscrapers-7 (TASK=skyscrapers; looped/eqr/skyscrapers.py): a 7x7 Latin square of heights
+# inside the 9x9 board, visibility clues on the border, 81 tokens as Sudoku; same arms, recipe and evaluation.
+# Run root eqr_runs/skyscrapers_<JOB>, W&B project looped-eqr-skyscrapers. Once, on the login node:
+#   git pull && bash looped/eqr/install_overlay.sh $WORK/EqR          # installs the two configs
+#   python looped/eqr/build_skyscrapers_dataset.py --out-root $WORK/EqR/data --n-train 1000,10000 --n-test 10000 --workers 8
+# Pilot (difficulty and training-set size): EqR on 10k and 1k training puzzles (x 8 symmetries); run roots
+# eqr_runs/skyscrapers10k_<JOB> and skyscrapers1k_<JOB>, run ids <arm>-s<seed>-sky10k-<JOB> etc.:
+#   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-10k-aug-8 --array=0 jobs/looped/sudoku_eqr.slurm
+#   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-1k-aug-8 --array=0 jobs/looped/sudoku_eqr.slurm
+#
 # Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
 # latest one (EqR restores weights, optimiser, EMA, carry, RNG and data position; the W&B run
 # continues). EqR's LR is constant after warmup (lr_min_ratio 1.0), so extending 20k -> 50k
@@ -143,16 +153,29 @@ REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 # submission in place (training is skipped once its final checkpoint exists):
 #   sbatch --export=ALL,JOB_TAG=<old array job id> --array=<task> jobs/looped/sudoku_eqr.slurm
 JOB=${JOB_TAG:-${SLURM_ARRAY_JOB_ID:-local}}
-RUN_ROOT=${RUN_ROOT:-${WORK}/eqr_runs/sudoku_${JOB}}
+# TASK: sudoku (Sudoku-Extreme-1k, EqR's own data) or skyscrapers (Skyscrapers-7 on the same 9x9 board,
+# looped/eqr/skyscrapers.py; SKY_DATA picks the training-set size, built beforehand, see the header).
+TASK=${TASK:-sudoku}
+SKY_DATA=${SKY_DATA:-skyscrapers7-10k-aug-8}
+SKY_TAG=${SKY_DATA#skyscrapers7-}; SKY_TAG=${SKY_TAG%-aug-8}          # 1k | 10k
+case "${TASK}" in
+  sudoku) TASK_ARGS=(); TASK_TAG="" ;;
+  # the training-set size goes into the run root and run ids, so 1k and 10k runs never collide
+  skyscrapers) TASK_ARGS=("++dataset.data_path=data/${SKY_DATA}"); TASK_TAG="sky${SKY_TAG}-" ;;
+  *) echo "FATAL: unknown TASK=${TASK} (sudoku | skyscrapers)"; exit 1 ;;
+esac
+if [[ "${TASK}" == skyscrapers ]]; then RUN_ROOT=${RUN_ROOT:-${WORK}/eqr_runs/skyscrapers${SKY_TAG}_${JOB}}
+else RUN_ROOT=${RUN_ROOT:-${WORK}/eqr_runs/sudoku_${JOB}}; fi
 
 MAX_STEPS=${MAX_STEPS:-20000}
-# In-training eval (whole test set, 16 it., ~30 min each) only feeds the W&B curves; 7000 gives
-# points at 7k and 14k and none at the end, where evaluate.py's full_D16 would duplicate it.
-EVAL_INTERVAL=${EVAL_INTERVAL:-7000}
+# In-training eval (whole test set, 16 it.) only feeds the W&B curves. Sudoku's test set is 423k puzzles
+# (~30 min per eval): 7000 gives points at 7k and 14k and none at the end, where evaluate.py's full_D16
+# would duplicate it. Skyscrapers' test set is 10k puzzles, so evaluate every 2000 steps.
+if [[ "${TASK}" == skyscrapers ]]; then EVAL_INTERVAL=${EVAL_INTERVAL:-2000}; else EVAL_INTERVAL=${EVAL_INTERVAL:-7000}; fi
 SUB_BATCHES=${SUB_BATCHES:-64}
 EVAL_NOISE=${EVAL_NOISE:-0.01}
 read -r -a SEEDS <<< "${SEEDS:-0}"
-WANDB_PROJECT=${WANDB_PROJECT:-looped-eqr-sudoku}
+WANDB_PROJECT=${WANDB_PROJECT:-looped-eqr-${TASK}}
 WANDB_ENTITY=${WANDB_ENTITY:-hakon-noren-ntnu}
 
 COUPLED="arch.name=coupled_eqr@CoupledEqRModel arch.short_name=Coupled"
@@ -190,7 +213,7 @@ A=$(( ID / NS )); SEED=${SEEDS[$(( ID % NS ))]}
 if (( A >= ${#ARMS[@]} )); then echo "no arm for task ${ID}"; exit 1; fi
 ARM=${ARMS[$A]}
 NAME="${ARM}_s${SEED}"
-RUN_ID="${ARM//_/-}-s${SEED}-${JOB}"
+RUN_ID="${ARM//_/-}-s${SEED}-${TASK_TAG}${JOB}"
 
 module load Anaconda3/2024.02-1
 eval "$(conda shell.bash hook)"
@@ -236,6 +259,16 @@ for P in pretrain_rate_groups.patch pretrain_wandb_resume.patch; do
     exit 1
   fi
 done
+if [[ "${TASK}" == skyscrapers ]]; then
+  for F in dataset/skyscrapers.yaml train/eqr_skyscrapers.yaml; do
+    cmp -s "${REPO}/looped/eqr/configs/${F}" "config/${F}" || {
+      log "FATAL: ${EQR_DIR}/config/${F} missing or out of date; rerun bash looped/eqr/install_overlay.sh ${EQR_DIR}"; exit 1; }
+  done
+  [[ -f "data/${SKY_DATA}/train/dataset.json" && -f "data/${SKY_DATA}/test/dataset.json" ]] || {
+    log "FATAL: no ${EQR_DIR}/data/${SKY_DATA}; build it on the login node:"
+    log "  python ${REPO}/looped/eqr/build_skyscrapers_dataset.py --out-root ${EQR_DIR}/data --n-train 1000,10000 --n-test 10000 --workers 8"
+    exit 1; }
+fi
 
 final_ckpt() { ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_${MAX_STEPS}_*.pth 2>/dev/null | head -1; }
 # newest checkpoint of this run id by step number (the path itself has other underscores)
@@ -253,10 +286,10 @@ if [[ -z "$(final_ckpt)" ]]; then
     RESUME_ARGS=("++load_checkpoint='${RESUME}'")    # quoted for Hydra's override grammar
   fi
   # shellcheck disable=SC2086  (intentional word-splitting of ARM_ARGS)
-  WANDB_RUN_ID=${RUN_ID} python pretrain.py --config-name train/eqr_sudoku \
+  WANDB_RUN_ID=${RUN_ID} python pretrain.py --config-name train/eqr_${TASK} \
     ++max_steps=${MAX_STEPS} ++seed=${SEED} eval_interval_steps=${EVAL_INTERVAL} \
     ++project_name=${WANDB_PROJECT} ++entity=${WANDB_ENTITY} ++run_name=${NAME} \
-    ${ARM_ARGS[$A]} "${RESUME_ARGS[@]}" 2>&1 | tr '\r' '\n' | grep -v "it/s\]$\|s/it\]$"
+    "${TASK_ARGS[@]}" ${ARM_ARGS[$A]} "${RESUME_ARGS[@]}" 2>&1 | tr '\r' '\n' | grep -v "it/s\]$\|s/it\]$"
   RC=${PIPESTATUS[0]}
   (( RC != 0 )) && { log "training FAILED (exit ${RC})"; exit "${RC}"; }
 fi

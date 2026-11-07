@@ -1,0 +1,40 @@
+# @package _global_
+# EqR's Sudoku recipe (config/train/eqr_sudoku.yaml) unchanged, on Skyscrapers-7: same 9x9 board and
+# 81-token sequence, token-mixing MLP, no positional encoding. Installed by looped/eqr/install_overlay.sh.
+
+defaults:
+  - /arch: eqr
+  - /dataset: skyscrapers
+  - _self_
+
+hydra:
+  output_subdir: null
+
+global_batch_size: 768
+epochs: 50000
+train_epochs_per_iter: 5000
+eval_interval_steps: 5000
+checkpoint_interval_steps: 5000
+heavy_metrics_log_interval: 2500
+steps_hist_log_interval_steps: 1000
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+target_q_update_every: 4
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_lr: 1e-4
+puzzle_emb_weight_decay: 1.0
+arch:
+  mlp_t: true
+  pos_encodings: none
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+
+load_weights_only: false
+ema: true
+ema_rate: 0.999
+gradient_checkpoint: false
+grad_norm_log_interval_steps: null
