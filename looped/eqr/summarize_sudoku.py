@@ -34,6 +34,7 @@ import torch
 ARM_ORDER = ["eqr-released", "eqr", "kick_fixed", "kick_learned", "relax3", "relax3_leak4", "relax3_leak1",
              "relax3_leak2", "relax3_leak3", "kick_pos", "relax3_leak1_injL", "relax3_leak1_injL_self",
              "kick_pos_injL", "twinL_leak1", "twinL_leak2", "innerL_self_leak1",
+             "twinL_leak3", "twinL_leak10", "twinL_leak2_noise25", "eqr_noise25",
              "relax3_learned", "kick_learned_ch"]
 
 

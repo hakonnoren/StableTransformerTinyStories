@@ -9,7 +9,8 @@ import os
 
 ORDER = ["eqr-released", "eqr", "relax3_leak1", "relax3_leak4", "relax3", "kick_pos", "kick_learned", "kick_fixed",
          "relax3_leak1_injL", "relax3_leak1_injL_self", "kick_pos_injL", "relax3_leak2", "relax3_leak3",
-         "twinL_leak1", "twinL_leak2", "innerL_self_leak1"]
+         "twinL_leak1", "twinL_leak2", "innerL_self_leak1", "twinL_leak3", "twinL_leak10", "twinL_leak2_noise25",
+         "eqr_noise25"]
 
 
 def f(v, nd=3):
@@ -87,6 +88,24 @@ def main():
           "Sudoku agreeing with the givens (label-free). distinct: mean number of different answers over the starts; mixed: "
           "share of puzzles with some but not all starts right; ΔPI: EqR's path-independence gap; endpoint cos: mean pairwise "
           "cosine of the final states of one puzzle's starts. AUROC: how well the score separates right from wrong runs.")
+
+    # 2b. twin copies
+    rows = []
+    for arm, step, r in res:
+        for nk, ms in sorted((r.get("multistart") or {}).items(), key=lambda kv: float(kv[0].split("_")[1])):
+            rl = a.r or str(max(int(k) for k in ms if k.isdigit()))
+            tw = (ms.get(rl) or {}).get("twin")
+            if not tw:
+                continue
+            cell = lambda d, k, nd=3: f(d.get(k), nd) if d else "–"
+            rows.append([lab(arm, step), nk.split("_")[1]] +
+                        [cell(tw.get(c), k) for c in ("correct", "wrong") for k in ("cos_median", "sep_median", "frac_split")])
+    if rows:
+        print(f"\n## Twin copies L, L' at iteration {a.r or 'last'}\n")
+        print(table(["arm", "noise", "cos right", "sep right", "split right", "cos wrong", "sep wrong", "split wrong"], rows))
+        print("\nsep: |L - L'| / (|L| + |L'|) over the whole state (median over runs; 0 merged, 1 opposite); split: share of "
+              "runs with some token above 0.1. Merged copies (sep ~ 0) are fixed points of the self-reading map, split copies its 2-cycles "
+              "(paper Prop. 7-8). With noise, sep includes the independent noise on the two copies.")
 
     # 3. jacobian
     rows = []

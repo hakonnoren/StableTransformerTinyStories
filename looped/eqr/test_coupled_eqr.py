@@ -193,7 +193,7 @@ def _relax(own, cross, f, rate, c):
     return k * own + (1 - k) * (c * cross + f)
 
 
-@pytest.mark.parametrize("leak", [1.0, 2.0])
+@pytest.mark.parametrize("leak", [1.0, 2.0, 3.0, 10.0])
 def test_twin_update_formula(leak):
     """twin_l: L and L' read each other where EqR's L reads itself, H reads their mean, EqR's order."""
     torch.manual_seed(0)
@@ -225,6 +225,26 @@ def test_twin_update_formula(leak):
     assert (Z1 - torch.cat([l, mm], dim=1)).abs().max() < 1e-12
     with pytest.raises(RuntimeError):
         inner.log_volume_per_recursion(9)
+
+
+def test_twin_large_leak_with_merged_copies_is_eqr_form():
+    """twinL_leak10: with L = L' one twin update is a*L + (1-a)*B(L + H + x), EqR's z_L update with
+    lambda = 1 - e^-3 (EqR: 0.95), up to the cross term (1-a)c*L with c = e^-10."""
+    torch.manual_seed(0)
+    m = CoupledEqRModel(dict(_cfg(coupling="relax", rate=3.0, leak=10.0, inject_h=False, schedule="eqr",
+                                  twin_l=True), L_cycles=2))
+    inner = m.inner
+    torch.manual_seed(5)
+    H, L = torch.randn(4, 9, 16, dtype=torch.float64), torch.randn(4, 9, 16, dtype=torch.float64)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    with torch.no_grad():
+        a = math.exp(-3.0)
+        eqr_form = a * L + (1 - a) * inner.L_level(L + H + x, **seq)
+        twin = inner.half_step_twin(L, L.clone(), H, x, seq)
+    assert (twin - eqr_form).abs().max() < 1e-4 * L.abs().max()
+    assert (twin - eqr_form).abs().max() > 0                                          # c = e^-10, not 0
 
 
 def test_eqr_schedule_self_read_formula():

@@ -42,20 +42,38 @@
 #   inner L loop (6 L updates per H, each reading L), which EqR's / TRM's ablations put at ~10 points.
 #   The twin and inner-loop arms put it back; delta 2 / 3 continue the retention trend (1.0 / 0.79 /
 #   0.40 for delta 0 / 1/4 / 1 gave 13 / 47 / 64% exact at 16 iterations, 20k).
+#   -- round four (after round three; looped/eqr/paper, sec. 5.1 and the W&B analysis of 2026-11-07) --
+#   twinL_leak2_noise25  twinL_leak2 trained at noise 0.25 instead of 0.01. Every coupled arm lost noise
+#                     tolerance between 20k and 50k (right answers kept at test noise 0.75: relax 1.00 -> 0.04,
+#                     kick 1.00 -> 0.33; the twin's gain from test noise 0.5 at depth 256: +27 -> -3 points),
+#                     EqR did not. Training at the noise that test-time search uses asks right answers to
+#                     survive it. Hypothesis: keeps the 20k twin's noise-driven depth scaling at 50k.
+#   eqr_noise25       control: EqR trained at noise 0.25.
+#   twinL_leak3       twin with delta = 3 (c = 0.05; merged-copy retention 0.097).
+#   twinL_leak10      twin with delta = 10 (c = 4.5e-5): no cross term, so with merged copies the update is
+#                     EqR's own L <- 0.05 L + 0.95 B(L + H + x) with L read from its twin. delta 1 -> 2 doubled
+#                     the twin's depth exponent at 20k (-0.39 -> -0.78); delta also sets where the copies split
+#                     (merged state loses stability at mu(DB) = -1 - c, paper Prop. 8).
+#   NOTE (noise arms): EqR's in-training eval (the W&B all.* curves) runs at the TRAINING noise, so for the
+#   two noise-0.25 arms those curves are at sigma = 0.25 and not comparable with the other arms'. The
+#   evaluations below (evaluate.py, EVAL_NOISE = 0.01) and sudoku_scaling.slurm set the noise explicitly.
 #
 # Left out to keep the sweep small (both were in the first version of this job):
 #   kick_learned_ch (per-channel learned kick; the PDF has it equal to the scalar one)
 #   relax3_learned  (relax rates learned from 3; the PDF's single-run row, and on the toy
 #                    tasks learned rates changed nothing -- HANDOFF.md §3, phase-4 update)
 #
-# 15 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
-#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 15 arms, seed 0
-#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-44 jobs/looped/sudoku_eqr.slurm   # 3 seeds
+# 19 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
+#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 19 arms, seed 0
+#   sbatch --export=ALL,SEEDS="0 1 2" --array=0-56 jobs/looped/sudoku_eqr.slurm   # 3 seeds
 # Round two, into round 1's run root (one summary table; W&B ids <arm>-s0-25939526):
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=10 jobs/looped/sudoku_eqr.slurm   # self-read diagnostic
 # Round three (arm 9 = relax3_leak2 was killed before it started; rerun it here):
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=9,11-14 jobs/looped/sudoku_eqr.slurm
+# Round four, straight to 50k (checkpoints every 5k, so the 20k one is there for sudoku_scaling.slurm
+# with CKPT_STEP=20000); arms 15-18, seed 0:
+#   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --time=16:00:00 --array=15-18 jobs/looped/sudoku_eqr.slurm
 #
 # Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
 # latest one (EqR restores weights, optimiser, EMA, carry, RNG and data position; the W&B run
@@ -105,7 +123,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --array=0-14
+#SBATCH --array=0-18
 #SBATCH --output=output_sudoku_eqr_%A_%a.txt
 #SBATCH --error=output_sudoku_eqr_%A_%a.err
 
@@ -140,7 +158,9 @@ WANDB_ENTITY=${WANDB_ENTITY:-hakon-noren-ntnu}
 COUPLED="arch.name=coupled_eqr@CoupledEqRModel arch.short_name=Coupled"
 ARMS=(eqr kick_fixed kick_learned relax3 relax3_leak1 relax3_leak4 kick_pos
       relax3_leak1_injL kick_pos_injL relax3_leak2 relax3_leak1_injL_self
-      relax3_leak3 twinL_leak1 twinL_leak2 innerL_self_leak1)
+      relax3_leak3 twinL_leak1 twinL_leak2 innerL_self_leak1
+      twinL_leak2_noise25 eqr_noise25 twinL_leak3 twinL_leak10)
+TWIN="${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.inject_h=false ++arch.schedule=eqr ++arch.twin_l=true"
 ARM_ARGS=(
   ""
   "${COUPLED} ++arch.coupling=kick ++arch.rate=0.005"
@@ -157,7 +177,12 @@ ARM_ARGS=(
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0 ++arch.inject_h=false ++arch.schedule=eqr ++arch.twin_l=true"
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=2.0 ++arch.inject_h=false ++arch.schedule=eqr ++arch.twin_l=true"
   "${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.leak=1.0 ++arch.inject_h=false ++arch.self_read=true ++arch.schedule=eqr"
+  "${TWIN} ++arch.leak=2.0 ++arch.noise_scale=0.25"
+  "++arch.noise_scale=0.25"
+  "${TWIN} ++arch.leak=3.0"
+  "${TWIN} ++arch.leak=10.0"
 )
+(( ${#ARMS[@]} == ${#ARM_ARGS[@]} )) || { echo "FATAL: ${#ARMS[@]} arm names but ${#ARM_ARGS[@]} argument sets"; exit 1; }
 
 ID=${SLURM_ARRAY_TASK_ID:?submit as an array: sbatch jobs/looped/sudoku_eqr.slurm}
 NS=${#SEEDS[@]}

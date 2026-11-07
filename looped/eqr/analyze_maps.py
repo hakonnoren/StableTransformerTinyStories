@@ -215,6 +215,36 @@ def participation_ratio(x):
 
 
 # ------------------------------------------------------------------------------------------- runs
+TWIN_SPLIT_TOKEN = 0.1         # a run's copies count as split if some token has sep > 0.1 (sep defined below)
+
+
+def twin_split(views):
+    """Twin models: per run, how far the copies L, L' are apart (paper Prop. 7c/8: merged copies are the
+    self-map's fixed points; split copies, L != L', its 2-cycles). sep = |L - L'| / (|L| + |L'|) in [0, 1]:
+    0 for merged copies, 1 for opposite ones; over the whole state (twin_sep) and the worst token (twin_tokmax).
+    Empty for models without twins."""
+    if "L2" not in views:
+        return {}
+    Lf, Mf = views["L"].float(), views["L2"].float()                    # [runs, seq, d]
+    sep = lambda a, b, dim: (a - b).norm(dim=dim) / (a.norm(dim=dim) + b.norm(dim=dim)).clamp_min(1e-30)
+    return {"twin_cos": F.cosine_similarity(Lf.flatten(1), Mf.flatten(1), dim=1).cpu(),
+            "twin_sep": sep(Lf.flatten(1), Mf.flatten(1), 1).cpu(),
+            "twin_tokmax": sep(Lf, Mf, -1).amax(dim=1).cpu()}
+
+
+def twin_summary(rec_out):
+    out = {}
+    for cls, m in (("all", torch.ones_like(rec_out["exact"])), ("correct", rec_out["exact"]), ("wrong", ~rec_out["exact"])):
+        if not m.any():
+            out[cls] = None
+            continue
+        sep, tok = rec_out["twin_sep"][m], rec_out["twin_tokmax"][m]
+        out[cls] = {"n": int(m.sum()), "cos_median": float(rec_out["twin_cos"][m].median()),
+                    "sep_median": float(sep.median()), "sep_q90": float(torch.quantile(sep, 0.9)),
+                    "tokmax_median": float(tok.median()), "frac_split": float((tok > TWIN_SPLIT_TOKEN).float().mean())}
+    return out
+
+
 @torch.no_grad()
 def multistart_chunk(inner, batch, B, R, rec, noise, units, device):
     """B random starts per puzzle, R iterations at `noise`; per recorded r, per-run tensors (CPU)."""
@@ -243,7 +273,8 @@ def multistart_chunk(inner, batch, B, R, rec, noise, units, device):
                       "sres": torch.stack(sres_buf).mean(0).cpu(), "q": q.float().cpu(),
                       "sres_last": sres_buf[-1].cpu(),
                       "sres2": (sres2 if sres2 is not None else torch.full_like(sres_buf[-1], float("nan"))).cpu(),
-                      "rms": {k: float(v.float().pow(2).mean().sqrt()) for k, v in views.items()}}
+                      "rms": {k: float(v.float().pow(2).mean().sqrt()) for k, v in views.items()},
+                      **twin_split(views)}
     # endpoint path independence: mean pairwise cosine of the B final states per puzzle
     sn = F.normalize(mc.flat_state(carry).view(n, B, -1), dim=-1)
     gram = sn @ sn.transpose(1, 2)
@@ -289,6 +320,7 @@ def per_puzzle(rec_out, n, B):
         "by_class": {cls: {k: (float(rec_out[k][m].float().median()) if m.any() else None) for k in ("lscore", "sres", "q", "E")}
                      for cls, m in (("correct", rec_out["exact"]), ("wrong", ~rec_out["exact"]))},
         "rms": rec_out["rms"],
+        **({"twin": twin_summary(rec_out)} if "twin_cos" in rec_out else {}),
     }
 
 
@@ -410,6 +442,11 @@ def main():
                 f"r{r}: single {res['multistart'][key][str(r)]['single']:.3f} conv1 {res['multistart'][key][str(r)]['conv1']:.3f} "
                 f"vote {res['multistart'][key][str(r)]['vote']:.3f} any {res['multistart'][key][str(r)]['any']:.3f}" for r in rec[-2:])
                   + f"  ({time.time() - t0:.0f}s)", flush=True)
+            tw = ms.get("twin")
+            if tw:
+                print(f"[multistart] noise {noise:g} twins at r{cfg['R']}: " + "  ".join(
+                    f"{cls}: cos {v['cos_median']:.4f} sep {v['sep_median']:.2e} split {v['frac_split']:.2f}"
+                    for cls, v in tw.items() if v), flush=True)
 
     if "jacobian" not in skip and jac_pool:
         carry = type(jac_pool[0][0])(**{k: torch.cat([getattr(j[0], k) for j in jac_pool]) for k in vars(jac_pool[0][0])})
