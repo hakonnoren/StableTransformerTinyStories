@@ -69,17 +69,30 @@ def test_design_sequence_pairs_are_compatible():
 
 
 def test_tokens_round_trip():
-    db, seq = "((...)).", "GCAAAGCA"
-    x, y = rd.encode_structure(db, 12), rd.encode_sequence(seq, 12)
+    db, seq = "((...)).", "GUAAAACA"                  # pairs (0,6) = GC, (1,5) = UA
+    x, y = rd.encode_structure(db, 12), rd.encode_labels(db, seq, 12)
     assert x.tolist() == [2, 2, 1, 1, 1, 3, 3, 1, 0, 0, 0, 0]
-    assert y.tolist()[:8] == [6, 5, 4, 4, 4, 6, 5, 4] and y[8:].sum() == 0
-    assert rd.decode_structure(x) == db and rd.decode_sequence(y, len(seq)) == seq
-    logits = np.zeros((12, rd.VOCAB_SIZE))
-    logits[:, 1] = 9.0                                 # a structure token wins overall ...
-    logits[:, 6] = 1.0                                 # ... but decoding only looks at A, C, G, U
-    assert rd.decode_sequence(logits, 5) == "GGGGG"
+    GC, UA = rd.PAIR_TOKENS["GC"], rd.PAIR_TOKENS["UA"]
+    assert y.tolist()[:8] == [GC, UA, 4, 4, 4, UA, GC, 4] and y[8:].sum() == 0       # pair type at both ends
+    assert rd.decode_structure(x) == db and rd.decode_sequence(y, db) == seq
+    with pytest.raises(ValueError):
+        rd.encode_labels(db, "GGAAAACA", 12)           # (0,6) = G.C fine, (1,5) = G.A cannot pair
     with pytest.raises(ValueError):
         rd.encode_structure("(" * 13, 12)
+    assert rd.gc_a_design("((...)).") == "GGAAACCA"
+
+
+def test_decode_logits_gives_complementary_pairs():
+    db = "((...))"
+    logits = np.zeros((10, rd.VOCAB_SIZE))
+    logits[:, 1] = 9.0                                 # a structure token wins overall: ignored
+    logits[:, 6] = 5.0                                 # G is the best base everywhere: only used where unpaired
+    k = {p: rd.PAIR_TOKENS[p] for p in rd.PAIRS}
+    logits[0, k["GC"]], logits[0, k["CG"]] = 2.0, 1.9  # 5' end prefers GC slightly ...
+    logits[6, k["CG"]], logits[6, k["GC"]] = 3.0, 0.0  # ... the 3' end prefers CG strongly: the sum picks CG
+    logits[1, k["AU"]], logits[5, k["AU"]] = 1.0, 1.0
+    s = rd.decode_sequence(logits, db)
+    assert s == "CAGGGUG" and all(s[i] + s[j] in rd.PAIRS for i, j in rd.pairs_of(db))
 
 
 @needs_rna
@@ -129,11 +142,14 @@ def test_builder_smoke(tmp_path):
             d = tmp_path / name / split
             meta = json.load(open(d / "dataset.json"))
             x, y = np.load(d / "all__inputs.npy"), np.load(d / "all__labels.npy")
-            assert x.shape == y.shape == (n, 40) and meta["seq_len"] == 40 and meta["vocab_size"] == 8
+            assert x.shape == y.shape == (n, 40) and meta["seq_len"] == 40 and meta["vocab_size"] == rd.VOCAB_SIZE
             assert np.load(d / "all__group_indices.npy").tolist() == list(range(n + 1))
             for xi, yi in zip(x, y):
                 t = rd.decode_structure(xi)
-                assert rd.fold(rd.decode_sequence(yi, len(t)))[0] == t
+                pt = rd.pair_table(t)
+                assert all((yi[i] >= 8) == (pt[i] >= 0) for i in range(len(t)))          # pair tokens exactly at pairs
+                assert all(yi[i] == yi[pt[i]] for i in range(len(t)) if pt[i] >= 0)      # same token at both ends
+                assert rd.fold(rd.decode_sequence(yi, t))[0] == t
     # nested training sets, shared test set
     a = np.load(tmp_path / "rna-L40-12" / "train" / "all__inputs.npy")
     b = np.load(tmp_path / "rna-L40-16" / "train" / "all__inputs.npy")
@@ -144,4 +160,4 @@ def test_builder_smoke(tmp_path):
     e = tmp_path / "rna-eterna100v2-L40" / "test"
     x, y = np.load(e / "all__inputs.npy"), np.load(e / "all__labels.npy")
     assert x.shape == (1, 40) and rd.decode_structure(x[0]) == "((((...))))"
-    assert rd.decode_sequence(y[0], 11) == "GGGGAAACCCC"
+    assert rd.decode_sequence(y[0], "((((...))))") == "GGGGAAACCCC"

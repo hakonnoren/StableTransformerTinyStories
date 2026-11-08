@@ -14,9 +14,10 @@ Every size shares one test set. Targets are unique across all splits and exclude
 One example per puzzle and one puzzle per group (no augmentation: the energy model has no symmetry).
 Each example depends only on --seed and its index, so the output does not depend on --workers.
 
-Tokens: inputs are the target structure ('.', '(', ')' = 1, 2, 3; PAD 0 past its length), labels the
-sequence (A, C, G, U = 4..7; 0 = ignored past its length). The label is one solution among many: score
-predictions by refolding (rna_design.verify), not by agreement with the label.
+Tokens (vocabulary 14): inputs are the target structure ('.', '(', ')' = 1, 2, 3; PAD 0 past its length);
+labels are the base at unpaired positions (A, C, G, U = 4..7) and the pair type at both positions of a pair
+(GC CG AU UA GU UG = 8..13), 0 = ignored past the length (rna_design.encode_labels). The label is one solution
+among many: score predictions by refolding (rna_design.verify), not by agreement with the label.
 """
 import argparse
 import csv
@@ -48,8 +49,8 @@ def _write_split(save_dir, targets, sequences, seq_len):
     os.makedirs(save_dir, exist_ok=True)
     n = len(targets)
     inputs = np.stack([rd.encode_structure(t, seq_len) for t in targets]) if n else np.zeros((0, seq_len), np.uint8)
-    labels = np.stack([rd.encode_sequence(s, seq_len) if s else np.zeros(seq_len, np.uint8) for s in sequences]) \
-        if n else np.zeros((0, seq_len), np.uint8)
+    labels = np.stack([rd.encode_labels(t, s, seq_len) if s else np.zeros(seq_len, np.uint8)
+                       for t, s in zip(targets, sequences)]) if n else np.zeros((0, seq_len), np.uint8)
     arrays = {"inputs": inputs.astype(np.uint8), "labels": labels.astype(np.uint8),
               "puzzle_identifiers": np.zeros(n, dtype=np.int32),
               "puzzle_indices": np.arange(n + 1, dtype=np.int32),

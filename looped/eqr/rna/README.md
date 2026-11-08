@@ -14,15 +14,16 @@ dangles 2, 37 °C), the "Vienna 2" engine of Eterna100-V2. Why it suits EqR (see
 
 ## Status (2026-11-08)
 
-Phase 1 (data) and phase 2 (EqR integration and job) are done and tested on CPU; no GPU run yet. Phases 3–4
-below are not started.
+Phase 1 (data) and phase 2 (EqR integration and job) are done and tested on CPU. The first GPU runs (job
+26000697, per-base labels) learned nothing usable, which led to the pair-type labels below; data built before
+2026-11-08 evening (vocabulary 8) must be rebuilt, and the evaluator refuses it. Phases 3–4 are not started.
 
 | file | role |
 |---|---|
 | `rna_design.py` | task definition: structure utilities, design-like structure sampler, Eterna-style sequence designer, energy-gap adaptive walk, folding / verification (ViennaRNA), token encoding |
 | `build_rna_dataset.py` | EqR-format datasets: nested training sets, one shared test set, optional Eterna100-V2 test set |
-| `rna_refold.py` | EqR evaluator `rna_refold@RNARefold`: refolds predictions, reports `rna/solved`, `rna/bp_dist`, `rna/pairs_ok`, `rna/label_agree`, solved by length; per-target CSV |
-| `test_rna_design.py` | 9 tests, including a builder smoke test (`python -m pytest -q looped/eqr/rna/test_rna_design.py`; needs `pip install ViennaRNA`) |
+| `rna_refold.py` | EqR evaluator `rna_refold@RNARefold`: refolds predictions, reports `rna/solved`, `rna/gc_a_solved` (the beginner-strategy floor on the same targets), `rna/bp_dist`, `rna/pair_gc`, `rna/loop_a`, `rna/label_agree`, solved by length; per-target CSV |
+| `test_rna_design.py` | 10 tests, including a builder smoke test (`python -m pytest -q looped/eqr/rna/test_rna_design.py`; needs `pip install ViennaRNA`) |
 | `test_rna_eqr.py` | 5 tests inside an EqR checkout: the evaluator, and EqR / relax / twin with the attention block on RNA batches |
 
 Elsewhere: `../configs/dataset/rna_design.yaml`, `../configs/train/eqr_rna.yaml`, `../layers_sdpa_fallback.patch`
@@ -50,17 +51,32 @@ A designed sequence folds back into its sampled structure in 67 / 50 / 28% of ca
 differs from the sampled structure. Generation costs about 110 ms per example on one core (3.2 CPU-hours for
 105k examples).
 
-Tokens (shared vocabulary): PAD 0, `.` 1, `(` 2, `)` 3, A 4, C 5, G 6, U 7. Inputs hold the structure, labels the
-sequence, with 0 (ignored) past the target's length. Decode predictions with an argmax over A, C, G, U only
-(`rna_design.decode_sequence`).
+### Labels: one pair type per pair
+
+Tokens (shared vocabulary of 14): PAD 0, `.` 1, `(` 2, `)` 3, bases A C G U = 4–7, pair types GC CG AU UA GU UG =
+8–13 (first letter at the 5' position). Inputs hold the structure. Labels hold the base at unpaired positions and
+the pair type at **both** positions of each pair (`rna_design.encode_labels`), 0 (ignored) past the target's
+length. Decoding (`rna_design.decode_sequence`) takes the argmax over bases at unpaired positions and, for each pair,
+the pair type maximising the sum of both positions' log-probabilities, so every predicted pair is complementary.
+
+Why: the first runs (job 26000697, EqR and the twin on 100k targets) used one base per position. Their training
+label agreement rose to 0.48 by step 200 and stayed there. That is the ceiling of a predictor that only knows
+whether a position is paired (0.474 on generated data; adding helix ends and hairpin positions gives 0.476),
+because the designer orients each pair GC or CG by a coin flip and redraws its composition per example. At both
+ends of a pair the most likely base is then G (0.43 against 0.41–0.42 for C), so the per-position argmax writes
+G·G, which cannot pair: refolded, that predictor solves 0 of 300 generated targets, and the per-position loss gives
+no reason to correlate the two ends. With pair-type labels the same "most common label" predictor is Eterna's
+beginner strategy (GC pairs, A loops), which solves 60% of generated targets (75% up to 64 nt): the floor a model
+now has to beat, reported per evaluation as `rna/gc_a_solved`.
 
 ### Baselines: Eterna100-V2, 66 targets of length ≤ 128 (Vienna 2)
 
-From the benchmark repository's `data/results.tsv` (one trial per puzzle):
+From the benchmark repository's `data/results.tsv` (one trial per puzzle), plus the beginner strategy
+(`rna_design.gc_a_design`, computed here):
 
-| DesiRNA | NEMO | LEARNA (retrained V2) | SentRNA | EternaBrain | RNAinverse |
-|---|---|---|---|---|---|
-| 64 | 59 | 52 | 50 | 35 | 16 |
+| DesiRNA | NEMO | LEARNA (retrained V2) | SentRNA | EternaBrain | RNAinverse | GC pairs, A loops |
+|---|---|---|---|---|---|---|
+| 64 | 59 | 52 | 50 | 35 | 16 | 13 |
 
 ViennaRNA 2.8.0 reproduces the benchmark: 99 of 100 V2 sample solutions fold into their targets (puzzle 100 is
 the known unsolvable one).
@@ -127,8 +143,9 @@ single-start solve rate, any-solved (legitimate here), and the convergence-selec
 Run on the generated test set and on Eterna100-V2.
 
 **4. Questions for the dynamics.**
-- Are predicted pairs complementary? Per-position argmax of marginals can give G·G where the label distribution
-  puts GC and CG at equal odds. Does iteration break this symmetry?
+- Does the model get beyond the beginner strategy? `rna/pair_gc` and `rna/loop_a` near 1 with `rna/solved` near
+  `rna/gc_a_solved` mean it learned only the most common labels. Pair complementarity itself is now guaranteed by
+  the labels and decoding; with per-base labels it was not, and nothing was learned (see Labels).
 - Do random starts reach different correct sequences (many right attractors) or one? Coverage then means
   something different than on Sudoku.
 - Does convergence still pick solved starts when wrong candidates can be stable?

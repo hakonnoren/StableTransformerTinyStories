@@ -185,7 +185,8 @@ run_dir, step, tag = sys.argv[1:]
 for f in sorted(glob.glob(f"{run_dir}/eval_preds/step_{step}_{tag}_*/eval_metrics_step_*.json")):
     m = json.load(open(f))["metrics"]
     g = lambda k: m.get(f"rna/{k}", float("nan"))
-    print(f"  {tag}: solved {g('solved'):.3f}  bp_dist {g('bp_dist'):.3f}  pairs_ok {g('pairs_ok'):.3f}  n {g('n'):.0f}")
+    print(f"  {tag}: solved {g('solved'):.3f} (GC/A floor {g('gc_a_solved'):.3f})  bp_dist {g('bp_dist'):.3f}  "
+          f"pair_gc {g('pair_gc'):.2f}  loop_a {g('loop_a'):.2f}  n {g('n'):.0f}")
 EOF
 }
 run_eval() {   # tag depth [further evaluate.py overrides]

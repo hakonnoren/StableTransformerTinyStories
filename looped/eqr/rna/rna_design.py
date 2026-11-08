@@ -14,9 +14,13 @@ Training pairs are self-consistent by construction (`make_example`):
 The target is therefore always designable and the label is one of its solutions. `mode="random"` replaces
 steps 1-2 by a uniformly random sequence (natural-looking but loosely structured folds).
 
-Tokens (shared vocabulary, as EqR expects): PAD 0, '.' 1, '(' 2, ')' 3, A 4, C 5, G 6, U 7. Inputs carry
-the structure, labels the sequence; positions past the target's length are PAD in the input and 0 (ignored)
-in the label.
+Tokens (shared vocabulary, as EqR expects): PAD 0, '.' 1, '(' 2, ')' 3, bases A C G U = 4..7, pair types
+GC CG AU UA GU UG = 8..13 (first letter at the 5' position of the pair). Inputs carry the structure. Labels
+carry the base at unpaired positions and the pair type at BOTH positions of a pair (`encode_labels`), and
+decoding combines the two positions of each pair (`decode_sequence`), so every predicted pair is
+complementary. With one base per position instead, the training labels' coin-flip orientation (GC or CG)
+makes the per-position argmax G at both ends (G.G, no pair): a run plateaued at the marginal ceiling and
+solved nothing (README). Positions past the target's length are PAD in the input and 0 (ignored) in the label.
 """
 from __future__ import annotations
 
@@ -32,10 +36,12 @@ except ImportError:  # the structure utilities work without it; folding does not
 PAD = 0
 STRUCT_TOKENS = {".": 1, "(": 2, ")": 3}
 NUC_TOKENS = {"A": 4, "C": 5, "G": 6, "U": 7}
-VOCAB_SIZE = 8
-ID_TO_CHAR = {v: k for k, v in {**STRUCT_TOKENS, **NUC_TOKENS}.items()}
 NUCS = "ACGU"
 PAIRS = ("GC", "CG", "AU", "UA", "GU", "UG")          # canonical + wobble pairs ViennaRNA allows
+PAIR_TOKENS = {p: 8 + k for k, p in enumerate(PAIRS)}  # pair type, first letter at the 5' position
+VOCAB_SIZE = 14
+ID_TO_CHAR = {v: k for k, v in {**STRUCT_TOKENS, **NUC_TOKENS}.items()}
+ID_TO_PAIR = {v: k for k, v in PAIR_TOKENS.items()}
 MIN_HAIRPIN = 3                                        # ViennaRNA's minimum hairpin loop
 
 
@@ -382,11 +388,22 @@ def encode_structure(db: str, seq_len: int) -> np.ndarray:
     return out
 
 
-def encode_sequence(seq: str, seq_len: int) -> np.ndarray:
+def encode_labels(target: str, seq: str, seq_len: int) -> np.ndarray:
+    """Label tokens of a solution `seq` of `target`: the base at unpaired positions, the pair type at both
+    positions of every pair. Raises ValueError if a pair of `seq` cannot pair."""
+    if len(seq) != len(target):
+        raise ValueError("sequence and structure differ in length")
     if len(seq) > seq_len:
         raise ValueError(f"sequence of length {len(seq)} > seq_len {seq_len}")
     out = np.zeros(seq_len, dtype=np.uint8)
-    out[:len(seq)] = [NUC_TOKENS[c] for c in seq]
+    for i, j in enumerate(pair_table(target)):
+        if j < 0:
+            out[i] = NUC_TOKENS[seq[i]]
+        else:
+            a, b = min(i, j), max(i, j)
+            if seq[a] + seq[b] not in PAIR_TOKENS:
+                raise ValueError(f"positions {a}, {b} hold {seq[a]}{seq[b]}, which cannot pair")
+            out[i] = PAIR_TOKENS[seq[a] + seq[b]]
     return out
 
 
@@ -400,12 +417,46 @@ def decode_structure(ids) -> str:
     return "".join(out)
 
 
-def decode_sequence(ids_or_logits, length: int) -> str:
-    """Sequence from predicted token ids, or from logits over the vocabulary (argmax over A, C, G, U only,
-    so a prediction is always a valid sequence). Token ids outside A..U decode as 'A'."""
+def _log_softmax(x: np.ndarray) -> np.ndarray:
+    m = x.max(-1, keepdims=True)
+    return x - m - np.log(np.exp(x - m).sum(-1, keepdims=True))
+
+
+def decode_sequence(ids_or_logits, target: str) -> str:
+    """Sequence for `target` from label / predicted token ids, or from logits over the vocabulary.
+
+    Logits (seq_len, vocab): unpaired positions take the argmax over the bases; a pair (i, j) takes the pair
+    type maximising log p_i(type) + log p_j(type) over the six pair types, so every pair is complementary.
+    Ids: the pair token at i (else at j); a pair with no pair token on either side decodes as A.A (no pair),
+    a non-base token at an unpaired position as A.
+    """
+    pt = pair_table(target)
+    n = len(target)
     x = np.asarray(ids_or_logits)
-    if x.ndim == 2:                                   # logits: (seq_len, vocab)
-        ids = 4 + x[:length, 4:8].argmax(-1)
+    seq = ["A"] * n
+    if x.ndim == 2:
+        x = x[:n].astype(np.float64)
+        pair_lp = _log_softmax(x[:, 8:14])
+        for i, j in enumerate(pt):
+            if j < 0:
+                seq[i] = NUCS[int(x[i, 4:8].argmax())]
+            elif j > i:
+                p = PAIRS[int((pair_lp[i] + pair_lp[j]).argmax())]
+                seq[i], seq[j] = p[0], p[1]
     else:
-        ids = x[:length]
-    return "".join(ID_TO_CHAR.get(int(t), "A") if 4 <= int(t) <= 7 else "A" for t in ids)
+        ids = [int(t) for t in x[:n]]
+        for i, j in enumerate(pt):
+            if j < 0:
+                seq[i] = ID_TO_CHAR[ids[i]] if 4 <= ids[i] <= 7 else "A"
+            elif j > i:
+                p = ID_TO_PAIR.get(ids[i]) or ID_TO_PAIR.get(ids[j]) or "AA"
+                seq[i], seq[j] = p[0], p[1]
+    return "".join(seq)
+
+
+def gc_a_design(target: str) -> str:
+    """Eterna's beginner strategy: every pair GC (G at the 5' position), every unpaired base A. The floor a
+    model has to beat: close to what predicting the most common label everywhere gives (GC and CG are about
+    equally common; with CG everywhere instead the solve rate is similar)."""
+    pt = pair_table(target)
+    return "".join("A" if j < 0 else ("G" if j > i else "C") for i, j in enumerate(pt))

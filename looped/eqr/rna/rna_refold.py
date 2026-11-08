@@ -6,13 +6,16 @@ compare a prediction with the training label, which is one solution among many. 
 
 Reported under "rna" (evaluate.py writes rna/<metric>; with breadth > 1 EqR passes the first start only):
   solved                  MFE structure of the prediction == target (Eterna's criterion)
+  gc_a_solved             the same for Eterna's beginner strategy (GC pairs, A loops) on the same targets: the floor
   bp_dist                 base-pair distance of the prediction's MFE structure to the target / length
-  pairs_ok                share of target pairs whose two predicted bases can pair (GC, AU, GU)
-  label_agree             share of positions equal to the training label (where the target has one)
+  pair_gc                 share of predicted pairs that are GC or CG
+  loop_a                  share of unpaired positions predicted A (pair_gc = loop_a = 1 is the beginner strategy)
+  label_agree             share of positions whose base equals the training label's (where the target has one)
   solved_len<lo>-<hi>     `solved` by target length
   n                       targets scored
-Predictions are decoded with an argmax over A, C, G, U only, so every prediction is a sequence. With a save path
-(evaluate.py's eval dir) it writes rna_refold.csv with one row per target.
+Predictions are decoded with the target structure (rna_design.decode_sequence: bases at unpaired positions, one
+pair type per pair from both positions' logits), so every pair is complementary. With a save path (evaluate.py's
+eval dir) it writes rna_refold.csv with one row per target.
 """
 import csv
 import os
@@ -43,16 +46,16 @@ class RNARefold:
     def update_batch(self, batch, preds):
         if "logits" not in preds:
             raise KeyError("RNARefold needs the model's logits (required_outputs = {'logits'})")
-        ids = (4 + preds["logits"][..., 4:8].float().argmax(-1)).cpu().numpy()
+        logits = preds["logits"].float().cpu().numpy()
         inputs = batch["inputs"].cpu().numpy()
         labels = batch["labels"].cpu().numpy()
-        for x, p, y in zip(inputs, ids, labels):
+        for x, lg, y in zip(inputs, logits, labels):
             target = rd.decode_structure(x)
             if not target:                              # padding rows of a last, partial batch
                 continue
             n = len(target)
-            label = rd.decode_sequence(y, n) if (y[:n] >= 4).all() else ""
-            self.rows.append((target, rd.decode_sequence(p, n), label))
+            label = rd.decode_sequence(y, target) if (y[:n] >= 4).all() else ""
+            self.rows.append((target, rd.decode_sequence(lg, target), label))
 
     def result(self, save_path=None, rank=0, world_size=1, group=None):
         rows = self.rows
@@ -65,18 +68,28 @@ class RNARefold:
         if not rows:
             return {}
         out = []
+        n_pairs = n_gc = n_loop = n_a = 0
         for target, pred, label in rows:
             v = rd.verify(pred, target)
-            pairs = rd.pairs_of(target)
+            pt = rd.pair_table(target)
+            for i, j in enumerate(pt):
+                if j < 0:
+                    n_loop += 1
+                    n_a += pred[i] == "A"
+                elif j > i:
+                    n_pairs += 1
+                    n_gc += pred[i] + pred[j] in ("GC", "CG")
             out.append({"length": len(target), "solved": v["solved"], "bp_distance": v["bp_distance"],
-                        "pairs_ok": np.mean([pred[i] + pred[j] in rd.PAIRS for i, j in pairs]) if pairs else 1.0,
+                        "gc_a_solved": rd.verify(rd.gc_a_design(target), target)["solved"],
                         "label_agree": np.mean([a == b for a, b in zip(pred, label)]) if label else np.nan,
                         "target": target, "prediction": pred, "label": label, "structure": v["structure"]})
         lengths = np.array([r["length"] for r in out])
         solved = np.array([r["solved"] for r in out], dtype=float)
         metrics = {"solved": float(solved.mean()),
+                   "gc_a_solved": float(np.mean([r["gc_a_solved"] for r in out])),
                    "bp_dist": float(np.mean([r["bp_distance"] / r["length"] for r in out])),
-                   "pairs_ok": float(np.mean([r["pairs_ok"] for r in out])),
+                   "pair_gc": n_gc / max(n_pairs, 1),
+                   "loop_a": n_a / max(n_loop, 1),
                    "n": float(len(out))}
         agree = [r["label_agree"] for r in out if not np.isnan(r["label_agree"])]
         if agree:
@@ -91,9 +104,9 @@ class RNARefold:
             os.makedirs(save_path, exist_ok=True)
             with open(os.path.join(save_path, "rna_refold.csv"), "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["length", "solved", "bp_distance", "pairs_ok", "target", "prediction", "mfe_structure",
+                w.writerow(["length", "solved", "gc_a_solved", "bp_distance", "target", "prediction", "mfe_structure",
                             "label"])
                 for r in out:
-                    w.writerow([r["length"], int(r["solved"]), r["bp_distance"], f"{r['pairs_ok']:.3f}",
+                    w.writerow([r["length"], int(r["solved"]), int(r["gc_a_solved"]), r["bp_distance"],
                                 r["target"], r["prediction"], r["structure"], r["label"]])
         return {"rna": metrics}

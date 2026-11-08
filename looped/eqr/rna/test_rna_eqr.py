@@ -26,14 +26,16 @@ pytestmark = pytest.mark.skipif(rd.RNA is None, reason="ViennaRNA not installed"
 SEQ_LEN = 16
 
 
-def _onehot_logits(seqs, struct_noise=True):
-    """Logits that decode to `seqs`; structure tokens get even larger logits, which decoding must ignore."""
-    x = torch.zeros(len(seqs), SEQ_LEN, rd.VOCAB_SIZE)
-    for b, s in enumerate(seqs):
-        for i, c in enumerate(s):
-            x[b, i, rd.NUC_TOKENS[c]] = 5.0
-    if struct_noise:
-        x[..., rd.STRUCT_TOKENS["("]] = 9.0
+def _label_logits(pairs):
+    """Logits whose argmax is the label encoding of each (target, sequence); a structure token gets an even
+    larger logit everywhere, which decoding must ignore. (None, None) gives an all-zero padding row."""
+    x = torch.zeros(len(pairs), SEQ_LEN, rd.VOCAB_SIZE)
+    for b, (t, s) in enumerate(pairs):
+        if t is None:
+            continue
+        for i, tok in enumerate(rd.encode_labels(t, s, SEQ_LEN)[:len(t)]):
+            x[b, i, int(tok)] = 5.0
+        x[b, :, rd.STRUCT_TOKENS["("]] = 9.0
     return x
 
 
@@ -41,20 +43,22 @@ def test_evaluator_scores_by_refolding(tmp_path):
     t0, t1 = "((((...))))", "((((((....))))))"
     inputs = torch.stack([torch.from_numpy(rd.encode_structure(t, SEQ_LEN)) for t in (t0, t1)]
                          + [torch.zeros(SEQ_LEN, dtype=torch.uint8)])               # a padding row
-    labels = torch.stack([torch.from_numpy(rd.encode_sequence(s, SEQ_LEN)) for s in ("GGGGAAACCCC", "G" * 6 + "A" * 4 + "C" * 6)]
+    labels = torch.stack([torch.from_numpy(rd.encode_labels(t, s, SEQ_LEN))
+                          for t, s in ((t0, "GGGGAAACCCC"), (t1, "GGGGGGAAAACCCCCC"))]
                          + [torch.zeros(SEQ_LEN, dtype=torch.uint8)])
-    preds = {"logits": _onehot_logits(["GGGGAAACCCC", "A" * 16, ""])}               # right, wrong, padding
+    # right; complementary but too weak (GU pairs: unfolded); padding
+    preds = {"logits": _label_logits([(t0, "GGGGAAACCCC"), (t1, "GGGGGGAAAAUUUUUU"), (None, None)])}
     ev = RNARefold(data_path=None, eval_metadata=types.SimpleNamespace(vocab_size=rd.VOCAB_SIZE))
     assert ev.required_outputs == {"logits"}
     ev.begin_eval()
     ev.update_batch({"inputs": inputs, "labels": labels}, preds)
     m = ev.result(str(tmp_path))["rna"]
-    assert m["n"] == 2 and m["solved"] == 0.5
-    assert m["pairs_ok"] == 0.5                       # poly-A pairs nothing
-    assert m["label_agree"] == pytest.approx((1.0 + 4 / 16) / 2)
+    assert m["n"] == 2 and m["solved"] == 0.5 and m["gc_a_solved"] == 1.0
+    assert m["pair_gc"] == pytest.approx(4 / 10) and m["loop_a"] == 1.0
+    assert m["label_agree"] == pytest.approx((1.0 + 10 / 16) / 2)
     assert m["solved_len1-32"] == 0.5
     rows = list(csv.DictReader(open(tmp_path / "rna_refold.csv")))
-    assert [r["solved"] for r in rows] == ["1", "0"] and rows[0]["prediction"] == "GGGGAAACCCC"
+    assert [r["solved"] for r in rows] == ["1", "0"] and rows[1]["prediction"] == "GGGGGGAAAAUUUUUU"
     ev.begin_eval()
     assert ev.result(None) == {}                     # nothing seen since begin_eval
     with pytest.raises(ValueError):
@@ -72,7 +76,7 @@ def _rna_batch(b=4, seed=0):
     ts = [rd.sample_structure(rng, int(rng.integers(12, 25))) for _ in range(b)]
     seqs = [rd.design_sequence(rng, t) for t in ts]
     return {"inputs": torch.from_numpy(np.stack([rd.encode_structure(t, 24) for t in ts])).long(),
-            "labels": torch.from_numpy(np.stack([rd.encode_sequence(s, 24) for s in seqs])).long(),
+            "labels": torch.from_numpy(np.stack([rd.encode_labels(t, s, 24) for t, s in zip(ts, seqs)])).long(),
             "puzzle_identifiers": torch.zeros(b, dtype=torch.int32)}
 
 
