@@ -41,6 +41,7 @@ import sys
 from types import SimpleNamespace
 
 import torch
+import torch.nn.attention  # noqa: F401  (sdpa_kernel for the JVPs)
 
 R_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
@@ -225,7 +226,9 @@ def spectral_radius(model, batch, carry, n_rho, device, iters=60, keep=20):
         v = v / bcast(v.flatten(1).norm(dim=1))
         logs = []
         for k in range(iters):
-            _, jv = torch.func.jvp(f, (s,), (v,))
+            # the attention block (RNA) needs SDPA's math kernel: the fused kernels have no forward-mode AD
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                _, jv = torch.func.jvp(f, (s,), (v,))
             n = jv.flatten(1).norm(dim=1).clamp_min(1e-30)
             if k >= iters - keep:
                 logs.append(torch.log(n))

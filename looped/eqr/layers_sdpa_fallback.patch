@@ -1,0 +1,17 @@
+diff --git a/models/layers.py b/models/layers.py
+index 271c3c8..db5ede7 100644
+--- a/models/layers.py
++++ b/models/layers.py
+@@ -146,9 +146,9 @@ class Attention(nn.Module):
+         k = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
+         v = qkv[:, :, self.num_heads + self.num_key_value_heads :]
+         q, k = self._apply_rope(cos_sin, q, k)
+-        if q.is_cuda and self.head_dim % 8 == 0:
+-            if flash_attn_func is None:
+-                colored_exception(RuntimeError, "flash_attn is not installed but CUDA attention was requested.")
++        # overlay (layers_sdpa_fallback.patch): without FlashAttention, use PyTorch's SDPA below
++        # (it runs a flash kernel on Ampere/Hopper) instead of refusing to run.
++        if q.is_cuda and self.head_dim % 8 == 0 and flash_attn_func is not None:
+             y = flash_attn_func(q=q, k=k, v=v, causal=self.causal)
+             if isinstance(y, tuple):
+                 y = y[0]

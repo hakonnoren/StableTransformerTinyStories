@@ -35,6 +35,7 @@ import sys
 import time
 
 import torch
+import torch.nn.attention  # noqa: F401  (sdpa_kernel for the JVPs)
 import torch.nn.functional as F
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -133,7 +134,9 @@ def outer_map(inner, x, seq, n_h):
 
 def jvp(f, s, v):
     try:
-        return torch.func.jvp(f, (s,), (v,))[1]
+        # the attention block (RNA) needs SDPA's math kernel: the fused kernels have no forward-mode AD
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            return torch.func.jvp(f, (s,), (v,))[1]
     except Exception:                                    # e.g. an op without forward-mode AD on this device
         eps = 1e-3 * s.flatten(1).norm(dim=1) / v.flatten(1).norm(dim=1).clamp_min(1e-30)
         eps = eps.view(-1, *([1] * (s.dim() - 1)))

@@ -1,0 +1,45 @@
+# @package _global_
+# EqR on RNA inverse folding (looped/eqr/rna). Pairing partners change from target to target, so this uses
+# EqR's attention block with 1D RoPE (as on Maze), not the token-mixing MLP of the Sudoku recipe; on CUDA
+# without FlashAttention it needs layers_sdpa_fallback.patch. Otherwise the Sudoku recipe at the same width
+# (lr 1e-4, weight decay 1.0, EMA), which was tuned for 1k training puzzles, not 100k: a starting point.
+# Installed by looped/eqr/install_overlay.sh.
+
+defaults:
+  - /arch: eqr
+  - /dataset: rna_design
+  - _self_
+
+hydra:
+  output_subdir: null
+
+global_batch_size: 768
+epochs: 50000
+train_epochs_per_iter: 5000
+eval_interval_steps: 2000
+checkpoint_interval_steps: 5000
+heavy_metrics_log_interval: 2500
+steps_hist_log_interval_steps: 1000
+
+lr: 1e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 2000
+target_q_update_every: 4
+beta1: 0.9
+beta2: 0.95
+weight_decay: 1.0
+puzzle_emb_lr: 1e-4
+puzzle_emb_weight_decay: 1.0
+arch:
+  mlp_t: false
+  pos_encodings: rope
+  board_height: null
+  board_width: null
+  puzzle_emb_ndim: 512
+  puzzle_emb_len: 16
+
+load_weights_only: false
+ema: true
+ema_rate: 0.999
+gradient_checkpoint: false
+grad_norm_log_interval_steps: null

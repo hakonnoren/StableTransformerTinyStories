@@ -11,8 +11,9 @@
 #   1. clone github.com/locuslab/EqR at the pinned commit into $EQR_DIR
 #   2. install the overlay (looped/eqr/install_overlay.sh)
 #   3. create a conda env at $EQR_ENV with torch + EqR's requirements
-#      (minus flash_attn_3: the Sudoku model mixes tokens with an MLP, no attention;
-#       plus exceptiongroup, which EqR imports but does not list)
+#      (minus flash_attn_3: the Sudoku model mixes tokens with an MLP, no attention, and the RNA model's
+#       attention falls back to PyTorch SDPA via layers_sdpa_fallback.patch;
+#       plus exceptiongroup, which EqR imports but does not list, and ViennaRNA for the RNA task)
 #   4. build adam-atan2 with its CUDA backend (EqR's optimiser; training refuses to
 #      run without it). Needs nvcc: loads $CUDA_MODULE and builds for A100 + H100.
 #   5. download EqR's data (locuslab/EqR-data) and the released Sudoku checkpoint
@@ -73,7 +74,8 @@ if ! python -c "import torch; assert torch.__version__.startswith('${TORCH_VERSI
   pip install -q "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX}"
 fi
 pip install -q numpy pydantic omegaconf hydra-core wandb coolname psutil tqdm pyyaml argdantic colorama \
-  huggingface_hub exceptiongroup matplotlib plotly pandas scipy scikit-learn pytest
+  huggingface_hub exceptiongroup matplotlib plotly pandas scipy scikit-learn pytest \
+  ViennaRNA==2.8.0   # RNA inverse folding (looped/eqr/rna): folding for data, evaluator and tests
 log "torch $(python -c 'import torch; print(torch.__version__, torch.version.cuda)')"
 
 # 4. adam-atan2 with CUDA backend ----------------------------------------------
@@ -113,5 +115,5 @@ for split in ("train", "test"):
 PY
 
 # 6. overlay tests (CPU) --------------------------------------------------------
-python -m pytest -q tests_coupled/test_coupled_eqr.py
+python -m pytest -q tests_coupled/          # test_coupled_eqr.py and test_rna_eqr.py
 log "setup done: EQR_DIR=${EQR_DIR} EQR_ENV=${EQR_ENV}. Next: sbatch jobs/looped/eqr_sanity.slurm"

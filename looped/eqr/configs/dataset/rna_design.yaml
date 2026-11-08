@@ -1,0 +1,9 @@
+# RNA inverse folding (looped/eqr/rna; built by looped/eqr/rna/build_rna_dataset.py): target structure in,
+# sequence out, scored by refolding (evaluators/rna_refold.py). Installed into the EqR checkout by
+# looped/eqr/install_overlay.sh. Training-set size: override dataset.data_path
+# (sudoku_eqr.slurm: RNA_DATA=rna-L128-10k | rna-L128-100k).
+name: RNA-design
+data_path: data/rna-L128-100k
+
+evaluators:
+  - name: rna_refold@RNARefold
