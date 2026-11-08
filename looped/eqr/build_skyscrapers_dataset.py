@@ -69,6 +69,11 @@ def main():
     a = ap.parse_args()
     sizes = sorted(int(s) for s in a.n_train.split(","))
     need = a.n_test + sizes[-1]
+    # fail now, not after the generation (an unset $WORK in --out-root gave /EqR/data once)
+    os.makedirs(a.out_root, exist_ok=True)
+    if not os.access(a.out_root, os.W_OK):
+        raise SystemExit(f"cannot write to {a.out_root}")
+    print(f"[out] {os.path.abspath(a.out_root)}", flush=True)
 
     t0 = time.time()
     kept, seen, i0 = [], set(), 0

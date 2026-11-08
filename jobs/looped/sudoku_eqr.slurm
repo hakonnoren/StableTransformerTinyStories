@@ -78,8 +78,8 @@
 # Second task, Skyscrapers-7 (TASK=skyscrapers; looped/eqr/skyscrapers.py): a 7x7 Latin square of heights
 # inside the 9x9 board, visibility clues on the border, 81 tokens as Sudoku; same arms, recipe and evaluation.
 # Run root eqr_runs/skyscrapers_<JOB>, W&B project looped-eqr-skyscrapers. Once, on the login node:
-#   git pull && bash looped/eqr/install_overlay.sh $WORK/EqR          # installs the two configs
-#   python looped/eqr/build_skyscrapers_dataset.py --out-root $WORK/EqR/data --n-train 1000,10000 --n-test 10000 --workers 8
+#   git pull && bash looped/eqr/install_overlay.sh /cluster/work/$USER/EqR          # installs the two configs
+#   python looped/eqr/build_skyscrapers_dataset.py --out-root /cluster/work/$USER/EqR/data --n-train 1000,10000 --n-test 10000 --workers 8
 # Pilot (difficulty and training-set size): EqR on 10k and 1k training puzzles (x 8 symmetries); run roots
 # eqr_runs/skyscrapers10k_<JOB> and skyscrapers1k_<JOB>, run ids <arm>-s<seed>-sky10k-<JOB> etc.:
 #   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-10k-aug-8 --array=0 jobs/looped/sudoku_eqr.slurm
@@ -90,7 +90,7 @@
 # 20k steps instead of ~15. A 100k set (800k examples) matches Sudoku; the build is nested and keeps the same
 # test set and the 1k/10k sets as prefixes (~0.17 s per puzzle per core, ~20 min on 16 cores):
 #   srun --account=share-ie-imf --partition=CPUQ --cpus-per-task=16 --mem=16G --time=01:00:00 \
-#     python looped/eqr/build_skyscrapers_dataset.py --out-root $WORK/EqR/data --n-train 1000,10000,100000 --n-test 10000 --workers 16
+#     python looped/eqr/build_skyscrapers_dataset.py --out-root /cluster/work/$USER/EqR/data --n-train 1000,10000,100000 --n-test 10000 --workers 16
 #   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-100k-aug-8 --array=0,17 jobs/looped/sudoku_eqr.slurm
 #
 # Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
