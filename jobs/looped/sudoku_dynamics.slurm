@@ -10,7 +10,9 @@
 # Per run it writes <run dir>/dynamics.json: learned rates at every checkpoint, the
 # noise-free trajectory of 768 test puzzles to 256 iterations (fixed-point and 2-cycle
 # fractions, overthinking, changed predictions, stop-signal rate) and the spectral
-# radius of one iteration at the final state. Uses each run's LAST checkpoint.
+# radius of one iteration at the final state. Uses each run's LAST checkpoint. Runs that already
+# have dynamics.json are skipped (REDO=1 redoes them). Before f5283a1 (2026-11-08) the spectral radius
+# ran out of GPU memory, so no run had one; this job backfills them.
 # ─────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=sudoku_dyn
@@ -21,7 +23,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=output_sudoku_dyn_%j.txt
 #SBATCH --error=output_sudoku_dyn_%j.err
 
@@ -46,6 +48,7 @@ for RUN in "${RUN_ROOT}"/outputs/*/*/*/; do
   CKPT=$(ls "${RUN}"checkpoints/step_*_*.pth 2>/dev/null \
          | awk '{f=$0; sub(/.*\/step_/, "", f); split(f, a, "_"); print a[1], $0}' | sort -n | tail -1 | cut -d' ' -f2-)
   [[ -z "${CKPT}" ]] && continue
+  [[ -f "${RUN}dynamics.json" && "${REDO:-0}" != 1 ]] && { echo "[$(date -Is)] ${RUN}: already done"; continue; }
   echo "[$(date -Is)] ${CKPT}"
   python "${REPO}/looped/eqr/dynamics_eqr.py" --eqr-dir "${EQR_DIR}" --ckpt "${CKPT}" 2>&1 \
     | grep -E "^\[rates\]|^\[dynamics\]|Error|Traceback"
