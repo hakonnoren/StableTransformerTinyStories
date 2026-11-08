@@ -194,6 +194,8 @@ def trajectory(model, batch, r_max, device):
     return out, carry
 
 
+@torch.no_grad()   # the weights require grad: without this every JVP also tapes a backward graph, and v carries
+                   # all 60 of them along (CUDA OOM on 80 GB at n_rho = 32). Forward-mode JVP is unaffected.
 def spectral_radius(model, batch, carry, n_rho, device, iters=60, keep=20):
     from models.eqr import LatentCarry
     inner = model.model.inner
