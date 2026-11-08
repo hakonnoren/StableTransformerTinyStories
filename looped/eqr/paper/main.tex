@@ -111,10 +111,11 @@ checkpoints (\S\ref{sec:maps}), guided by a small amount of theory (\S\ref{sec:t
 
 \paragraph{Summary of findings.}
 \begin{enumerate}[leftmargin=*,itemsep=1pt]
-\item \textbf{Certification is easy; coverage is hard.} In every working model right answers are attracting fixed points
-($\rho<1$) and wrong end states are not ($\rho>1$). Convergence, the halting head and a Sudoku validity check therefore pick
-the right start almost whenever one exists (AUROC $\approx 1$); what separates models is how often random starts land in the
-right basin (\S\ref{sec:select}).
+\item \textbf{Certification is easy; coverage is hard.} In every working model of rounds one and two right answers are attracting fixed points
+($\rho<1$) and wrong end states are not ($\rho>1$); three later checkpoints keep only the weaker ordering that wrong end states are less stable
+than right ones, and that is enough. Convergence, the halting head and a Sudoku validity check pick
+the right start almost whenever one exists (AUROC $\approx 1$ without noise for all 22 working checkpoints of the 26 analysed); what separates models is how often random
+starts land in the right basin (\S\ref{sec:select}, \S\ref{sec:maps34}).
 \item \textbf{Noise acts on wrong attractors first.} Under noise $\sigma$ below an arm-specific breakdown level $\sigma^\star$ right
 answers are never lost, while $15$--$33\%$ of wrong end states are rescued (\S\ref{sec:escape}), as in Hopfield
 networks at finite temperature \cite{amit1985storing,coolen2000statics}. $\sigma^\star$ depends on the state scale, which is fixed
@@ -141,12 +142,16 @@ not ($97.6$). The gain comes from test noise: at the training noise it reaches o
 makes no difference, so the two copies, not the cross term, are what matters (\S\ref{sec:tts3}).
 \item \textbf{The twin's advantage belongs to early training.} At $\sigma=0.5$ its depth-1024 error is lowest at 20--25k steps and rises
 after 30k, while EqR's keeps falling until 40k (seed 0). By 50k the twin's right answers are no longer fixed points (the state still moves
-by $5$--$11\%$ per iteration at 256 noise-free iterations, and its copies have split), so test noise removes them. At $\sigma=0.25$ every arm
-converges to the same $96$--$97\%$. Training at $\sigma=0.25$ restores fixed points but costs ten points at 20k and three at 50k, and the
-noise-trained twin and EqR end level, below EqR trained at $\sigma=0.01$ (\S\ref{sec:round4}).
+by $5$--$11\%$ per iteration at 256 noise-free iterations, and its copies have split). Noise does not remove them once reached (none of
+about 3850 is lost in 32 iterations at $\sigma=0.5$), but fewer noisy runs reach them, and noise rescues the twins' wrong end states far less
+often than at 20k ($6$--$25\%$ against $42\%$). At $\sigma=0.25$ every arm converges to the same $96$--$97\%$. Training at $\sigma=0.25$
+restores fixed points but costs ten points at 20k and three at 50k; at 20k its failures concentrate on puzzles that no start solves, so 128
+starts leave $7.7\%$ of puzzles without a right start instead of $0.1\%$. The noise-trained twin and EqR end level, below EqR trained at
+$\sigma=0.01$ (\S\ref{sec:round4}, \S\ref{sec:maps34}).
 \item \textbf{A second task.} On Skyscrapers-7, embedded in Sudoku's $9\times9$ board, EqR memorises 1k and overfits 10k training puzzles
-(test accuracy peaks at $41\%$ and falls) and generalises with 100k ($90.4\%$ at 20k steps, still rising); the twin reaches $84.8\%$
-(\S\ref{sec:sky}).
+(test accuracy peaks at $41\%$ and falls) and generalises with 100k ($90.4\%$ at 20k steps, still rising); the twin reaches $84.8\%$.
+Under test-time scaling EqR stays ahead in a single run ($97.1$ against $94.9\%$ at depth 1024, $\sigma=0.5$), and with 128 starts the most
+converged start is right for $99.0\%$ of puzzles for both: the twin's 20k advantage on Sudoku does not carry over (\S\ref{sec:sky}).
 \end{enumerate}
 
 %=====================================================================================================
@@ -502,9 +507,10 @@ EqR by about six points at 16 iterations; the gap does not close with training (
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_training.pdf}
-\caption{(a) In-training evaluation (whole test set, 16 iterations, $\sigma=0.01$) of the six arms trained to 50k steps. The twin
+\caption{(a) In-training evaluation (whole test set, 16 iterations, $\sigma=0.01$) of the six round-one to round-three arms trained to 50k steps. The twin
 ($\delta=2$) starts slowly and nearly reaches EqR; relax $\delta=2$ peaks at 35k. (b) Test accuracy at 49k (filled) against
-training-batch accuracy averaged over steps 48--50k (open), with the mean number of ACT steps on training batches at the right.}\label{fig:training}
+training-batch accuracy averaged over steps 48--50k (open), with the mean number of ACT steps on training batches at the right, for all ten
+arms trained to 50k (round four included; the noise-trained arms' training batches run at $\sigma=0.25$).}\label{fig:training}
 \end{figure}
 
 \paragraph{Round two: input injection and self-reading.} Giving $x$ only to $L$ (as EqR does) costs $12$ points for relax and $7$ for kick.
@@ -525,7 +531,9 @@ $1.5$ points of EqR's ($84.6/90.7/93.7$ against $85.8/92.1/95.0$ at 16/64/256 it
 \centering\small
 \caption{Generalisation at 50k (W\&B). Test: in-training evaluation (whole test set, 16 iterations, $\sigma=0.01$) at 49k and its maximum
 over the evaluations every 7k steps. Train: exact accuracy of training batches averaged over steps 48--50k; it counts sequences that halt,
-so it depends on the halting head. ACT: mean outer iterations per training sequence. $\cos(H,L)$ over the same window.}\label{tab:ext50}
+so it depends on the halting head. ACT: mean outer iterations per training sequence. $\cos(H,L)$ over the same window. Last four rows:
+round four (seed 0); the noise-trained arms' training batches run at their training noise $\sigma=0.25$, so their train column is not comparable
+with the others'.}\label{tab:ext50}
 \setlength{\tabcolsep}{4.5pt}
 \begin{tabular}{@{}lrrrrrr@{}}
 \toprule
@@ -543,7 +551,10 @@ accuracy falls. EqR and the twin show gaps of about one point ($87.2$ against $8
 The self-reading inner loop is right less often on training batches than on the test set ($70.1$ against $80.6$, with $8.3$ ACT steps), which
 says more about its halting head than about fitting. At 20k all gaps were small (EqR $+1$, relax $\delta=1$ $+3$ points), so the gap opens with
 training. The arms whose inner equilibrium is a single explicit layer (Prop.~\ref{prop:explicit}) thus fit the training puzzles, and the three arms
-with an implicit inner problem (EqR, twin, inner loop) do not. This is a correlation across six single-seed runs, not a controlled test.
+with an implicit inner problem (EqR, twin, inner loop) do not. Round four adds two twins trained to 50k: $\delta=3$ and $10$ have gaps of $4.9$
+and $3.6$ points ($88.3$ against $83.4$; $87.8$ against $84.2$) at $5.2$ ACT steps, larger than $\delta=2$'s one point but far below the
+alternating couplings' $15$--$26$. (The noise-trained twin and EqR show $1.8$ and $0$ points, but their training batches run at $\sigma=0.25$.)
+This is a correlation across eight single-seed runs, not a controlled test.
 
 \begin{figure}[t]
 \centering
@@ -654,6 +665,9 @@ $99.0\pm0.5\%$ top-4 at depth 64 with 128 starts; EqR at 20k gives $92.2\pm1.8$ 
 therefore about five points at depth 1024 and four with 128 starts, larger than the seed spread of either arm (sd $0.5$--$2.1$). Against EqR's released 50k
 checkpoint the twin at 20k is ahead with 128 starts ($99.0$ against $98.6$ top-4, $99.3$ against $98.7$ by vote) but behind at depth 1024
 ($96.9$ against $97.6$). At the training noise it is seven points behind EqR at 16 iterations ($61.5\pm1.2$ against $68.6\pm1.8$).
+With 128 starts the twin's advantage is coverage, not the single run: at depth 64 and $\sigma=0.5$ its single run is no better than EqR's
+($72$--$80\%$ over the nine twin runs with $\delta\in\{2,3,10\}$, against $79$--$81\%$ for EqR's three), but some start is right for
+$99.3$--$100\%$ of puzzles against $95.5$--$98.7\%$, and for both arms the most converged start loses at most $0.3$ points of that.
 
 \paragraph{Damping does not matter beyond $\delta=2$.} Twins with $\delta=2$, $3$ and $10$ agree within one point at every setting of
 Table~\ref{tab:seeds}; for a given seed they agree within $0.7$ points at depth 1024 ($98.2$, $98.9$, $98.4$ for seed 0; $95.8$, $95.3$,
@@ -693,8 +707,10 @@ we have measured. Twin $\delta=1$ and relax $\delta=1$ gain about 18 points, EqR
 ($76.0$ against $75.8$), so that arm's strong depth scaling at the training noise (\S\ref{sec:acc}) does not carry over to EqR's protocol: at
 $\sigma=0.5$ it is the second-weakest round-three arm ($81.8\%$ at depth 1024). Positive kick loses from noise at every checkpoint. By the escape
 analysis (\S\ref{sec:escape}), noise below an arm's breakdown level $\sigma^\star$ destabilises wrong end states without losing right ones;
-a gain as large as the twin's means that at 20k many of its wrong end states are shallow while its right ones survive $\sigma=0.5$. We have not
-yet run the escape analysis on twin checkpoints, so this is an inference from the accuracies.
+a gain as large as the twin's means that at 20k many of its wrong end states are shallow while its right ones survive $\sigma=0.5$. The escape
+analysis of the twin checkpoints confirms this (Table~\ref{tab:escape}): at 20k the twin keeps every right answer at $\sigma=0.5$ and $32$
+noisy iterations rescue $42\%$ of its wrong end states, the highest rate of any checkpoint (EqR at 20k: $30\%$). The inner loop rescues
+$9\%$, which is why noise does not help it.
 
 \paragraph{Longer training removes the need for noise.} At 50k every arm is accurate at the training noise, and $\sigma=0.5$ helps EqR by
 $0.3$ points and hurts all others: the twin by $3.1$, the inner loop by $3.7$, kick by $25$, and relax $\delta=2$ collapses ($2.6\%$ exact at every
@@ -771,14 +787,20 @@ arm & steps & seeds & exact (\%) & fixed point (\%) & step (\%) & $\rho$ & $\cos
 has a relative step below $10^{-2}$, the median step is $10.8\%$ per outer iteration and the spectral radius is $1.17$; for $\delta=10$ the
 step is $4.5\%$ and $2\%$ are at a fixed point; $\delta=3$ is the most converged of the three ($31\%$, step $1.1\%$). In relax ($\delta=1$)
 and the noise-trained arms the fixed-point share equals or nearly equals the exact share. Convergence alone does not order the twins,
-however: $\delta=3$ converges best and loses most at $\sigma=0.5$, so noise tolerance needs the escape analysis of \S\ref{sec:escape} on
-these checkpoints, which we have not yet run. A
-local map analysis of the $\delta=2$ twin (128 puzzles, two starts, noise off) shows how the copies behave. At 20k the copies of every right
-end state coincide (median $|L-L'|/(|L|+|L'|)=2\cdot10^{-7}$; none of 170 right runs split) and right answers contract strongly
-($\rho\approx0.26$ on 4 end states, wrong ones $0.61$), while $93\%$ of wrong end states have split copies. At 50k every end state is split, right ones included (median cosine $0.97$, separation
-$0.12$), and $\rho\approx1.0$ at right answers. The twin has crossed the symmetry-breaking instability of Prop.~\ref{prop:lag2}: its right
-answers now sit on the antisymmetric branch, which is only marginally stable, and Langevin noise at $\sigma=0.5$ moves them off. EqR's
-end states at 50k are near critical ($\rho=0.98$, median over right and wrong) with $22\%$ at a fixed point, and lose little to noise.
+however: $\delta=3$ converges best and loses most at $\sigma=0.5$.
+
+The map analysis of these checkpoints (\S\ref{sec:maps34}, Table~\ref{tab:twin}, Figure~\ref{fig:twinnoise}) shows what happens. At 20k
+the copies of every right end state coincide (median $|L-L'|/(|L|+|L'|)=2\cdot10^{-7}$, none split) and right answers contract strongly
+($\rho=0.27$), while $94\%$ of wrong end states have split copies. At 50k every end state of the $\delta=2$ twin is split, right ones included
+(median cosine $0.97$, separation $0.12$), and its right answers no longer contract ($\rho=1.20$): the twin has crossed the symmetry-breaking
+instability of Prop.~\ref{prop:lag2}. But test noise does not remove these answers. Started from the noise-free end states, all three 50k
+twins keep every right answer through 32 iterations at $\sigma=0.5$ (none of about 3850 is lost; Table~\ref{tab:escape}). What changes is the
+way in. From random starts under $\sigma=0.5$ the 50k twins end right less often than without noise ($91.2$, $84.4$ and $91.3\%$ against $94.7$,
+$93.6$ and $94.1\%$ for $\delta=2,3,10$ at depth 256; EqR $96.2$ against $96.3$) and reach more distinct answers ($\delta=3$: $3.5$ per puzzle
+against $2.0$), and noise moves their wrong end states to the right answer far less often than at 20k ($25$, $6$ and $10\%$ against $42\%$).
+The rescue rate orders the twins as their noise tolerance does: $\delta=3$, the most converged, has the wrong end states that noise rescues
+least, and loses most at $\sigma=0.5$ ($89.6\%$ at depth 1024, against $93.3$ for $\delta=10$ and $95.4$ for $\delta=2$). EqR's end states at
+50k are near critical ($\rho=0.98$, median over right and wrong) with $22\%$ at a fixed point, and lose little to noise.
 
 \paragraph{Noise training.} The lower block of Table~\ref{tab:round4}. Training at $\sigma=0.25$ makes the answers fixed points (fixed-point share
 $80.5\%$ against $82.9\%$ exact for the twin, $84.2\%$ against $84.2\%$ for EqR) with stronger contraction ($\rho=0.76$, $0.30$), and the noise-trained twin keeps them at
@@ -786,14 +808,23 @@ $\sigma=0.5$ ($96.3\%$ at depth 1024 against $95.4$ for the plain twin). But it 
 (at 20k the noise-trained twin is eleven points behind the plain twin at depth 1024, $87.1$ against $98.2\%$, and the noise-trained EqR four
 behind EqR, $87.7$ against $91.4\%$; seed 0), and ends below plain EqR ($96.3$ against $97.1$ at
 depth 1024; $97.4$ against $98.0$ top-4). It also erases the difference between the architectures: the noise-trained twin and EqR are within
-one point at every test-time setting. Noise in training thus buys stable answers at the price of the fast early learning that made the twin worth having.
+one point at every test-time setting. What it costs early is coverage rather than the single run. At 20k, depth 64 and $\sigma=0.5$, the
+noise-trained twin's single run is about as good as the plain twin's ($77.7$ against $79.5\%$, seed 0), but some of its 128 starts is right for
+only $92.3\%$ of puzzles against $99.9\%$, so the gain from breadth (any minus single) falls from $20$ to $15$ points; for EqR it falls from
+$15$ to $13$ ($92.3$ against $95.9\%$ any, single runs $79.2$ and $80.8\%$). At 50k both twins cover about $98\%$, the plain one from a weaker
+single run ($16.5$ points of breadth gain against $9.7$). The map analysis (\S\ref{sec:maps34}) shows that the noise-trained twin's starts do
+not agree more: at $\sigma=0.5$ they reach more distinct answers than the plain twin's ($3.4$ against $2.0$ per puzzle at depth 256). Its failures
+instead concentrate on puzzles that no start solves ($7.8\%$ of puzzles without a right start among 16, against $0.8\%$), where the plain
+twin's failures depend on the start. Noise in training thus buys stable answers at the price of the fast early learning, and of the
+start-to-start variation that breadth exploits, that made the twin worth having.
 
 %=====================================================================================================
 \section{Dynamics of the trained maps}\label{sec:maps}
 
 All quantities in this section use the noise-free map unless stated, in float32, on the first 256 test puzzles with 16 random starts and 256
-outer iterations, at the checkpoints' EMA weights. The analysis covers the round-one and round-two checkpoints; the round-three
-checkpoints (twin, inner loop, relax $\delta\in\{2,3\}$) have not been analysed yet.
+outer iterations, at the checkpoints' EMA weights, seed 0. Sections~\ref{sec:select}--\ref{sec:escape} start from the round-one and round-two
+checkpoints; the round-three and round-four checkpoints (twins, inner loop, relax $\delta\in\{2,3\}$, the noise-trained arms) are added to
+Tables~\ref{tab:spectral} and \ref{tab:escape} and treated in \S\ref{sec:maps34}.
 
 \subsection{Selection is solved; coverage is not}\label{sec:select}
 
@@ -828,7 +859,7 @@ puzzle. Relax at 50k collapses at $\sigma=0.75$ although it tolerated it at 20k.
 
 \begin{table}[t]
 \centering\small
-\caption{Spectral radius of one outer iteration's Jacobian at noise-free end states (16 right and 16 wrong per arm, power iteration on JVPs), and the share of complex leading Ritz values (Arnoldi, 30 steps).}\label{tab:spectral}
+\caption{Spectral radius of one outer iteration's Jacobian at noise-free end states (16 right and 16 wrong per arm, power iteration on JVPs), and the share of complex leading Ritz values (Arnoldi, 30 steps). Lower block: rounds three and four (seed 0).}\label{tab:spectral}
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}llrcrr|rr@{}}
 \toprule
@@ -841,10 +872,14 @@ arm & steps & $\rho$ & $[q_{10},q_{90}]$ & $\mathbb{C}$ top-1 & $\mathbb{C}$ top
 \end{table}
 
 \begin{observation}[Right answers attract, wrong end states do not]
-In every working model the median spectral radius at right end states is below one and at wrong end states above one
+In every working model of rounds one and two the median spectral radius at right end states is below one and at wrong end states above one
 (Table~\ref{tab:spectral}, Figure~\ref{fig:spectral}). Wrong end states after 256 iterations are therefore not stable fixed points but
 slow transients or unstable sets, which is why convergence certifies correctness (\S\ref{sec:select}) and why per-instance path independence
-separates right from wrong answers \cite{anil2022path}.
+separates right from wrong answers \cite{anil2022path}. Of the twelve round-three and round-four checkpoints, nine follow the same ordering
+and three do not: the right end states of the self-reading inner loop at 20k ($\rho=1.04$) and of the $\delta=2$ twin at 50k ($1.20$) do not
+contract, and the wrong end states of the $\delta=1$ twin at 20k do ($0.97$). Convergence still selects right starts for all three (AUROC
+$\ge0.997$ without noise, Table~\ref{tab:select34}), so what certifies an answer is that wrong end states are less stable than right ones,
+not that right ones are fixed points.
 \end{observation}
 
 EqR's right answers sit close to criticality and move closer with training ($0.87\to0.93\to0.97$), as reported for converged Sudoku loopers
@@ -858,10 +893,18 @@ One caveat qualifies the comparison. For the coupled maps the spectral radius is
 puzzle-independent mode of the coupled update, rather than the puzzle's own constraint dynamics, may therefore set the coupled maps' $\rho$;
 the leading Ritz values (Figure~\ref{fig:ritz}) are real and tightly clustered, consistent with this. Identifying that mode is left open.
 
+Rounds three and four (lower block of Table~\ref{tab:spectral}, right of the dotted line in Figure~\ref{fig:spectral}) extend the picture. At
+20k the twins and relax $\delta=3$ contract their right answers harder than any round-one or round-two arm ($\rho=0.27$--$0.38$; the noise-trained twin
+$0.22$). At 50k the twins' right answers are near critical, as EqR's are ($0.93$ and $0.89$ for $\delta=3$ and $10$), or not contracting
+($1.20$ for $\delta=2$, whose end states are not fixed points, Table~\ref{tab:dyn}), and their wrong end states have become far more unstable
+($\rho$ from $2.2$ at 20k to $7.0$--$10.2$). Noise training keeps the twin's right answers contracting at 50k ($0.82$) and gives EqR its most
+contracting right answers of any checkpoint ($0.28$ against $0.93$).
+
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_spectral.pdf}
-\caption{Median spectral radius of one outer iteration at right (filled) and wrong (open) end states. Dashed: $\rho=1$.}\label{fig:spectral}
+\caption{Median spectral radius of one outer iteration at right (filled) and wrong (open) end states. Dashed: $\rho=1$. Right of the dotted
+line: rounds three and four (seed 0).}\label{fig:spectral}
 \end{figure}
 
 \begin{figure}[t]
@@ -874,8 +917,10 @@ end states; circle: $|\mu|=1$.}\label{fig:ritz}
 \subsection{Escape under noise}\label{sec:escape}
 
 \begin{table}[t]
-\centering\small
-\caption{From noise-free end states, $K=32$ iterations at noise $\sigma$: $P(\text{keep}\mid\text{right})\,/\,P(\text{right}\mid\text{wrong})$.}\label{tab:escape}
+\centering\footnotesize
+\caption{From noise-free end states, $K=32$ iterations at noise $\sigma$: $P(\text{keep}\mid\text{right})\,/\,P(\text{right}\mid\text{wrong})$.
+Lower block: rounds three and four (seed 0).}\label{tab:escape}
+\setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}llccccc@{}}
 \toprule
 arm & steps & $\sigma=0.1$ & $0.25$ & $0.5$ & $0.75$ & $1.0$\\
@@ -894,6 +939,14 @@ $\sigma^\star$, so it must be chosen per checkpoint: relax tolerated $\sigma=0.7
 although its state scale is unchanged; its right answers attract less strongly at 50k ($\rho$ $0.53\to0.68$). Relax $\delta=\frac14$ rescues almost
 nothing: its wrong attractors are deep, which is why breadth does not help it.
 
+The lower block of Table~\ref{tab:escape} measures what \S\ref{sec:tts3} inferred from accuracies. At 20k the twin ($\delta=2$) keeps every right
+answer up to $\sigma=0.5$ and rescues $42\%$ of wrong end states there, more than any other checkpoint (EqR at 20k $30\%$, the released EqR
+$23\%$); at $\sigma=0.75$ it begins to lose right answers ($5\%$). At 50k all three twins still keep every right answer at $\sigma=0.5$, and
+$\delta=2$ and $3$ at $\sigma=0.75$ as well, but rescue far fewer wrong ones ($25$, $6$ and $10\%$ for $\delta=2,3,10$). Under noise their
+wrong end states almost always change answer (the same wrong answer survives in under $1\%$ of runs) but rarely to the right one. The
+self-reading inner loop rescues $9$--$15\%$ at $\sigma=0.5$. Noise training moves the twin's breakdown above $\sigma=0.75$ at both checkpoints, and
+at 20k its rescue rate stays high up to $0.75$ ($37$ and $42\%$ at $\sigma=0.5$ and $0.75$).
+
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_escape.pdf}
@@ -905,6 +958,72 @@ nothing: its wrong attractors are deep, which is why breadth does not help it.
 \includegraphics[width=0.55\textwidth]{figures/fig_auroc.pdf}
 \caption{AUROC of EqR's convergence score for right vs.\ wrong runs, against test noise.}\label{fig:auroc}
 \end{figure}
+
+\subsection{Rounds three and four}\label{sec:maps34}
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Multistart of the round-three and round-four checkpoints, as Table~\ref{tab:select} (256 puzzles, 16 starts, depth 256, seed 0),
+with EqR as reference.}\label{tab:select34}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llrrrrrrrrr@{}}
+\toprule
+arm & steps & single & any & vote & conv. & $q$ & verifier & AUROC & answers & $\Delta$PI \\
+\tabinput{tables/tab_select34.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{The twin copies at the noise-free end states (256 puzzles, 16 starts, depth 256): median cosine and separation
+$|L-L'|/(|L|+|L'|)$ over the whole state, share of runs with some token separated by more than $0.1$, and the spectral radius of one outer
+iteration (Table~\ref{tab:spectral}), for right and wrong runs.}\label{tab:twin}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llrrrr|rrrr@{}}
+\toprule
+& & \multicolumn{4}{c|}{right end states} & \multicolumn{4}{c}{wrong end states}\\
+arm & steps & cos & sep. & split (\%) & $\rho$ & cos & sep. & split (\%) & $\rho$\\
+\midrule
+\tabinput{tables/tab_twin.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_twinnoise.pdf}
+\caption{Twins and EqR under test noise (seed 0). (a)--(c) Multistart from random starts with noise during all 256 iterations (256 puzzles,
+16 starts): one run right, some start right, distinct answers per puzzle. (d) Wrong end states rescued by $K=32$ noisy iterations from the
+noise-free end state. Open/dashed: 20k; filled: 50k; triangles: trained at $\sigma=0.25$.}\label{fig:twinnoise}
+\end{figure}
+
+Tables~\ref{tab:select34} and \ref{tab:twin}, Figure~\ref{fig:twinnoise}; same protocol as above. Selection remains free: for every
+checkpoint, noise-free and at $\sigma=0.5$, the most converged start and the verifier are within $0.4$ points of ``any'' and the largest
+halting logit within $0.7$, and the convergence score separates right from wrong runs with AUROC $0.975$--$1.000$.
+
+\paragraph{The twin at 20k.} Without noise the twin is weaker than EqR at 20k ($62.8\%$ single, $68.4\%$ any, against $73.5$ and $83.2$) and
+its starts reach as many distinct answers ($4.6$ per puzzle against $4.5$). At $\sigma=0.5$ its single run gains $31$ points (to $93.7\%$; EqR
+$+16$ to $89.4\%$), some start is right for $99.2\%$ of puzzles (EqR $97.3\%$), and its starts reach fewer distinct answers than EqR's ($2.0$
+against $2.7$). Noise moves the twin's runs off wrong answers onto the right one more effectively than EqR's, as the escape rates show
+($42$ against $30\%$, \S\ref{sec:escape}). The copies separate right from wrong (Table~\ref{tab:twin}): for all three 20k twins ($\delta=1$, $2$
+and the noise-trained one) the copies of every right end state coincide to about $10^{-7}$, and $94$--$96\%$ of wrong end states are split,
+as Prop.~\ref{prop:lag2} allows: merged copies are the fixed points of the self-reading map, split ones its 2-cycles.
+
+\paragraph{The twins at 50k.} The $\delta=2$ twin's copies are split at every end state, right ones included (cosine $0.972$, separation $0.12$);
+$\delta=3$ and $10$ split $53$ and $75\%$ of their right end states with smaller separation ($0.03$, $0.05$), and the noise-trained twin all of
+them, less far apart ($0.08$). At 50k the split no longer marks wrong answers, and the fully split $\delta=2$ twin is the one whose right
+answers do not contract ($\rho=1.20$). Under noise from random starts the 50k twins lose single-run accuracy and gain distinct answers
+(Figure~\ref{fig:twinnoise}a, c; $\delta=3$: $93.6\to84.4\%$ and $2.0\to3.5$ answers from $\sigma=0$ to $0.5$), while EqR at 50k does not
+($96.3\to96.2\%$, $1.6$ answers), and their wrong end states are rescued less often than at 20k (panel d). \S\ref{sec:round4} draws the
+consequence for test-time scaling.
+
+\paragraph{Noise training.} At 20k and $\sigma=0.5$ the noise-trained twin is right on $84.8\%$ of single runs and some start is right for
+$92.2\%$ of puzzles, against $93.7$ and $99.2\%$ for the plain twin, although its starts reach more distinct answers ($3.4$ against $2.0$) and
+fewer puzzles have mixed outcomes ($14.8$ against $18.8\%$). Its failures concentrate on puzzles that no start solves; the plain twin's
+depend on the start. At 50k the noise-trained arms have the largest noise-free fixed-point shares of all checkpoints ($93\%$ for EqR,
+all of its right answers, and $83\%$ for the twin; relative step below $10^{-4}$), and they keep more single-run accuracy at $\sigma=0.75$
+($80$ and $85\%$, against $47$--$62\%$ for the plain twins and $72\%$ for EqR).
 
 \subsection{Inside one outer iteration}
 
@@ -964,7 +1083,7 @@ ones (Table~\ref{tab:lcycles}; $\pm2.5$ points at 128 puzzles). We read the peri
 combined with EqR's light damping, not as a computational mechanism. By Propositions~\ref{prop:twin} and \ref{prop:lag2} a twin coupling holds
 such a cycle as a fixed point with $L\ne L'$; the cosine between the copies is therefore a direct readout of whether the twin arms learn the
 same structure. They do, late in training: at 20k the copies of right end states coincide, at 50k every end state of the $\delta=2$ twin
-is split, and the split right answers are what test noise removes (\S\ref{sec:round4}).
+is split and its right answers no longer contract (\S\ref{sec:maps34}).
 
 %=====================================================================================================
 \section{A second task: Skyscrapers-7}\label{sec:sky}
@@ -1013,17 +1132,50 @@ distinct training examples.
 
 \paragraph{Twin against EqR.} On 100k puzzles the twin ($\delta=3$) trails EqR by $5$--$7$ points throughout ($84.8$ against $90.4\%$ at
 20k), with a four-point gap between training and test accuracy that EqR does not have. On Sudoku the twin also trailed EqR at 16 iterations and
-the training noise (Table~\ref{tab:seeds}) and led under test-time scaling; whether this carries over is the open question. The test-time
-scaling of these two runs is running.
+the training noise (Table~\ref{tab:seeds}) and led under test-time scaling.
+
+\begin{table}[t]
+\centering\small
+\caption{Skyscrapers-7 at 20k steps, seed 0, from the run roots. Training noise: \texttt{evaluate.py} on all 10{,}000 test puzzles, one
+run at depth 16, 64 and 256. Test noise: first 2048 test puzzles, one run at depth 1024, and depth 64 with 128 starts at $\sigma=0.5$ by
+selection rule (no vote: EqR's vote counts the untrained border tokens, which differ between starts, so identical answers do not pool).
+Fixed point and $\rho$: noise-free dynamics (Table~\ref{tab:dyn}), 768 puzzles. Test-time scaling and dynamics exist for the 100k runs
+only.}\label{tab:skyeval}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llrrrrrrrrrr@{}}
+\toprule
+& & \multicolumn{3}{c}{$\sigma=0.01$} & \multicolumn{2}{c}{depth 1024} & \multicolumn{3}{c}{$64\times128$, $\sigma=0.5$} & & \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}\cmidrule(lr){8-10}
+puzzles & arm & 16 & 64 & 256 & $\sigma=0.25$ & $0.5$ & conv. & top-4 & any & fixed pt.\ (\%) & $\rho$\\
+\midrule
+\tabinput{tables/tab_sky_eval.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Final evaluation and test-time scaling.} Table~\ref{tab:skyeval}. On all 10{,}000 test puzzles at the training noise EqR on 100k
+puzzles is right on $90.3$, $93.6$ and $95.3\%$ at depth 16, 64 and 256, and the twin on $85.3$, $88.1$ and $90.3\%$; with 10k puzzles EqR
+reaches $34.3$--$38.1\%$ and with 1k nothing. Under test noise both 100k runs improve with depth, and here the twin does not overtake EqR:
+one run at depth 1024 is right on $97.1$ against $94.9\%$ at $\sigma=0.5$ and $98.0$ against $97.7\%$ at $\sigma=0.25$ (the lower noise is
+better for both, as for the Sudoku checkpoints late in training). With 128 starts at depth 64 the most converged start is right on $99.0\%$
+for both, with some start right on $99.6$ and $99.2\%$, so selection is as free as on Sudoku and the difference is again coverage. Without
+noise EqR's runs end at a fixed point for $86.6\%$ of puzzles ($95.4\%$ right at 256 iterations) and the twin's for $79.7\%$ ($88.0\%$), with
+$\rho=0.64$ and $0.60$ (median over right and wrong); the twin's copies stay close (cosine $0.978$). At 20k on Skyscrapers the twin behaves
+like EqR with a weaker single run, not like the 20k Sudoku twin.
 
 %=====================================================================================================
 \section{Discussion}
 
 \paragraph{Which properties matter.}
 \begin{enumerate}[leftmargin=*,itemsep=1pt]
-\item \emph{Attracting right answers and non-attracting wrong ones.} Every working model has it, and it makes selection by convergence or
-halting essentially free. Models without it (relax $\delta=0$, $\frac14$; fixed and learned kick) also lose the certificate.
+\item \emph{Attracting right answers and non-attracting wrong ones.} Every working model of rounds one and two has it, and it makes selection
+by convergence or halting essentially free. Models without it (relax $\delta=0$, $\frac14$; fixed and learned kick) also lose the certificate.
+Three later checkpoints (the inner loop at 20k, the twins with $\delta=1$ at 20k and $\delta=2$ at 50k) have only the weaker property that
+wrong end states are less stable than right ones, and selection is still free for them.
 \item \emph{Large, dominant basins for right answers (path independence).} This is where EqR leads, and it grows with training for every arm.
+It is not an advantage under breadth: at 20k the twin's single runs are no more accurate than EqR's, but its starts cover $99.3$--$100\%$ of
+puzzles against $95.5$--$98.7\%$ (three seeds each), and training noise lowers coverage by making failures depend on the puzzle rather
+than on the start (\S\ref{sec:maps34}).
 \item \emph{A margin between the noise that breaks wrong attractors and the noise that breaks right ones.} It exists for all working models; its
 location $\sigma^\star$ is set by the state scale (exactly predictable, Prop.~\ref{prop:scale}) and by contraction strength, and it moves with training.
 \item \emph{Damping of the common mode}, not the volume constraint. The undamped mode of relax is fatal; strong but not maximal damping is best.
@@ -1034,25 +1186,28 @@ training noise. This suggests that invertibility is not what costs the alternati
 \item \emph{Noise-driven exploration that pays off with depth}, which depends on the checkpoint. At 20k the twin gains 27 points from test noise
 at depth 256 and, over three seeds, leads EqR at 20k by five points at depth 1024 and beats EqR's released 50k checkpoint with 128 starts; the
 self-reading inner loop, which also has an implicit inner problem, gains nothing. The twin's gain does not depend on its damping, so it comes
-from the two alternating copies. It is largest early in training: as the twin trains on, its right answers split into the antisymmetric branch of
-Prop.~\ref{prop:lag2}, stop being fixed points, and lose their tolerance to $\sigma=0.5$, while EqR's improve until 40k. Training with noise
-restores fixed points but removes the early advantage.
+from the two alternating copies, and the escape analysis measures it: at 20k noise rescues $42\%$ of the twin's wrong end states without
+losing right ones. It is largest early in training: as the twin trains on, its right answers split into the antisymmetric branch of
+Prop.~\ref{prop:lag2} and stop being fixed points; noise still keeps them once reached, but rescues wrong end states far less often ($6$--$25\%$
+at 50k) and fewer noisy runs reach the right ones, while EqR's improve until 40k. Training with noise restores fixed points but removes the
+early advantage, both in depth and in coverage. On Skyscrapers-7 at 20k the twin shows no such advantage.
 \end{enumerate}
 
 \paragraph{Limitations.} Three seeds exist only for EqR and the twins at 20k; everything else, including the training trajectory of
 Figure~\ref{fig:trace} and all of round four at 50k, is seed 0, which was the twins' best seed at 20k by $1.3$--$2$ points. Test-time
 numbers use 2048 puzzles ($\pm0.5$ points; $\pm0.2$ near $99\%$) and the dynamical analysis 256 puzzles ($\pm1$--$2$ points). Spectra use 16
 right and 16 wrong end states per arm, and Ritz values from 30 Arnoldi steps approximate only the leading spectrum. GPU traces ran with TF32
-matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The round-three and round-four
-checkpoints have the noise-free dynamics of Table~\ref{tab:dyn} but not the full map analysis of \S\ref{sec:maps}; the twin's copy statistics
-come from a local run on 128 puzzles with 4 right and 4 wrong spectra. Most test-time comparisons use EqR's $\sigma=0.5$, which is not the best
-noise for every checkpoint (\S\ref{sec:round4}). Skyscrapers-7 has one seed per arm and no test-time scaling yet. Training-batch accuracy depends on halting, so the generalisation gaps
-are indicative.
+matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The map analysis of \S\ref{sec:maps}
+covers seed 0 only, for every arm. Most test-time comparisons use EqR's $\sigma=0.5$, which is not the best
+noise for every checkpoint (\S\ref{sec:round4}). Skyscrapers-7 has one seed per arm, test-time scaling and dynamics for the two 100k runs only,
+and no map analysis; its majority vote is not usable (EqR's vote counts the untrained border tokens). Training-batch accuracy depends on halting,
+so the generalisation gaps are indicative.
 
 \paragraph{Next.} (i) A noise switch: train the twin ($\delta=10$, the simplest) and EqR at $\sigma=0.01$ to 20k and continue at $\sigma=0.25$,
 to keep the twin's fast early learning and make its answers stable. (ii) Seeds 1 and 2 of the training trajectory, to place the twin's peak
-without seed-0 bias. (iii) The escape analysis on the twin checkpoints, since convergence alone does not order their noise tolerance.
-(iv) Test-time scaling on Skyscrapers-7, the twin at 50k there, and further seeds.
+without seed-0 bias. (iii) The map analysis of seeds 1 and 2 at 20k, to check that the twin's merged right answers and high rescue rate are
+not seed-0 properties. (iv) On Skyscrapers-7: training beyond 20k (EqR's test accuracy was still rising), the twin at 50k, further seeds, and a
+vote that ignores the border tokens.
 
 \appendix
 \section{Rates, scales and dimensionality}
@@ -1076,7 +1231,7 @@ arm & steps & $\gamma$ & $\alpha$ & $\delta$ & vol.\ bound & RMS pred. & RMS mea
 \item Training and evaluation: \nolinkurl{jobs/looped/sudoku_eqr.slurm} (which also runs the test-time scaling of \nolinkurl{jobs/looped/eqr_scaling.sh} after training), \nolinkurl{jobs/looped/sudoku_scaling.slurm}, \nolinkurl{jobs/looped/sudoku_dynamics.slurm}; summary tables: \nolinkurl{looped/eqr/summarize_sudoku.py}.
 \item Skyscrapers-7: \nolinkurl{looped/eqr/skyscrapers.py}, \nolinkurl{looped/eqr/build_skyscrapers_dataset.py}; \nolinkurl{sudoku_eqr.slurm} with \texttt{TASK=skyscrapers}.
 \item Dynamical analysis: \nolinkurl{looped/eqr/export_for_analysis.py}, \nolinkurl{looped/eqr/analyze_maps.py} (GPU job \nolinkurl{jobs/looped/sudoku_maps.slurm}), \nolinkurl{looped/eqr/summarize_maps.py}.
-\item This note: \nolinkurl{looped/eqr/paper/make_figures.py} and \nolinkurl{make_tables.py}, from the data in \nolinkurl{looped/eqr/paper/data/}; the seed-resolved \nolinkurl{runs_*.csv} there are written by \nolinkurl{looped/eqr/paper/export_results.py} from the pulled run root.
+\item This note: \nolinkurl{looped/eqr/paper/make_figures.py} and \nolinkurl{make_tables.py}, from the data in \nolinkurl{looped/eqr/paper/data/}; the seed-resolved \nolinkurl{runs_*.csv} there are written by \nolinkurl{looped/eqr/paper/export_results.py} from the pulled Sudoku run root, \nolinkurl{sky_runs_*.csv} by the same script from the Skyscrapers-7 run roots (\texttt{--prefix sky\_runs --puzzles-from-root}), \nolinkurl{maps/*.json} by \nolinkurl{analyze_maps.py}, and \nolinkurl{wandb_curves.json} and \nolinkurl{sky_wandb.json} from W\&B.
 \end{itemize}
 
 \bibliographystyle{plainnat}

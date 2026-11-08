@@ -2,7 +2,9 @@
 from the local inner-loop-length test, and from W&B. One seed (0) in the transcribed blocks below.
 
 Seed-resolved results (rounds three and four, seeds, checkpoint trace, dynamics; 2026-11-08) are read from
-runs_*.csv, written by ../export_results.py from the pulled run root; Skyscrapers-7 from sky_wandb.json (W&B)."""
+runs_*.csv, written by ../export_results.py from the pulled run root; Skyscrapers-7 from sky_wandb.json (W&B, training
+curves) and sky_runs_*.csv (export_results.py on the pulled Skyscrapers run roots: final evaluations, test-time scaling,
+dynamics). Map analyses (analyze_maps.py) of all rounds are in maps/*.json."""
 import csv
 import json
 import os
@@ -209,6 +211,12 @@ EXT50 = [
     ("relax3_leak2", .711, (.745, 35000), .968, 2.0, .98),
     ("twinL_leak2", .850, (.850, 49000), .860, 5.6, .41),
     ("innerL_self_leak1", .806, (.806, 49000), .701, 8.3, .71),
+    # round four (W&B, pulled 2026-11-08 evening, same definitions). The noise-trained arms' training batches run at
+    # their training noise 0.25, so their train column is not comparable with the others'.
+    ("twinL_leak3", .834, (.840, 42000), .883, 5.2, .41),
+    ("twinL_leak10", .842, (.842, 49000), .878, 5.2, .39),
+    ("twinL_leak2_noise25", .821, (.821, 49000), .840, 5.9, .45),
+    ("eqr_noise25", .842, (.842, 49000), .842, 5.9, .51),
 ]
 
 # relax common-mode damping sweep (rate 3, x in both forces): delta -> eval at 14k (W&B)
@@ -235,6 +243,10 @@ def _csv(name):
 RUNS_MAIN = _csv("runs_main")
 RUNS_SCALING = _csv("runs_scaling")
 RUNS_DYN = _csv("runs_dynamics")
+# Skyscrapers-7 run roots (export_results.py --prefix sky_runs --puzzles-from-root): same columns plus `puzzles`.
+SKY_MAIN = _csv("sky_runs_main")
+SKY_SCALING = _csv("sky_runs_scaling")
+SKY_DYN = _csv("sky_runs_dynamics")
 
 
 def runs(table, arm, step, seeds=None, **match):

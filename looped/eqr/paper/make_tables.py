@@ -180,12 +180,21 @@ def tab_select():
     write("tab_select", "\n".join(blocks))
 
 
+R34 = [("relax3_leak2", 20000), ("relax3_leak3", 20000), ("twinL_leak1", 20000), ("twinL_leak2", 20000), ("twinL_leak2", 50000),
+       ("twinL_leak3", 50000), ("twinL_leak10", 50000), ("innerL_self_leak1", 20000), ("innerL_self_leak1", 50000),
+       ("twinL_leak2_noise25", 20000), ("twinL_leak2_noise25", 50000), ("eqr_noise25", 50000)]
+
+
 def tab_spectral():
     order = [("eqr", 20000), ("eqr", 50000), ("eqr-released", 50000), ("relax3_leak1", 20000), ("relax3_leak1", 50000),
              ("relax3_leak1_injL_self", 20000), ("relax3_leak4", 20000), ("relax3", 20000), ("kick_pos", 20000), ("kick_pos", 50000),
-             ("kick_learned", 20000), ("kick_fixed", 20000)]
+             ("kick_learned", 20000), ("kick_fixed", 20000), None] + R34
     lines = []
-    for arm, step in order:
+    for key in order:
+        if key is None:
+            lines.append(r"\midrule")
+            continue
+        arm, step = key
         j = M[(arm, step)]["jacobian"]
         c, w = j["correct"], j["wrong"]
         lines.append(f"{NAME[arm]} & {k(step)} & {num(c['rho_median'])} & [{num(c['rho_q10_q90'][0])}, {num(c['rho_q10_q90'][1])}] & "
@@ -196,14 +205,67 @@ def tab_spectral():
 
 def tab_escape():
     order = [("eqr", 20000), ("eqr", 50000), ("eqr-released", 50000), ("relax3_leak1", 20000), ("relax3_leak1", 50000),
-             ("kick_pos", 20000), ("kick_pos", 50000), ("relax3_leak4", 20000), ("relax3", 20000), ("kick_fixed", 20000)]
+             ("kick_pos", 20000), ("kick_pos", 50000), ("relax3_leak4", 20000), ("relax3", 20000), ("kick_fixed", 20000), None] + R34
     sig = ["0.1", "0.25", "0.5", "0.75", "1.0"]
     lines = []
-    for arm, step in order:
+    for key in order:
+        if key is None:
+            lines.append(r"\midrule")
+            continue
+        arm, step = key
         e = M[(arm, step)]["escape"]["by_sigma"]
         cells = [f"{num(e[s]['keep_if_correct'])} / {num(e[s]['rescued_if_wrong'])}" for s in sig]
         lines.append(f"{NAME[arm]} & {k(step)} & " + " & ".join(cells) + r" \\")
     write("tab_escape", "\n".join(lines))
+
+
+def tab_select34():
+    """Multistart of the round-three and round-four checkpoints (256 puzzles, 16 starts, depth 256), EqR as reference."""
+    order = [("eqr", 20000), ("eqr", 50000)] + R34
+    blocks = []
+    for noise in ("0", "0.5"):
+        lines = [r"\midrule" if noise == "0.5" else "", rf"\multicolumn{{11}}{{l}}{{\emph{{test noise $\sigma={noise}$}}}} \\"]
+        for arm, step in order:
+            m = last(M[(arm, step)]["multistart"][f"noise_{noise}"])
+            lines.append(f"{NAME[arm]} & {k(step)} & {pct(m['single'])} & {pct(m['any'])} & {pct(m['vote'])} & {pct(m['conv1'])} & "
+                         f"{pct(m['q1'])} & {pct(m['verifier'])} & {num(m['auroc']['lscore'], 3)} & {num(m['distinct_mean'], 1)} & "
+                         f"{num(m['delta_pi'], 3)} \\\\")
+        blocks.append("\n".join(x for x in lines if x))
+    write("tab_select34", "\n".join(blocks))
+
+
+def tab_twin():
+    """Twin copies at the noise-free end states (256 puzzles x 16 starts, depth 256), right and wrong runs, with the
+    spectral radius of one outer iteration at right / wrong end states (16 each)."""
+    order = [("twinL_leak1", 20000), ("twinL_leak2", 20000), ("twinL_leak2", 50000), ("twinL_leak3", 50000), ("twinL_leak10", 50000),
+             ("twinL_leak2_noise25", 20000), ("twinL_leak2_noise25", 50000)]
+    sci = lambda v: (f"{v:.2f}" if v >= 0.005 else ("$" + f"{v:.0e}".replace("e-0", r"\cdot10^{-") + "}$"))
+    lines = []
+    for arm, step in order:
+        tw = last(M[(arm, step)]["multistart"]["noise_0"])["twin"]
+        j = M[(arm, step)]["jacobian"]
+        c, w = tw["correct"], tw["wrong"]
+        lines.append(f"{NAME[arm]} & {k(step)} & {num(c['cos_median'], 3)} & {sci(c['sep_median'])} & {pct(c['frac_split'], 0)} & "
+                     f"{num(j['correct']['rho_median'])} & {num(w['cos_median'], 3)} & {sci(w['sep_median'])} & {pct(w['frac_split'], 0)} & "
+                     f"{num(j['wrong']['rho_median'])} \\\\")
+    write("tab_twin", "\n".join(lines))
+
+
+def tab_sky_eval():
+    """Skyscrapers-7 run roots at 20k (seed 0): evaluate.py at the training noise (whole test set at depth 16, 10k puzzles),
+    test-time scaling (first 2048 puzzles) and noise-free dynamics. No vote column: EqR's vote counts the untrained border
+    tokens, so on Skyscrapers it does not pool identical answers."""
+    lines = []
+    for n, arm in ((1000, "eqr"), (10000, "eqr"), (100000, "eqr"), (100000, "twinL_leak3")):
+        m = next(r for r in T.SKY_MAIN if r["arm"] == arm and r["puzzles"] == n)
+        sc = lambda D, B, N, key: next((r[key] for r in T.SKY_SCALING if r["arm"] == arm and r["puzzles"] == n and r["D"] == D
+                                        and r["B"] == B and abs(r["N"] - N) < 1e-9), None)
+        dyn = next((r for r in T.SKY_DYN if r["arm"] == arm and r["puzzles"] == n), None)
+        cells = [pct(m["exact@16"]), pct(m["exact@64s"]), pct(m["exact@256s"]), pct(sc(1024, 1, 0.25, "single")),
+                 pct(sc(1024, 1, 0.5, "single")), pct(sc(64, 128, 0.5, "conv1")), pct(sc(64, 128, 0.5, "convk")),
+                 pct(sc(64, 128, 0.5, "any")), pct(dyn["FP@256(1e-2)"]) if dyn else "--", num(dyn["rho"]) if dyn else "--"]
+        lines.append(f"{n // 1000}k & {NAME[arm]} & " + " & ".join(cells) + r" \\")
+    write("tab_sky_eval", "\n".join(lines))
 
 
 def tab_lcycles():
@@ -298,6 +360,6 @@ def tab_sky():
 
 if __name__ == "__main__":
     for f in (tab_main, tab_scaling, tab_noisedep, tab_ext50, tab_rates, tab_select, tab_spectral, tab_escape,
-              tab_lcycles, tab_round3, tab_seeds, tab_round4, tab_dyn, tab_sky):
+              tab_lcycles, tab_round3, tab_seeds, tab_round4, tab_dyn, tab_sky, tab_select34, tab_twin, tab_sky_eval):
         f()
         print("ok", f.__name__)

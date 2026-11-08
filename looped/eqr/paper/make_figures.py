@@ -34,14 +34,16 @@ W = 6.3          # text width (in)
 C = {"eqr": "C0", "eqr-released": "C4", "relax3_leak1": "C1", "kick_pos": "C2", "relax3_leak4": "C8",
      "relax3": "C7", "kick_learned": "C9", "kick_fixed": "C5", "relax3_leak1_injL": "C3",
      "relax3_leak1_injL_self": "C6", "kick_pos_injL": "C3", "relax3_leak2": "C9", "relax3_leak3": "C7",
-     "twinL_leak1": "C5", "twinL_leak2": "C3", "innerL_self_leak1": "C6", "twinL_leak3": "C8", "twinL_leak10": "C9"}
+     "twinL_leak1": "C5", "twinL_leak2": "C3", "innerL_self_leak1": "C6", "twinL_leak3": "C8", "twinL_leak10": "C9",
+     "twinL_leak2_noise25": "#7f0000", "eqr_noise25": "#08306b"}
 LABEL = {"eqr": "EqR", "eqr-released": "EqR (released)", "relax3_leak1": r"relax $\delta{=}1$",
          "kick_pos": "kick (pos.)", "relax3_leak4": r"relax $\delta{=}1/4$", "relax3": r"relax $\delta{=}0$",
          "kick_learned": "kick (learned)", "kick_fixed": "kick (fixed)", "relax3_leak1_injL": r"relax $\delta{=}1$, $x\!\to\!L$",
          "relax3_leak1_injL_self": r"relax $\delta{=}1$, $x\!\to\!L$, self", "kick_pos_injL": r"kick, $x\!\to\!L$",
          "relax3_leak2": r"relax $\delta{=}2$", "relax3_leak3": r"relax $\delta{=}3$", "twinL_leak1": r"twin $\delta{=}1$",
          "twinL_leak2": r"twin $\delta{=}2$", "innerL_self_leak1": r"inner loop, self", "twinL_leak3": r"twin $\delta{=}3$",
-         "twinL_leak10": r"twin $\delta{=}10$"}
+         "twinL_leak10": r"twin $\delta{=}10$", "twinL_leak2_noise25": r"twin $\delta{=}2$, train $\sigma{=}0.25$",
+         "eqr_noise25": r"EqR, train $\sigma{=}0.25$"}
 STEP_STYLE = {20000: dict(ls="--", mfc="white"), 50000: dict(ls="-")}
 
 
@@ -76,7 +78,7 @@ def lab(arm, step):
 # --------------------------------------------------------------------------------------------- training
 def fig_training():
     ext = ["eqr", "twinL_leak2", "innerL_self_leak1", "relax3_leak1", "kick_pos", "relax3_leak2"]
-    fig, (a, b) = plt.subplots(1, 2, figsize=(W, 2.45), gridspec_kw={"width_ratios": [1.2, 1]})
+    fig, (a, b) = plt.subplots(1, 2, figsize=(W, 2.85), gridspec_kw={"width_ratios": [1.2, 1]})
     for arm in ext:
         ev = np.array(WB[arm]["eval"])
         a.plot(ev[:, 0] / 1000, ev[:, 1], "o-", color=C[arm], label=LABEL[arm], ms=3.2)
@@ -94,7 +96,7 @@ def fig_training():
         b.text(1.005, i, f"{act:.1f}", va="center", fontsize=7, transform=b.get_yaxis_transform())
     b.text(1.005, len(rows) - 0.55, "ACT", va="bottom", fontsize=7, transform=b.get_yaxis_transform())
     b.set_yticks(range(len(rows)), [LABEL[r[0]] for r in rows])
-    b.set_ylim(-0.6, len(rows) + 0.75)
+    b.set_ylim(-0.6, len(rows) + 1.7)
     b.set_xlabel("exact accuracy")
     b.set_xlim(0.65, 1.0)
     b.plot([], [], "o", color="0.3", label="test (eval at 49k)")
@@ -304,6 +306,42 @@ def fig_escape():
     save(fig, "fig_escape")
 
 
+TWIN_ARMS = [("eqr", 20000), ("eqr", 50000), ("twinL_leak2", 20000), ("twinL_leak2", 50000), ("twinL_leak3", 50000),
+             ("twinL_leak10", 50000), ("twinL_leak2_noise25", 50000), ("eqr_noise25", 50000)]
+
+
+def fig_twinnoise():
+    """Rounds three and four under test noise: multistart from random starts (256 puzzles, 16 starts, depth 256) and escape
+    from the noise-free end states (K = 32 noisy iterations)."""
+    fig, axes = plt.subplots(1, 4, figsize=(W, 2.15))
+    xs = [float(n) for n in NOISES]
+    for arm, step in TWIN_ARMS:
+        st = dict(STEP_STYLE[step])
+        mk = "^" if arm.endswith("noise25") else "o"
+        for ax, key in zip(axes[:3], ("single", "any", "distinct_mean")):
+            ax.plot(xs, [_ms(arm, step, n, key) for n in NOISES], marker=mk, color=C[arm], label=lab(arm, step), ms=3.2, lw=1.1, **st)
+        e = M[(arm, step)]["escape"]["by_sigma"]
+        sg = [s for s in sorted(e, key=float) if float(s) <= 0.75]
+        axes[3].plot([float(s) for s in sg], [e[s]["rescued_if_wrong"] for s in sg], marker=mk, color=C[arm], ms=3.2, lw=1.1, **st)
+    axes[0].set_title("(a) one run", fontsize=8.5)
+    axes[1].set_title("(b) some start right", fontsize=8.5)
+    axes[2].set_title("(c) distinct answers", fontsize=8.5)
+    axes[3].set_title("(d) wrong end state rescued", fontsize=8.5)
+    for ax in axes[:3]:
+        ax.set_xlabel(r"test noise $\sigma$")
+        ax.set_xticks(xs, ["0", ".25", ".5", ".75"])
+    axes[3].set_xlabel(r"$\sigma$, $K{=}32$ from end state")
+    axes[3].set_xticks([0.1, 0.25, 0.5, 0.75], [".1", ".25", ".5", ".75"])
+    axes[0].set_ylim(0.4, 1.0)
+    axes[1].set_ylim(0.65, 1.005)
+    axes[2].set_ylim(0, 10)
+    axes[3].set_ylim(0, 0.5)
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.17), fontsize=6.6)
+    fig.tight_layout(w_pad=0.5)
+    save(fig, "fig_twinnoise")
+
+
 def fig_auroc():
     fig, a = plt.subplots(figsize=(3.1, 2.2))
     xs = [float(n) for n in NOISES]
@@ -321,25 +359,35 @@ def fig_auroc():
 # --------------------------------------------------------------------------------------------- Jacobians
 SPEC_ARMS = [("eqr-released", 50000), ("eqr", 50000), ("eqr", 20000), ("relax3_leak1", 50000), ("relax3_leak1", 20000),
              ("relax3_leak1_injL_self", 20000), ("relax3_leak1_injL", 20000), ("relax3_leak4", 20000), ("relax3", 20000),
-             ("kick_pos", 50000), ("kick_pos", 20000), ("kick_pos_injL", 20000), ("kick_learned", 20000), ("kick_fixed", 20000)]
+             ("kick_pos", 50000), ("kick_pos", 20000), ("kick_pos_injL", 20000), ("kick_learned", 20000), ("kick_fixed", 20000), None,
+             ("relax3_leak2", 20000), ("relax3_leak3", 20000), ("twinL_leak1", 20000), ("twinL_leak2", 20000), ("twinL_leak2", 50000),
+             ("twinL_leak3", 50000), ("twinL_leak10", 50000), ("innerL_self_leak1", 20000), ("innerL_self_leak1", 50000),
+             ("twinL_leak2_noise25", 20000), ("twinL_leak2_noise25", 50000), ("eqr_noise25", 50000)]
 
 
 def fig_spectral():
-    fig, a = plt.subplots(figsize=(W, 2.5))
-    for i, (arm, step) in enumerate(SPEC_ARMS):
+    fig, a = plt.subplots(figsize=(W, 2.9))
+    ticks, labels = [], []
+    for i, key in enumerate(SPEC_ARMS):
+        if key is None:                                   # rounds one-two | rounds three-four
+            a.axvline(i, color="0.6", lw=0.6, ls=":")
+            continue
+        arm, step = key
         j = M[(arm, step)]["jacobian"]
-        a.plot([i], [j["correct"]["rho_median"]], "o", color=C[arm], ms=6)
-        a.plot([i], [j["wrong"]["rho_median"]], "s", color=C[arm], mfc="white", ms=6)
+        a.plot([i], [j["correct"]["rho_median"]], "o", color=C[arm], ms=5)
+        a.plot([i], [j["wrong"]["rho_median"]], "s", color=C[arm], mfc="white", ms=5)
         a.plot([i, i], [j["correct"]["rho_median"], j["wrong"]["rho_median"]], color=C[arm], lw=0.6)
+        ticks.append(i)
+        labels.append(lab(arm, step))
     a.axhline(1.0, color="0.4", lw=0.7, ls="--")
     a.set_yscale("log")
-    a.set_yticks([0.3, 0.5, 1, 2, 5, 10], ["0.3", "0.5", "1", "2", "5", "10"])
-    a.set_ylim(0.3, 11)
+    a.set_yticks([0.2, 0.5, 1, 2, 5, 10], ["0.2", "0.5", "1", "2", "5", "10"])
+    a.set_ylim(0.18, 12)
     a.set_ylabel(r"$\rho(J)$, one outer iteration")
-    a.set_xticks(range(len(SPEC_ARMS)), [lab(a_, s) for a_, s in SPEC_ARMS], rotation=35, ha="right", fontsize=7)
+    a.set_xticks(ticks, labels, rotation=60, ha="right", fontsize=6.2)
     a.plot([], [], "o", color="0.3", label="right endpoints (median)")
     a.plot([], [], "s", color="0.3", mfc="white", label="wrong endpoints (median)")
-    a.legend(loc="upper right")
+    a.legend(loc="upper center", bbox_to_anchor=(0.4, 1.0))
     fig.tight_layout()
     save(fig, "fig_spectral")
 
@@ -547,6 +595,6 @@ def fig_sky():
 
 if __name__ == "__main__":
     for f in (fig_training, fig_retention, fig_depth, fig_breadth, fig_r3_depth, fig_noisedep, fig_noise, fig_escape, fig_auroc, fig_spectral, fig_ritz,
-              fig_recursion, fig_inner, fig_flip, fig_scale, fig_trace, fig_sky):
+              fig_recursion, fig_inner, fig_flip, fig_scale, fig_trace, fig_sky, fig_twinnoise):
         f()
         print("ok", f.__name__)
