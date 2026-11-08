@@ -34,13 +34,14 @@ W = 6.3          # text width (in)
 C = {"eqr": "C0", "eqr-released": "C4", "relax3_leak1": "C1", "kick_pos": "C2", "relax3_leak4": "C8",
      "relax3": "C7", "kick_learned": "C9", "kick_fixed": "C5", "relax3_leak1_injL": "C3",
      "relax3_leak1_injL_self": "C6", "kick_pos_injL": "C3", "relax3_leak2": "C9", "relax3_leak3": "C7",
-     "twinL_leak1": "C5", "twinL_leak2": "C3", "innerL_self_leak1": "C6"}
+     "twinL_leak1": "C5", "twinL_leak2": "C3", "innerL_self_leak1": "C6", "twinL_leak3": "C8", "twinL_leak10": "C9"}
 LABEL = {"eqr": "EqR", "eqr-released": "EqR (released)", "relax3_leak1": r"relax $\delta{=}1$",
          "kick_pos": "kick (pos.)", "relax3_leak4": r"relax $\delta{=}1/4$", "relax3": r"relax $\delta{=}0$",
          "kick_learned": "kick (learned)", "kick_fixed": "kick (fixed)", "relax3_leak1_injL": r"relax $\delta{=}1$, $x\!\to\!L$",
          "relax3_leak1_injL_self": r"relax $\delta{=}1$, $x\!\to\!L$, self", "kick_pos_injL": r"kick, $x\!\to\!L$",
          "relax3_leak2": r"relax $\delta{=}2$", "relax3_leak3": r"relax $\delta{=}3$", "twinL_leak1": r"twin $\delta{=}1$",
-         "twinL_leak2": r"twin $\delta{=}2$", "innerL_self_leak1": r"inner loop, self"}
+         "twinL_leak2": r"twin $\delta{=}2$", "innerL_self_leak1": r"inner loop, self", "twinL_leak3": r"twin $\delta{=}3$",
+         "twinL_leak10": r"twin $\delta{=}10$"}
 STEP_STYLE = {20000: dict(ls="--", mfc="white"), 50000: dict(ls="-")}
 
 
@@ -162,7 +163,8 @@ def fig_breadth():
     fig, axes = plt.subplots(1, 2, figsize=(W, 2.45), sharey=True, gridspec_kw={"width_ratios": [1.35, 1]})
     for ax, step in zip(axes, (20000, 50000)):
         arms = ["eqr", "relax3_leak1", "kick_pos"]
-        arms += ["relax3_leak2", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"] if step == 20000 else ["eqr-released"]
+        arms += (["relax3_leak2", "twinL_leak1", "twinL_leak2", "innerL_self_leak1"] if step == 20000
+                 else ["twinL_leak2", "innerL_self_leak1", "eqr-released"])
         off = np.linspace(-0.3, 0.3, len(arms))
         for j, arm in enumerate(arms):
             st = 50000 if arm == "eqr-released" else step
@@ -489,8 +491,62 @@ def fig_scale():
     save(fig, "fig_scale")
 
 
+def fig_trace():
+    """One-run error at depth 1024 against training step (seed 0, every 5k), at test noise 0.5 and 0.25;
+    20k seed means +- sd as error bars."""
+    arms = ["eqr", "twinL_leak2", "twinL_leak3", "twinL_leak10"]
+    fig, axes = plt.subplots(1, 2, figsize=(W, 2.6), sharey=True)
+    for ax, N in zip(axes, (0.5, 0.25)):
+        for j, arm in enumerate(arms):
+            pts = sorted((r["step"], r["single"]) for r in T.RUNS_SCALING if r["arm"] == arm and r["seed"] == 0 and r["D"] == 1024
+                         and r["B"] == 1 and abs(r["N"] - N) < 1e-9)
+            x, y = zip(*pts)
+            ax.plot(np.array(x) / 1000, 1 - np.array(y), marker="o", color=C[arm], label=LABEL[arm] + " (seed 0)", ms=3.2,
+                    lw=1.6 if arm == "eqr" else 1.1)
+            st = T.stat(T.runs(T.RUNS_SCALING, arm, 20000, D=1024, B=1, N=N), "single")
+            if st and st[2] > 1:
+                ax.errorbar(20 + 0.6 * (j - 1.5), 1 - st[0], yerr=st[1], fmt="s", color=C[arm], ms=3.5, mfc="white", capsize=2,
+                            lw=0.9)
+        if N == 0.5:
+            rel = next(r["single"] for r in T.scaling_rows() if r["arm"] == "eqr-released" and r["D"] == 1024 and r["B"] == 1)
+            ax.axhline(1 - rel, ls=":", color=C["eqr-released"], lw=1.0)
+            ax.text(50.5, (1 - rel) * 0.93, "EqR released (50k)", color=C["eqr-released"], fontsize=6.6, ha="right", va="top")
+        ax.set_yscale("log")
+        ax.set_xlabel("training step (k)")
+        ax.set_title(f"({'ab'[N == 0.25]}) depth 1024, one run, test noise $\\sigma={N:g}$")
+        ax.set_xticks([10, 20, 30, 40, 50])
+        ax.set_xlim(8, 52)
+        ax.grid(axis="y", which="both", color="0.92", lw=0.5)
+    axes[0].set_ylabel("error rate")
+    axes[0].set_yticks([0.01, 0.02, 0.05, 0.1, 0.2, 0.5], ["1%", "2%", "5%", "10%", "20%", "50%"])
+    axes[0].set_ylim(0.009, 0.65)
+    axes[1].legend(loc="upper right", fontsize=6.4, handletextpad=0.3)
+    axes[1].text(0.97, 0.04, "open squares: mean $\\pm$ sd of seeds 0-2 at 20k", transform=axes[1].transAxes, ha="right",
+                 fontsize=6.4, color="0.3")
+    fig.tight_layout(w_pad=0.6)
+    save(fig, "fig_trace")
+
+
+def fig_sky():
+    """Skyscrapers-7: in-training test exact accuracy (16 iterations, noise 0.01) against training step."""
+    fig, ax = plt.subplots(figsize=(0.55 * W, 2.3))
+    spec = [("eqr_s0_1k", "EqR, 1k puzzles", C["eqr"], ":"), ("eqr_s0_10k", "EqR, 10k puzzles", C["eqr"], "--"),
+            ("eqr_s0_100k", "EqR, 100k puzzles", C["eqr"], "-"), ("twinL_leak3_s0_100k", r"twin $\delta{=}3$, 100k puzzles", C["twinL_leak3"], "-")]
+    for key, lab_, col, ls in spec:
+        ev = T.SKY[key]["eval"]
+        ax.plot([s / 1000 for s, _, _ in ev], [e for _, e, _ in ev], ls=ls, marker="o", ms=2.8, color=col, label=lab_)
+    ax.set_xlabel("training step (k)")
+    ax.set_ylabel("test exact accuracy")
+    ax.set_xticks([0, 5, 10, 15, 20])
+    ax.set_ylim(-0.02, 1.0)
+    ax.grid(axis="y", color="0.9", lw=0.5)
+    ax.legend(loc="upper left", fontsize=6.4, handletextpad=0.3)
+    fig.tight_layout()
+    save(fig, "fig_sky")
+
+
 if __name__ == "__main__":
     for f in (fig_training, fig_retention, fig_depth, fig_breadth, fig_r3_depth, fig_noisedep, fig_noise, fig_escape, fig_auroc, fig_spectral, fig_ritz,
-              fig_recursion, fig_inner, fig_flip, fig_scale):
+              fig_recursion, fig_inner, fig_flip, fig_scale, fig_trace, fig_sky):
         f()
         print("ok", f.__name__)

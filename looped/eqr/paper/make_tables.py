@@ -16,7 +16,9 @@ NAME = {"eqr": "EqR", "eqr-released": "EqR (released)", "relax3_leak1": r"relax,
         "kick_fixed": "kick, fixed rates", "relax3_leak1_injL": r"relax, $\delta=1$, $x\to L$ only",
         "relax3_leak1_injL_self": r"relax, $\delta=1$, $x\to L$, self-read", "kick_pos_injL": r"kick, positive, $x\to L$ only",
         "relax3_leak2": r"relax, $\delta=2$", "relax3_leak3": r"relax, $\delta=3$", "twinL_leak1": r"twin $L$, $\delta=1$",
-        "twinL_leak2": r"twin $L$, $\delta=2$", "innerL_self_leak1": r"inner loop, self-read, $\delta=1$"}
+        "twinL_leak2": r"twin $L$, $\delta=2$", "innerL_self_leak1": r"inner loop, self-read, $\delta=1$",
+        "twinL_leak3": r"twin $L$, $\delta=3$", "twinL_leak10": r"twin $L$, $\delta=10$",
+        "twinL_leak2_noise25": r"twin $L$, $\delta=2$, train $\sigma=0.25$", "eqr_noise25": r"EqR, train $\sigma=0.25$"}
 
 
 def pct(v, nd=1):
@@ -218,8 +220,84 @@ def tab_round3():
     write("tab_round3", "\n".join(lines))
 
 
+# ------------------------------------------------------------------------- seed-resolved tables (2026-11-08)
+def ms(st, nd=1, scale=100):
+    """mean +- sd (sd only for n > 1); '--' if missing."""
+    if st is None:
+        return "--"
+    m, sd, n = st
+    return f"{scale * m:.{nd}f}" if sd is None else f"${scale * m:.{nd}f}\\pm{scale * sd:.{nd}f}$"
+
+
+def tab_seeds():
+    """20k, three seeds: training-noise accuracy and test-time scaling at sigma = 0.5."""
+    lines = []
+    for arm in ("eqr", "twinL_leak2", "twinL_leak3", "twinL_leak10"):
+        sc = lambda D, B, key: T.stat(T.runs(T.RUNS_SCALING, arm, 20000, D=D, B=B, N=0.5), key)
+        n = len(T.runs(T.RUNS_SCALING, arm, 20000, D=1024, B=1, N=0.5))
+        cells = [ms(T.stat(T.runs(T.RUNS_MAIN, arm, 20000), "exact@16")), ms(sc(256, 1, "single")), ms(sc(1024, 1, "single")),
+                 ms(sc(64, 128, "conv1")), ms(sc(64, 128, "convk")), ms(sc(64, 128, "vote")), ms(sc(64, 128, "any"))]
+        lines.append(f"{NAME[arm]} & {n} & " + " & ".join(cells) + r" \\")
+    rel = {r["D"] if r["B"] == 1 else (r["D"], r["B"]): r for r in T.scaling_rows() if r["arm"] == "eqr-released" and r["noise"] == 0.5}
+    r = rel[(64, 128)]
+    lines += [r"\midrule", f"EqR (released, 50k) & 1 & -- & {pct(rel[256]['single'])} & {pct(rel[1024]['single'])} & "
+              f"{pct(r['conv1'])} & {pct(r['convk'])} & {pct(r['vote'])} & {pct(r['any'])} \\\\"]
+    write("tab_seeds", "\n".join(lines))
+
+
+def tab_round4():
+    """50k, seed 0: training-noise accuracy and test-time scaling at sigma = 0.25 and 0.5."""
+    lines = []
+    for arm in ("eqr", "twinL_leak2", "twinL_leak3", "twinL_leak10", "innerL_self_leak1", None, "twinL_leak2_noise25", "eqr_noise25"):
+        if arm is None:
+            lines.append(r"\midrule")
+            continue
+        m = T.runs(T.RUNS_MAIN, arm, 50000, seeds=[0])
+        g = lambda key: m[0].get(key) if m else None
+        sc = lambda D, B, N, key: (lambda x: x[0][key] if x else None)(T.runs(T.RUNS_SCALING, arm, 50000, seeds=[0], D=D, B=B, N=N))
+        d20 = T.runs(T.RUNS_SCALING, arm, 20000, seeds=[0], D=1024, B=1, N=0.5)
+        cells = [pct(g("exact@16")), pct(g("exact@256s")), num(g("resid@256"), 1), pct(d20[0]["single"] if d20 else None),
+                 pct(sc(1024, 1, 0.25, "single")), pct(sc(64, 16, 0.25, "convk")), pct(sc(1024, 1, 0.5, "single")),
+                 pct(sc(64, 128, 0.5, "convk"))]
+        lines.append(f"{NAME[arm]} & " + " & ".join(cells) + r" \\")
+    write("tab_round4", "\n".join(lines))
+
+
+def tab_dyn():
+    """dynamics_eqr.py: noise-free trajectories of 768 test puzzles to 256 iterations; spectral radius on 32."""
+    keys = [("eqr", 20000), ("eqr", 50000), ("relax3_leak1", 50000), ("innerL_self_leak1", 50000), None,
+            ("twinL_leak2", 20000), ("twinL_leak2", 50000), ("twinL_leak3", 20000), ("twinL_leak3", 50000),
+            ("twinL_leak10", 20000), ("twinL_leak10", 50000), None, ("twinL_leak2_noise25", 50000), ("eqr_noise25", 50000)]
+    lines = []
+    for key in keys:
+        if key is None:
+            lines.append(r"\midrule")
+            continue
+        arm, step = key
+        rows = T.runs(T.RUNS_DYN, arm, step)
+        cos = T.stat(rows, "twin_cos@256")
+        cells = [str(len(rows)), ms(T.stat(rows, "nf_exact@256")), ms(T.stat(rows, "FP@256(1e-2)")),
+                 ms(T.stat(rows, "step50@256"), 1), ms(T.stat(rows, "rho"), 2, 1), "--" if cos is None else ms(cos, 3, 1)]
+        lines.append(f"{NAME[arm]} & {k(step)} & " + " & ".join(cells) + r" \\")
+    write("tab_dyn", "\n".join(lines))
+
+
+def tab_sky():
+    """Skyscrapers-7 pilot (W&B): test exact at 16 iterations along training, training-batch exact and ACT steps."""
+    lines = []
+    for key, arm, n in (("eqr_s0_1k", "eqr", "1k"), ("eqr_s0_10k", "eqr", "10k"), ("eqr_s0_100k", "eqr", "100k"),
+                        ("twinL_leak3_s0_100k", "twinL_leak3", "100k")):
+        d = T.SKY[key]
+        ev = {s: (e, c) for s, e, c in d["eval"]}
+        best = max(d["eval"], key=lambda t: t[1])
+        cells = [pct(ev[s][0]) for s in (8000, 10000, 14000, 20000)] + [f"{pct(best[1])} ({k(best[0])})", pct(ev[20000][1]),
+                 pct(d["train_18_20k"]), f"{d['act_18_20k']:.1f}"]
+        lines.append(f"{n} & {NAME[arm]} & " + " & ".join(cells) + r" \\")
+    write("tab_sky", "\n".join(lines))
+
+
 if __name__ == "__main__":
     for f in (tab_main, tab_scaling, tab_noisedep, tab_ext50, tab_rates, tab_select, tab_spectral, tab_escape,
-              tab_lcycles, tab_round3):
+              tab_lcycles, tab_round3, tab_seeds, tab_round4, tab_dyn, tab_sky):
         f()
         print("ok", f.__name__)

@@ -1,5 +1,14 @@
 """Numbers transcribed from summarize_sudoku.py output on IDUN (run root sudoku_25939526, 2026-11-06/07),
-from the local inner-loop-length test, and from W&B. One seed (0) everywhere."""
+from the local inner-loop-length test, and from W&B. One seed (0) in the transcribed blocks below.
+
+Seed-resolved results (rounds three and four, seeds, checkpoint trace, dynamics; 2026-11-08) are read from
+runs_*.csv, written by ../export_results.py from the pulled run root; Skyscrapers-7 from sky_wandb.json (W&B)."""
+import csv
+import json
+import os
+import statistics
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 # summarize_sudoku.py main table: evaluate.py at training noise 0.01, breadth 1.
 # exact16 / cell16: whole test set (423k puzzles), 16 iterations; exact64s / exact256s: first 49,152 puzzles;
@@ -150,6 +159,8 @@ innerL_self_leak1,50000,64,1,0.5,0.838,,,,,0.933
 innerL_self_leak1,50000,64,16,0.5,0.831,0.939,0.916,0.926,0.942,0.932
 innerL_self_leak1,50000,256,1,0.5,0.903,,,,,0.959
 innerL_self_leak1,50000,1024,1,0.5,0.933,,,,,0.971
+twinL_leak2,50000,64,128,0.5,0.822,0.986,0.979,0.979,0.987,0.927
+innerL_self_leak1,50000,64,128,0.5,0.831,0.956,0.949,0.954,0.962,0.932
 """
 
 
@@ -202,3 +213,49 @@ EXT50 = [
 
 # relax common-mode damping sweep (rate 3, x in both forces): delta -> eval at 14k (W&B)
 RELAX_DELTA = [(0.0, .022), (0.25, .341), (1.0, .490), (2.0, .563), (3.0, .541)]
+
+
+# ------------------------------------------------------------------------------ seed-resolved results (CSV)
+def _csv(name):
+    path = os.path.join(_HERE, name + ".csv")
+    out = []
+    for r in csv.DictReader(open(path)):
+        d = {}
+        for k, v in r.items():
+            if k == "arm":
+                d[k] = v
+            elif v == "":
+                d[k] = None
+            else:
+                d[k] = float(v) if any(c in v for c in ".e") or k in ("N",) else int(v)
+        out.append(d)
+    return out
+
+
+RUNS_MAIN = _csv("runs_main")
+RUNS_SCALING = _csv("runs_scaling")
+RUNS_DYN = _csv("runs_dynamics")
+
+
+def runs(table, arm, step, seeds=None, **match):
+    """Rows of one of the RUNS_* tables for an arm and step (all seeds unless given) matching match (e.g. D=1024, B=1, N=0.5)."""
+    out = []
+    for r in table:
+        if r["arm"] != arm or r["step"] != step or (seeds is not None and r["seed"] not in seeds):
+            continue
+        if all(r.get(k) is not None and abs(r[k] - v) < 1e-9 for k, v in match.items()):
+            out.append(r)
+    return out
+
+
+def stat(rows, key):
+    """(mean, sd or None, n) of key over rows (seeds); None if no values."""
+    v = [r[key] for r in rows if r.get(key) is not None]
+    if not v:
+        return None
+    return statistics.mean(v), (statistics.stdev(v) if len(v) > 1 else None), len(v)
+
+
+# Skyscrapers-7 (W&B project looped-eqr-skyscrapers): in-training eval on the 10k test puzzles at 16 iterations and
+# noise 0.01 every 2000 steps, training-batch exact accuracy and ACT steps averaged over steps 18k-20k.
+SKY = json.load(open(os.path.join(_HERE, "sky_wandb.json")))

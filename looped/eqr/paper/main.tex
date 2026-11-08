@@ -66,12 +66,17 @@ selection is nearly perfect and accuracy is limited by \emph{coverage}. Test noi
 destabilising wrong attractors below an arm-specific breakdown level. EqR differs from the alternating couplings in being near
 critical at its answers ($\rho\approx 0.93$--$0.97$ per outer iteration against $0.53$--$0.73$), in being more path
 independent, and in an inner loop that, with training, goes through a flip bifurcation into an exact 2-cycle.
-After 20k training steps the twin coupling with damping $\delta=2$ is the best test-time scaler we measured:
-$98.2\%$ exact at depth 1024 and $99.6\%$ top-4 with 128 starts at depth 64, above EqR's released 50k-step checkpoint
-($97.6\%$, $98.6\%$), although it is the weakest working arm at 16 iterations and its gain comes from test noise.
-Trained to 50k steps it generalises like EqR (training and test accuracy within one point, against gaps of 15--26 points for the
-alternating couplings, which fit the 1000 training puzzles), but loses part of its noise-driven depth scaling, and EqR leads at 50k.
-All results are single-seed.
+After 20k training steps the twin coupling is the best test-time scaler we measured. Over three seeds it is right on
+$96.9\pm1.2\%$ of puzzles at depth 1024 and $99.0\pm0.5\%$ top-4 with 128 starts at depth 64, against $92.2\pm1.8$ and
+$94.7\pm2.1$ for EqR at 20k and $97.6$, $98.6$ for EqR's released 50k-step checkpoint, although it is the weakest working arm at
+16 iterations and its gain comes from test noise. The common-mode damping makes no difference ($\delta=2,3,10$ agree within a point for
+each seed), so the gain comes from the two copies, not from the cross term. Along training the twin's depth scaling at test noise $0.5$
+peaks at 20--25k steps and then declines, while EqR's improves until 40k: by 50k the twin's right answers are no longer fixed points.
+Training at noise $0.25$ makes them fixed points again but slows learning, and ends level with EqR trained the same way, below EqR.
+Trained to 50k the twin generalises like EqR (training and test accuracy within one point, against gaps of 15--26 points for the
+alternating couplings, which fit the 1000 training puzzles). On a second task on the same board, Skyscrapers-7, EqR overfits
+10k training puzzles and needs 100k; there the twin trails EqR by about six points at 16 iterations. Results are single-seed except where
+marked (three seeds for EqR and the twins at 20k).
 \end{abstract}
 
 \tableofcontents
@@ -129,11 +134,19 @@ at 50k EqR leads on every metric (depth 1024: $97.1$ vs.\ $92.5$; depth 64 with 
 \item \textbf{Explicit inner equilibria fit the training puzzles.} At 50k the alternating couplings reach $93$--$97\%$ on training batches
 but $71$--$79\%$ on the test set, and relax $\delta=2$ declines after 35k steps. EqR, the twin and the self-reading inner loop, the three arms
 with an implicit inner problem, have no such gap (\S\ref{sec:acc}).
-\item \textbf{A twin inner loop gives the best test-time scaling at 20k.} The twin with $\delta=2$ is the weakest working arm at 16
-iterations ($52.3\%$ at $\sigma=0.5$) but its error falls 26-fold by depth 1024 ($98.2\%$), and with 128 starts at depth 64 it reaches
-$99.6\%$ top-4 and $99.8\%$ by vote, above EqR's released 50k checkpoint ($98.6$, $98.7$). The gain comes from test noise: at the
-training noise it reaches only $65.2\%$ at depth 256. At 50k it is accurate without noise ($84.6\%$ at 16 iterations, EqR $85.8$) and
-$\sigma=0.5$ costs it three points (\S\ref{sec:tts3}).
+\item \textbf{A twin inner loop gives the best test-time scaling at 20k.} The twin is the weakest working arm at 16 iterations
+($50$--$54\%$ at $\sigma=0.5$), but over three seeds it reaches $96.9\pm1.2\%$ at depth 1024 and $99.0\pm0.5\%$ top-4 with 128 starts at
+depth 64, against $92.2\pm1.8$ and $94.7\pm2.1$ for EqR at 20k; the second is above EqR's released 50k checkpoint ($98.6$), the first is
+not ($97.6$). The gain comes from test noise: at the training noise it reaches only $65\%$ at depth 256. The damping $\delta\in\{2,3,10\}$
+makes no difference, so the two copies, not the cross term, are what matters (\S\ref{sec:tts3}).
+\item \textbf{The twin's advantage belongs to early training.} At $\sigma=0.5$ its depth-1024 error is lowest at 20--25k steps and rises
+after 30k, while EqR's keeps falling until 40k (seed 0). By 50k the twin's right answers are no longer fixed points (the state still moves
+by $5$--$11\%$ per iteration at 256 noise-free iterations, and its copies have split), so test noise removes them. At $\sigma=0.25$ every arm
+converges to the same $96$--$97\%$. Training at $\sigma=0.25$ restores fixed points but costs ten points at 20k and three at 50k, and the
+noise-trained twin and EqR end level, below EqR trained at $\sigma=0.01$ (\S\ref{sec:round4}).
+\item \textbf{A second task.} On Skyscrapers-7, embedded in Sudoku's $9\times9$ board, EqR memorises 1k and overfits 10k training puzzles
+(test accuracy peaks at $41\%$ and falls) and generalises with 100k ($90.4\%$ at 20k steps, still rising); the twin reaches $84.8\%$
+(\S\ref{sec:sky}).
 \end{enumerate}
 
 %=====================================================================================================
@@ -571,7 +584,7 @@ EqR's released checkpoint. (b) The error of relax falls like a power of depth; E
 \centering\small
 \caption{Test-time scaling at $\sigma=0.5$, first 2048 test puzzles. Left: one start at depth $D$. Right: depth 64 with 128 starts, by
 selection rule (best non-oracle rule in bold; ``any'' is the oracle). The released EqR gives 98.6 top-4, as in EqR's README. Lower block:
-round three; ``--'': depth 64 with 128 starts at 50k still running.}\label{tab:scaling}
+round three. Seed 0 throughout; three-seed means at 20k are in Table~\ref{tab:seeds}, round four in Table~\ref{tab:round4}.}\label{tab:scaling}
 \begin{tabular}{@{}llrrrr|rrrr@{}}
 \toprule
 & & \multicolumn{4}{c|}{one run, depth $D$} & \multicolumn{4}{c}{depth 64, 128 starts}\\
@@ -594,7 +607,7 @@ match EqR at 50k. Round three, and the twin in particular, is in \S\ref{sec:tts3
 converged; any: some start right). (a) 20k, round-one arms open, round-three arms filled: the twin with $\delta=2$ is best under every selection rule (EqR has the better
 single run).
 Among the round-one arms positive kick has the best vote and ``any'' but the worst single run and convergence selection; (b) by 50k this has
-reversed. The round-three arms at 50k are still being evaluated.}\label{fig:breadth}
+reversed, and the twin ($\delta=2$) and the inner loop at 50k (filled) are below EqR under every rule.}\label{fig:breadth}
 \end{figure}
 
 Positive kick at 20k is the outlier (Figure~\ref{fig:breadth}): at $\sigma=0.5$ a single run is right only $37\%$ of the time, yet some start is right
@@ -604,23 +617,50 @@ and the regime is gone (any $93.8$, vote $87.9$).
 
 \subsection{Round three: the twin coupling scales best at 20k}\label{sec:tts3}
 
+\begin{table}[t]
+\centering\small
+\caption{Three seeds at 20k steps (mean $\pm$ sd). Depth 16 at the training noise on the whole test set (for the twins with $\delta=3$ and
+$10$ seeds 1--2 only: seed 0 was trained straight to 50k without an evaluation at 20k); test-time scaling at $\sigma=0.5$ on the first 2048
+test puzzles: one run at depth 256 and 1024, and depth 64 with 128 starts by selection rule. Last row: EqR's released 50k checkpoint.}\label{tab:seeds}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+& & $\sigma=0.01$ & \multicolumn{2}{c}{one run, $\sigma=0.5$} & \multicolumn{4}{c}{depth 64, 128 starts, $\sigma=0.5$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-5}\cmidrule(l){6-9}
+arm & seeds & depth 16 & depth 256 & depth 1024 & converged & top-4 & vote & any \\
+\midrule
+\tabinput{tables/tab_seeds.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_r3_depth.pdf}
 \caption{Round three: one-run error against depth at $\sigma=0.5$ (first 2048 test puzzles), log--log. Dotted: EqR's released 50k
-checkpoint in both panels. (a) At 20k the twin with $\delta=2$ starts worst and ends best: its error falls 26-fold from depth 16 to 1024
+checkpoint in both panels. Seed 0. (a) At 20k the twin with $\delta=2$ starts worst and ends best: its error falls 26-fold from depth 16 to 1024
 ($D^{-0.78}$), against 3.6-fold for EqR at 20k and 10-fold for the released checkpoint. (b) At 50k the twin is faster at short depth but its
 curve flattens ($D^{-0.47}$); EqR at 50k leads at every depth.}\label{fig:r3depth}
 \end{figure}
 
-Figure~\ref{fig:r3depth} and the lower block of Table~\ref{tab:scaling}. At 20k the twin with $\delta=2$ has the worst single run at 16
+Figure~\ref{fig:r3depth} and the lower block of Table~\ref{tab:scaling} (seed 0). At 20k the twin with $\delta=2$ has the worst single run at 16
 iterations of all working arms ($52.3\%$) and the steepest depth curve we have measured: error $47.7\%\to20.4\%\to7.4\%\to1.8\%$ at depths
-16, 64, 256 and 1024, a power law with exponent $-0.78$ (EqR at 20k: $-0.31$; the released EqR: $-0.56$; relax $\delta=1$: $-0.35$). At depth
-1024 it is right on $98.2\%$ of puzzles, against $91.4\%$ for EqR at 20k and $97.6\%$ for EqR's released 50k checkpoint. In EqR's headline
-setting, depth 64 with 128 starts, it reaches $99.6\%$ top-4, $99.6\%$ for the most converged start and $99.8\%$ by plurality vote (released
-EqR: $98.6$, $99.2$, $98.7$); some start is right for $99.9\%$ of puzzles, and convergence finds it. On 2048 puzzles that is about 4 wrong by
-vote against 27. The twin with $\delta=1$ is in between: $91.6\%$ at depth 1024, level with EqR at 20k, and $95.5\%$ top-4. So for the twins
-stronger common-mode damping pays at depth. For relax under test noise it does not: at depth 1024, $\delta=1,2,3$ give $90.4$, $88.3$ and
+16, 64, 256 and 1024, a power law with exponent $-0.78$ (EqR at 20k: $-0.31$; the released EqR: $-0.56$; relax $\delta=1$: $-0.35$). In EqR's
+headline setting, depth 64 with 128 starts, some start is right for $99.9\%$ of puzzles, and convergence finds it ($99.6\%$ top-4).
+
+\paragraph{Three seeds.} Table~\ref{tab:seeds}. Seed 0 was the best of three seeds for every twin, $1.3$--$2.0$ points above the mean at depth 1024,
+so the seed-0 figures above overstate the twin. Over seeds 0--2 the twin with $\delta=2$ is right on $96.9\pm1.2\%$ at depth 1024 and
+$99.0\pm0.5\%$ top-4 at depth 64 with 128 starts; EqR at 20k gives $92.2\pm1.8$ and $94.7\pm2.1$. The twin's lead over EqR at 20k is
+therefore about five points at depth 1024 and four with 128 starts, larger than the seed spread of either arm (sd $0.5$--$2.1$). Against EqR's released 50k
+checkpoint the twin at 20k is ahead with 128 starts ($99.0$ against $98.6$ top-4, $99.3$ against $98.7$ by vote) but behind at depth 1024
+($96.9$ against $97.6$). At the training noise it is seven points behind EqR at 16 iterations ($61.5\pm1.2$ against $68.6\pm1.8$).
+
+\paragraph{Damping does not matter beyond $\delta=2$.} Twins with $\delta=2$, $3$ and $10$ agree within one point at every setting of
+Table~\ref{tab:seeds}; for a given seed they agree within $0.7$ points at depth 1024 ($98.2$, $98.9$, $98.4$ for seed 0; $95.8$, $95.3$,
+$95.1$ for seed 1; $96.6$, $96.4$, $96.4$ for seed 2), while seeds differ by up to $3.6$. At $\delta=10$ the cross term $c=e^{-10}$ is
+negligible, and with merged copies the update is EqR's own, $L\leftarrow0.05L+0.95\,\Bk(L'+H+x)$ with $L'$ in place of $L$ inside the force.
+What the twin adds to EqR is therefore the two alternating copies, not the relaxation. The twin with $\delta=1$ (seed 0 only) is worse:
+$91.6\%$ at depth 1024 and $95.5\%$ top-4. For relax under test noise it does not: at depth 1024, $\delta=1,2,3$ give $90.4$, $88.3$ and
 $78.4\%$, with depth exponents $-0.35$, $-0.30$ and $-0.20$, although $\delta=2$ was the best relax arm at the training noise.
 
 \begin{table}[t]
@@ -659,9 +699,94 @@ yet run the escape analysis on twin checkpoints, so this is an inference from th
 \paragraph{Longer training removes the need for noise.} At 50k every arm is accurate at the training noise, and $\sigma=0.5$ helps EqR by
 $0.3$ points and hurts all others: the twin by $3.1$, the inner loop by $3.7$, kick by $25$, and relax $\delta=2$ collapses ($2.6\%$ exact at every
 depth), the collapse that relax $\delta=1$ showed at $\sigma=0.75$ (Figure~\ref{fig:noise}) now at a lower noise. The 50k twin is better than the
-20k twin at short depth ($68.0$ against $52.3\%$ at 16 iterations) but worse at large depth ($95.4$ against $98.2\%$ at 1024; most converged of
-16 starts at depth 64: $96.0$ against $98.3\%$), and EqR at 50k leads it at every depth. A fixed $\sigma$ is a different test for each checkpoint
-(Corollary~1 and \S\ref{sec:escape}); whether the 50k twin recovers its depth scaling at a smaller test noise is the first thing to measure next.
+20k twin at short depth ($68.0$ against $52.3\%$ at 16 iterations, seed 0) but worse at large depth ($95.4$ against $98.2\%$ at 1024, and
+against the three-seed mean $96.9$; most converged of 16 starts at depth 64: $96.0$ against $98.3\%$), and EqR at 50k leads it at every depth. A fixed $\sigma$ is a different test for each checkpoint
+(Corollary~1 and \S\ref{sec:escape}). At $\sigma=0.25$ the 50k twin recovers: $96.3\%$ at depth 1024, level with EqR at the same noise
+($96.3$), though below EqR's $97.1$ at $\sigma=0.5$ (Table~\ref{tab:round4}).
+
+\subsection{Round four: damping, noise training and the training trajectory}\label{sec:round4}
+
+Round four trains twins with $\delta=3$ and $10$, and the twin ($\delta=2$) and EqR at training noise $\sigma=0.25$ instead of $0.01$,
+straight to 50k steps with a checkpoint every 5k, so that test-time scaling can be followed along training (Table~\ref{tab:round4},
+Figure~\ref{fig:trace}). All four are seed 0; the twins with $\delta=3$ and $10$ also have seeds 1 and 2 at 20k (Table~\ref{tab:seeds}).
+
+\begin{table}[t]
+\centering\small
+\caption{Round four and its references at 50k steps (seed 0). Left: training noise $\sigma=0.01$ (depth 16 on the whole test set, depth 256 on
+49{,}152 puzzles, and EqR's residual $\|z_{256}-z_{255}\|$, not scale-normalised). Then one run at depth 1024 at 20k, and at 50k one run at
+depth 1024 and the top-4 of $B$ starts at depth 64, at test noise $0.25$ and $0.5$ (first 2048 test puzzles). EqR's released checkpoint:
+$97.6$ and $98.6$ at $\sigma=0.5$.}\label{tab:round4}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{$\sigma=0.01$} & 20k, $\sigma=0.5$ & \multicolumn{2}{c}{$\sigma=0.25$} & \multicolumn{2}{c}{$\sigma=0.5$}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-5}\cmidrule(lr){6-7}\cmidrule(l){8-9}
+arm & depth 16 & 256 & resid. & depth 1024 & 1024 & $64\times16$ & 1024 & $64\times128$\\
+\midrule
+\tabinput{tables/tab_round4.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_trace.pdf}
+\caption{One-run error at depth 1024 (first 2048 test puzzles) for the checkpoints of one training run every 5k steps, seed 0, at test noise
+(a) $0.5$ and (b) $0.25$. Open squares: mean $\pm$ sd over seeds 0--2 at 20k (offset for legibility). At $\sigma=0.5$ the twins are best at
+20--25k and lose accuracy afterwards while EqR improves until 40k; at $\sigma=0.25$ all four arms follow one curve.}\label{fig:trace}
+\end{figure}
+
+\paragraph{Damping.} At 20k the three twins are equal (\S\ref{sec:tts3}). At 50k they differ at $\sigma=0.5$ ($95.4$, $89.6$ and $93.3\%$ at
+depth 1024 for $\delta=2,3,10$) but not at $\sigma=0.25$ ($96.3$, $95.7$, $96.2$), so the difference is in how they tolerate noise, not in
+what they have learned. At the training noise $\delta=2$ and $10$ are level ($84.6$, $84.3\%$ at 16 iterations) and $\delta=3$ is $1.4$ points lower.
+The larger $\delta$ also removes most of the twin's high residual at depth 256 ($51$ for $\delta=2$, $23$ and $29$ for $\delta=3$, $10$).
+
+\paragraph{The training trajectory.} Figure~\ref{fig:trace}. At $\sigma=0.5$ the twins' error falls from about $23\%$ at 10k to
+$1.1$--$1.8\%$ at 20k and stays below $2.6\%$ until 30k, then rises to $4.6$--$10.4\%$ at 50k, most for $\delta=3$. EqR's error is not monotone
+early ($6.1\%$ at 10k, $9.5\%$ at 15k, $8.6\%$ at 20k) and then falls steadily to $2.6\%$ at 40k. At $\sigma=0.25$ all four arms follow nearly
+the same curve, from $33$--$58\%$ error at 10k to $3.3$--$4.7\%$ at 40--50k. Early in training $\sigma=0.5$ is far better than $0.25$ for every
+arm (EqR at 10k: $93.9$ against $67.4\%$); for EqR it stays the better noise to 50k, for the twins $0.25$ overtakes it at 35--40k. So the
+best test noise falls with training, and faster for the twins. Since seed 0 is the twins' best seed (Table~\ref{tab:seeds}), the fair
+comparison of the peaks is the 20k mean, $96.6$--$96.9\%$, against EqR's $97.4\%$ at 40k: the twin comes within a point of EqR's best
+depth scaling in half the training steps, and with 128 starts it exceeds it ($99.0\pm0.5$ top-4 at 20k against $98.0$ for EqR at 50k).
+
+\begin{table}[t]
+\centering\small
+\caption{Noise-free dynamics (\texttt{dynamics\_eqr.py}; 768 test puzzles iterated to $r=256$ without noise, spectral radius of one outer
+iteration at $r=256$ on 32 of them, median over puzzles, right and wrong together). Exact: share right at $r=256$. Fixed point: share with
+relative step $\|s_r-s_{r-1}\|/\|s_r\|<10^{-2}$ at $r=256$ (none reaches $10^{-3}$). Step: median relative step. $\cos(L,L')$: mean
+per-token cosine between the twin copies. For the twins with $\delta=3$ and $10$ at 20k seeds 1--2 only.}\label{tab:dyn}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+arm & steps & seeds & exact (\%) & fixed point (\%) & step (\%) & $\rho$ & $\cos(L,L')$\\
+\midrule
+\tabinput{tables/tab_dyn.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Why the twin loses its depth scaling.} Table~\ref{tab:dyn}. At 50k the plain twins answer correctly without noise
+($84$--$89\%$ at 256 iterations, as many as EqR) but most of their end states are not fixed points: for $\delta=2$ none of the 768 puzzles
+has a relative step below $10^{-2}$, the median step is $10.8\%$ per outer iteration and the spectral radius is $1.17$; for $\delta=10$ the
+step is $4.5\%$ and $2\%$ are at a fixed point; $\delta=3$ is the most converged of the three ($31\%$, step $1.1\%$). In relax ($\delta=1$)
+and the noise-trained arms the fixed-point share equals or nearly equals the exact share. Convergence alone does not order the twins,
+however: $\delta=3$ converges best and loses most at $\sigma=0.5$, so noise tolerance needs the escape analysis of \S\ref{sec:escape} on
+these checkpoints, which we have not yet run. A
+local map analysis of the $\delta=2$ twin (128 puzzles, two starts, noise off) shows how the copies behave. At 20k the copies of every right
+end state coincide (median $|L-L'|/(|L|+|L'|)=2\cdot10^{-7}$; none of 170 right runs split) and right answers contract strongly
+($\rho\approx0.26$ on 4 end states, wrong ones $0.61$), while $93\%$ of wrong end states have split copies. At 50k every end state is split, right ones included (median cosine $0.97$, separation
+$0.12$), and $\rho\approx1.0$ at right answers. The twin has crossed the symmetry-breaking instability of Prop.~\ref{prop:lag2}: its right
+answers now sit on the antisymmetric branch, which is only marginally stable, and Langevin noise at $\sigma=0.5$ moves them off. EqR's
+end states at 50k are near critical ($\rho=0.98$, median over right and wrong) with $22\%$ at a fixed point, and lose little to noise.
+
+\paragraph{Noise training.} The lower block of Table~\ref{tab:round4}. Training at $\sigma=0.25$ makes the answers fixed points (fixed-point share
+$80.5\%$ against $82.9\%$ exact for the twin, $84.2\%$ against $84.2\%$ for EqR) with stronger contraction ($\rho=0.76$, $0.30$), and the noise-trained twin keeps them at
+$\sigma=0.5$ ($96.3\%$ at depth 1024 against $95.4$ for the plain twin). But it costs three points at the training noise, slows learning
+(at 20k the noise-trained twin is eleven points behind the plain twin at depth 1024, $87.1$ against $98.2\%$, and the noise-trained EqR four
+behind EqR, $87.7$ against $91.4\%$; seed 0), and ends below plain EqR ($96.3$ against $97.1$ at
+depth 1024; $97.4$ against $98.0$ top-4). It also erases the difference between the architectures: the noise-trained twin and EqR are within
+one point at every test-time setting. Noise in training thus buys stable answers at the price of the fast early learning that made the twin worth having.
 
 %=====================================================================================================
 \section{Dynamics of the trained maps}\label{sec:maps}
@@ -838,7 +963,58 @@ The cycle carries no information the readout uses: odd inner-loop lengths, which
 ones (Table~\ref{tab:lcycles}; $\pm2.5$ points at 128 puzzles). We read the period doubling as a by-product of strong negative feedback in the block
 combined with EqR's light damping, not as a computational mechanism. By Propositions~\ref{prop:twin} and \ref{prop:lag2} a twin coupling holds
 such a cycle as a fixed point with $L\ne L'$; the cosine between the copies is therefore a direct readout of whether the twin arms learn the
-same structure, and it is the first quantity to measure on the twin checkpoints.
+same structure. They do, late in training: at 20k the copies of right end states coincide, at 50k every end state of the $\delta=2$ twin
+is split, and the split right answers are what test noise removes (\S\ref{sec:round4}).
+
+%=====================================================================================================
+\section{A second task: Skyscrapers-7}\label{sec:sky}
+
+Every result above is on one dataset. As a second task of the same size we use Skyscrapers on a $7\times7$ grid, embedded in Sudoku's
+$9\times9$ board so that EqR's model, sequence length and recipe are unchanged (\nolinkurl{looped/eqr/skyscrapers.py}). The grid holds a
+Latin square of building heights $1..7$ (rows and columns are permutations, as in Sudoku without boxes); the 28 border cells hold visibility
+clues, the number of buildings seen from that side of the line (a building is seen if it is taller than all in front of it). A clue
+constrains the order of a whole line, not pairs of cells. Inputs use 9 tokens (padding, blank, heights); the loss and exact accuracy are
+over the 49 grid cells. Puzzles are unique and minimal: from a random solution with all 28 clues, givens are added until the solution is
+unique, and then clues and givens are deleted in random order while it stays unique. Uniqueness is checked by propagating every line to
+generalised arc consistency over the 5040 permutations and branching on the cell with fewest candidates; the median puzzle needs 4 branching
+nodes (90th percentile 14, maximum 970) and $18\%$ are solved by propagation alone. One test set of 10{,}000 puzzles is shared; training sets of
+1k, 10k and 100k puzzles are nested and augmented by the 8 symmetries of the square. Heights cannot be relabelled as Sudoku's digits can, so
+10k puzzles give 80k distinct training examples where Sudoku-Extreme-1k with its 1000 augmentations per puzzle gives about one million.
+
+\begin{table}[t]
+\centering\small
+\caption{Skyscrapers-7, seed 0, EqR's recipe, 20k steps (W\&B). Test: exact accuracy on the 10{,}000 test puzzles at 16 iterations and the
+training noise, evaluated during training; cell: per-cell accuracy at 20k. Train: training-batch exact accuracy and ACT steps averaged over
+steps 18--20k.}\label{tab:sky}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}llrrrrrrrr@{}}
+\toprule
+& & \multicolumn{4}{c}{test exact at step} & & test cell & \multicolumn{2}{c}{train, 18--20k}\\
+\cmidrule(lr){3-6}\cmidrule(lr){9-10}
+puzzles & arm & 8k & 10k & 14k & 20k & best & 20k & exact & ACT\\
+\midrule
+\tabinput{tables/tab_sky.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.55\textwidth]{figures/fig_sky.pdf}
+\caption{Skyscrapers-7: test exact accuracy at 16 iterations during training, by training-set size.}\label{fig:sky}
+\end{figure}
+
+\paragraph{Training-set size.} Table~\ref{tab:sky} and Figure~\ref{fig:sky}. With 1k puzzles EqR memorises the training set ($99.1\%$ on
+training batches, $0.1\%$ on the test set) and halts after about one step. With 10k it learns for 10k steps (test $40.7\%$) and then overfits:
+the test accuracy falls to $34.3\%$ while the training accuracy reaches $94.2\%$ at $1.6$ ACT steps, the memorisation signature of
+\S\ref{sec:acc}. With 100k puzzles (800k examples, close to Sudoku's) the gap is gone: $90.4\%$ test against $89.6\%$ train at 20k, five ACT
+steps, and the test accuracy is still rising. Skyscrapers-7 is therefore learnable by EqR at Sudoku's scale, but only with Sudoku's number of
+distinct training examples.
+
+\paragraph{Twin against EqR.} On 100k puzzles the twin ($\delta=3$) trails EqR by $5$--$7$ points throughout ($84.8$ against $90.4\%$ at
+20k), with a four-point gap between training and test accuracy that EqR does not have. On Sudoku the twin also trailed EqR at 16 iterations and
+the training noise (Table~\ref{tab:seeds}) and led under test-time scaling; whether this carries over is the open question. The test-time
+scaling of these two runs is running.
 
 %=====================================================================================================
 \section{Discussion}
@@ -856,23 +1032,27 @@ fit the 1000 training puzzles and stop improving on the test set (train$-$test g
 without self-reading, by the twin's two copies, removes the gap (one point at 50k) and brings the twin to within $1$--$1.5$ points of EqR at the
 training noise. This suggests that invertibility is not what costs the alternating couplings accuracy, and that the missing inner loop is.
 \item \emph{Noise-driven exploration that pays off with depth}, which depends on the checkpoint. At 20k the twin gains 27 points from test noise
-at depth 256 and beats EqR's released 50k checkpoint at depth 1024 and with 128 starts; the self-reading inner loop, which also has an implicit
-inner problem, gains nothing. At 50k noise $\sigma=0.5$ helps only EqR. What makes a map profit from noise is not yet measured; the
-twin's lag-two structure (Prop.~\ref{prop:lag2}) and the escape and spectral analysis of its checkpoints are where to look.
+at depth 256 and, over three seeds, leads EqR at 20k by five points at depth 1024 and beats EqR's released 50k checkpoint with 128 starts; the
+self-reading inner loop, which also has an implicit inner problem, gains nothing. The twin's gain does not depend on its damping, so it comes
+from the two alternating copies. It is largest early in training: as the twin trains on, its right answers split into the antisymmetric branch of
+Prop.~\ref{prop:lag2}, stop being fixed points, and lose their tolerance to $\sigma=0.5$, while EqR's improve until 40k. Training with noise
+restores fixed points but removes the early advantage.
 \end{enumerate}
 
-\paragraph{Limitations.} All runs use one seed; in particular the twin's $99.6\%$ at depth 64 with 128 starts has not been replicated. Test-time
+\paragraph{Limitations.} Three seeds exist only for EqR and the twins at 20k; everything else, including the training trajectory of
+Figure~\ref{fig:trace} and all of round four at 50k, is seed 0, which was the twins' best seed at 20k by $1.3$--$2$ points. Test-time
 numbers use 2048 puzzles ($\pm0.5$ points; $\pm0.2$ near $99\%$) and the dynamical analysis 256 puzzles ($\pm1$--$2$ points). Spectra use 16
 right and 16 wrong end states per arm, and Ritz values from 30 Arnoldi steps approximate only the leading spectrum. GPU traces ran with TF32
-matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The round-three checkpoints have
-test-time results but no dynamical analysis, and their depth-64, 128-start evaluation at 50k is still running. All test-time comparisons use
-EqR's $\sigma=0.5$, which is not the best noise for every checkpoint. Training-batch accuracy depends on halting, so the generalisation gaps
+matrix multiplies (round-off $\approx10^{-4}$); the inner-loop analysis was redone locally in float32. The round-three and round-four
+checkpoints have the noise-free dynamics of Table~\ref{tab:dyn} but not the full map analysis of \S\ref{sec:maps}; the twin's copy statistics
+come from a local run on 128 puzzles with 4 right and 4 wrong spectra. Most test-time comparisons use EqR's $\sigma=0.5$, which is not the best
+noise for every checkpoint (\S\ref{sec:round4}). Skyscrapers-7 has one seed per arm and no test-time scaling yet. Training-batch accuracy depends on halting, so the generalisation gaps
 are indicative.
 
-\paragraph{Next.} (i) Seeds 1 and 2 of the twin ($\delta=2$) and EqR at 20k, with depth 1024 and depth 64 $\times$ 128 starts. (ii) A test-noise
-sweep at 50k ($\sigma\in\{0.1,0.25,0.75\}$) for the twin, the inner loop, relax $\delta=2$ and EqR. (iii) The dynamical analysis of the twin
-checkpoints at 20k and 50k: whether the copies coincide, spectra at right and wrong end states, and escape under noise. (iv) Twins with larger
-$\delta$ or learned rates, and a schedule without consecutive $H$ updates for the alternating couplings.
+\paragraph{Next.} (i) A noise switch: train the twin ($\delta=10$, the simplest) and EqR at $\sigma=0.01$ to 20k and continue at $\sigma=0.25$,
+to keep the twin's fast early learning and make its answers stable. (ii) Seeds 1 and 2 of the training trajectory, to place the twin's peak
+without seed-0 bias. (iii) The escape analysis on the twin checkpoints, since convergence alone does not order their noise tolerance.
+(iv) Test-time scaling on Skyscrapers-7, the twin at 50k there, and further seeds.
 
 \appendix
 \section{Rates, scales and dimensionality}
@@ -893,9 +1073,10 @@ arm & steps & $\gamma$ & $\alpha$ & $\delta$ & vol.\ bound & RMS pred. & RMS mea
 
 \section{Reproduction}
 \begin{itemize}[leftmargin=*,itemsep=0pt]
-\item Training and evaluation: \nolinkurl{jobs/looped/sudoku_eqr.slurm}, \nolinkurl{jobs/looped/sudoku_scaling.slurm}; summary tables: \nolinkurl{looped/eqr/summarize_sudoku.py}.
+\item Training and evaluation: \nolinkurl{jobs/looped/sudoku_eqr.slurm} (which also runs the test-time scaling of \nolinkurl{jobs/looped/eqr_scaling.sh} after training), \nolinkurl{jobs/looped/sudoku_scaling.slurm}, \nolinkurl{jobs/looped/sudoku_dynamics.slurm}; summary tables: \nolinkurl{looped/eqr/summarize_sudoku.py}.
+\item Skyscrapers-7: \nolinkurl{looped/eqr/skyscrapers.py}, \nolinkurl{looped/eqr/build_skyscrapers_dataset.py}; \nolinkurl{sudoku_eqr.slurm} with \texttt{TASK=skyscrapers}.
 \item Dynamical analysis: \nolinkurl{looped/eqr/export_for_analysis.py}, \nolinkurl{looped/eqr/analyze_maps.py} (GPU job \nolinkurl{jobs/looped/sudoku_maps.slurm}), \nolinkurl{looped/eqr/summarize_maps.py}.
-\item This note: \nolinkurl{looped/eqr/paper/make_figures.py} and \nolinkurl{make_tables.py}, from the data in \nolinkurl{looped/eqr/paper/data/}.
+\item This note: \nolinkurl{looped/eqr/paper/make_figures.py} and \nolinkurl{make_tables.py}, from the data in \nolinkurl{looped/eqr/paper/data/}; the seed-resolved \nolinkurl{runs_*.csv} there are written by \nolinkurl{looped/eqr/paper/export_results.py} from the pulled run root.
 \end{itemize}
 
 \bibliographystyle{plainnat}
