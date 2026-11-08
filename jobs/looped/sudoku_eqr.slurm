@@ -71,9 +71,9 @@
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=10 jobs/looped/sudoku_eqr.slurm   # self-read diagnostic
 # Round three (arm 9 = relax3_leak2 was killed before it started; rerun it here):
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=9,11-14 jobs/looped/sudoku_eqr.slurm
-# Round four, straight to 50k (checkpoints every 5k, so the 20k one is there for sudoku_scaling.slurm
-# with CKPT_STEP=20000); arms 15-18, seed 0:
-#   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --time=16:00:00 --array=15-18 jobs/looped/sudoku_eqr.slurm
+# Round four, straight to 50k (checkpoints every 5k; test-time scaling of 20k and 50k now runs at the
+# end of the task, so 50k runs need ~20 h: ~10 h training, ~2 h evaluation, ~2 h scaling); arms 15-18, seed 0:
+#   sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000 --time=20:00:00 --array=15-18 jobs/looped/sudoku_eqr.slurm
 #
 # Second task, Skyscrapers-7 (TASK=skyscrapers; looped/eqr/skyscrapers.py): a 7x7 Latin square of heights
 # inside the 9x9 board, visibility clues on the border, 81 tokens as Sudoku; same arms, recipe and evaluation.
@@ -84,6 +84,14 @@
 # eqr_runs/skyscrapers10k_<JOB> and skyscrapers1k_<JOB>, run ids <arm>-s<seed>-sky10k-<JOB> etc.:
 #   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-10k-aug-8 --array=0 jobs/looped/sudoku_eqr.slurm
 #   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-1k-aug-8 --array=0 jobs/looped/sudoku_eqr.slurm
+# Pilot result (jobs 26000066/7, 20k steps): both overfit. 10k: test exact peaks at 0.41 (10k steps) and falls
+# to 0.34, train 0.93 at 1.5 ACT steps; 1k: train 0.99, test 0.00. Heights cannot be relabelled as Sudoku's
+# digits can, so 10k x 8 symmetries is 80k distinct examples against Sudoku's ~1M, seen ~190 times each in
+# 20k steps instead of ~15. A 100k set (800k examples) matches Sudoku; the build is nested and keeps the same
+# test set and the 1k/10k sets as prefixes (~0.17 s per puzzle per core, ~20 min on 16 cores):
+#   srun --account=share-ie-imf --partition=CPUQ --cpus-per-task=16 --mem=16G --time=01:00:00 \
+#     python looped/eqr/build_skyscrapers_dataset.py --out-root $WORK/EqR/data --n-train 1000,10000,100000 --n-test 10000 --workers 16
+#   sbatch --export=ALL,TASK=skyscrapers,SKY_DATA=skyscrapers7-100k-aug-8 --array=0,17 jobs/looped/sudoku_eqr.slurm
 #
 # Resume / extend: if this run id has checkpoints but none at MAX_STEPS, training resumes from the
 # latest one (EqR restores weights, optimiser, EMA, carry, RNG and data position; the W&B run
@@ -108,6 +116,13 @@
 #                     predictions saved -> "cell, 64 it.", "residual, 64 it.", r = 256,
 #                     and the overthinking rate O / changed predictions dy (handoff §5)
 # Then: python looped/eqr/summarize_sudoku.py ${RUN_ROOT} --out sudoku_table.md
+#
+# Then test-time scaling (jobs/looped/eqr_scaling.sh, the same evaluation as sudoku_scaling.slurm) of the
+# final checkpoint and, if MAX_STEPS > 20000, of the 20k one: depth 16/64/256/1024 and 64 x 128 (EqR's
+# headline, top-4 by convergence) at test noise 0.5, depth 256/1024 and 64 x 16 at 0.25. ~1 h per
+# checkpoint. SCALE=0 skips it; SCALE_STEPS="20000 35000 50000" / SCALE_GRID="..." override. Every
+# evaluation is skipped if already done, so a task that hit its time limit can be resubmitted as is
+# (same JOB_TAG); training is skipped too once its final checkpoint exists.
 #
 # Then looped/eqr/dynamics_eqr.py on the final checkpoint -> <run dir>/dynamics.json: learned
 # rates at every checkpoint, the fixed-point / 2-cycle fraction out to 256 noise-free iterations,
@@ -270,7 +285,8 @@ if [[ "${TASK}" == skyscrapers ]]; then
     exit 1; }
 fi
 
-final_ckpt() { ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_${MAX_STEPS}_*.pth 2>/dev/null | head -1; }
+ckpt_at() { ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_${1}_*.pth 2>/dev/null | head -1; }
+final_ckpt() { ckpt_at "${MAX_STEPS}"; }
 # newest checkpoint of this run id by step number (the path itself has other underscores)
 latest_ckpt() {
   ls ${RUN_ROOT}/outputs/${RUN_ID}/*/*/checkpoints/step_*_*.pth 2>/dev/null \
@@ -296,11 +312,16 @@ fi
 CKPT=$(final_ckpt)
 [[ -z "${CKPT}" ]] && { log "FATAL: no step_${MAX_STEPS} checkpoint under ${RUN_ROOT}/outputs/${RUN_ID}"; exit 1; }
 log "checkpoint: ${CKPT}"
+RUN_DIR=$(dirname "$(dirname "${CKPT}")")       # evaluate.py writes eval_preds/ here
+EVAL_NL=$(python -c "print(float('${EVAL_NOISE}'))")
 
-# ── evaluate ─────────────────────────────────────────────────────────────────
+# ── evaluate (each step skipped if already done, so a resubmitted task continues where it stopped) ──
 run_eval() {   # tag depth [max_eval_steps]
   local tag=$1 depth=$2 nb=${3:-}
   local extra=()
+  if compgen -G "${RUN_DIR}/eval_preds/step_${MAX_STEPS}_${tag}_*_noise_scale-${EVAL_NL}_*/eval_metrics_step_*.json" > /dev/null; then
+    log "eval ${tag}: already done"; return
+  fi
   [[ -n "${nb}" ]] && extra=(max_eval_steps=${nb} "save_outputs=[preds,labels]")
   log "eval ${tag}: ${depth} iterations${nb:+, ${nb} batches}"
   python evaluate.py eval_yaml=config/eval/depth_breadth.yaml checkpoint="${CKPT}" \
@@ -311,9 +332,29 @@ run_eval full_D16 16
 for D in 16 64 256; do run_eval sub_D${D} ${D} ${SUB_BATCHES}; done
 
 # ── dynamics: learned rates per checkpoint, fixed points / 2-cycles to r=256, spectral radius ──────
-log "dynamics (looped/eqr/dynamics_eqr.py)"
-python "${REPO}/looped/eqr/dynamics_eqr.py" --eqr-dir "${EQR_DIR}" --ckpt "${CKPT}" 2>&1 \
-  | grep -E "^\[rates\]|^\[dynamics\]|Error|Traceback"
+if [[ -f "${RUN_DIR}/dynamics.json" ]]; then
+  log "dynamics: already done"
+else
+  log "dynamics (looped/eqr/dynamics_eqr.py)"
+  python "${REPO}/looped/eqr/dynamics_eqr.py" --eqr-dir "${EQR_DIR}" --ckpt "${CKPT}" 2>&1 \
+    | grep -E "^\[rates\]|^\[dynamics\]|Error|Traceback"
+fi
+
+# ── test-time scaling (jobs/looped/eqr_scaling.sh): depth x breadth under Langevin noise, as EqR is measured ──
+# On the final checkpoint and, for runs longer than 20k, on the 20k one too: the twin arms scale best at 20k
+# and lose it by 50k, so the comparison needs both. SCALE=0 skips this; SCALE_STEPS (checkpoint steps) and
+# SCALE_GRID (depth:breadth[:noise] list) override the defaults. ~1 h per checkpoint.
+if [[ "${SCALE:-1}" != 0 ]]; then
+  source "${REPO}/jobs/looped/eqr_scaling.sh"
+  for S in $(printf '%s\n' ${SCALE_STEPS:-20000 ${MAX_STEPS}} | sort -nu); do
+    (( S > MAX_STEPS )) && continue
+    C=$(ckpt_at "${S}")
+    [[ -z "${C}" ]] && { log "test-time scaling: no step_${S} checkpoint, skipped"; continue; }
+    log "test-time scaling of step ${S}: ${C}"
+    scale_eval "${C}" "${SCALE_GRID:-${SCALE_GRID_DEFAULT}}"
+  done
+  python "${REPO}/looped/eqr/summarize_sudoku.py" "${RUN_ROOT}" --scaling-only | grep -E "^\| (arm|${ARM}) \|"
+fi
 
 log "task ${ID} (${NAME}) done in $(( SECONDS / 60 )) min. Summarize with:"
 log "  python ${REPO}/looped/eqr/summarize_sudoku.py ${RUN_ROOT}"

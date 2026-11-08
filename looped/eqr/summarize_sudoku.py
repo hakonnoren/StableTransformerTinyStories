@@ -4,8 +4,9 @@
 
 RUN_ROOT is the job's OUTPUT_ROOT (contains outputs/<run id>/<date>/<time>/). For each run
 directory it reads the evaluate.py results written under eval_preds/. A run extended past its
-first budget (sudoku_eqr.slurm resume) has one directory per segment; rows are keyed by
-(arm, checkpoint step), so the 20k and 50k evaluations of one run are separate rows.
+first budget (sudoku_eqr.slurm resume) has one directory per segment, and a run trained straight
+to its final budget has its 20k and 50k evaluations in one directory; rows are keyed by
+(arm, checkpoint step) either way, so the 20k and 50k evaluations of one run are separate rows.
 
   full_D16       whole test set (423k puzzles), 16 iterations: the headline cell/exact accuracy
   sub_D{16,64,256}  the first SUB_BATCHES test batches at 16/64/256 iterations, with predictions
@@ -47,16 +48,18 @@ def _metrics(run_dir, tag, step=None):
     return json.load(open(path))["metrics"], os.path.dirname(path)
 
 
-def _run_step(run_dir):
-    """Checkpoint step this run directory was evaluated at (the highest, if several)."""
-    steps = [int(m.group(1)) for d in glob.glob(os.path.join(run_dir, "eval_preds", "step_*"))
-             if (m := re.match(r"step_(\d+)_", os.path.basename(d)))]
-    if steps:
-        return max(steps)
+def _dyn_step(run_dir):
     f = os.path.join(run_dir, "dynamics.json")
-    if os.path.exists(f):
-        return json.load(open(f)).get("step")
-    return None
+    return json.load(open(f)).get("step") if os.path.exists(f) else None
+
+
+def _run_steps(run_dir):
+    """Checkpoint steps this run directory was evaluated at (eval_preds/step_<s>_*, dynamics.json)."""
+    steps = {int(m.group(1)) for d in glob.glob(os.path.join(run_dir, "eval_preds", "step_*"))
+             if (m := re.match(r"step_(\d+)_", os.path.basename(d)))}
+    if (s := _dyn_step(run_dir)) is not None:
+        steps.add(s)
+    return sorted(steps) or [None]
 
 
 def _scaling(run_dir, step):
@@ -121,10 +124,11 @@ def _dynamics(run_dir, row):
         row["rates_by_step"] = [(x["step"], round(x["gamma"]["mean"], 4), round(x["alpha"]["mean"], 4)) for x in rates]
 
 
-def summarize_run(run_dir):
-    step = _run_step(run_dir)
+def summarize_run(run_dir, step, last_step):
     row = {"run": _run_name(run_dir), "step": step, "dir": run_dir}
-    _dynamics(run_dir, row)
+    ds = _dyn_step(run_dir)
+    if ds == step or (ds is None and step == last_step):   # dynamics.json belongs to one checkpoint
+        _dynamics(run_dir, row)
     row["scaling"] = _scaling(run_dir, step) if step is not None else []
     m, _ = _metrics(run_dir, "full_D16", step)
     if m:
@@ -210,7 +214,7 @@ def main():
         runs |= {os.path.dirname(os.path.dirname(c)) for c in
                  glob.glob(os.path.join(root, "outputs", "*", "*", "*", "eval_preds", "*"))}
         runs |= {os.path.dirname(c) for c in glob.glob(os.path.join(root, "outputs", "*", "*", "*", "dynamics.json"))}
-    rows = [summarize_run(r) for r in sorted(runs)]
+    rows = [summarize_run(r, s, steps[-1]) for r in sorted(runs) for steps in [_run_steps(r)] for s in steps]
     by_key = defaultdict(list)                      # (arm, checkpoint step) -> runs (seeds)
     for r in rows:
         by_key[(re.sub(r"_s\d+$", "", r["run"]), r["step"])].append(r)
