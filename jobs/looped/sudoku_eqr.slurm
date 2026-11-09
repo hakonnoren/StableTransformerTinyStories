@@ -54,6 +54,24 @@
 #                     EqR's own L <- 0.05 L + 0.95 B(L + H + x) with L read from its twin. delta 1 -> 2 doubled
 #                     the twin's depth exponent at 20k (-0.39 -> -0.78); delta also sets where the copies split
 #                     (merged state loses stability at mu(DB) = -1 - c, paper Prop. 8).
+#   -- round five (looped/dynlab/paper sec. 5: is the twin's decline drift along a mode training cannot see?) --
+#   Three arms BRANCH from twinL_leak2's step-20000 checkpoint (same seed), where the right-answer copies are still
+#   merged, and train 30000 more steps (branch step s = step 20000 + s of the original; MAX_STEPS is set to
+#   BRANCH_STEPS = 30000 for them). The weights are loaded as a weights-only file (EqR's legacy path), so each branch
+#   is a fresh run with its own W&B id and directory, fresh optimiser state, LR warmup, data order, and an EMA shadow
+#   that starts at the random init (0.999^5000 = 0.7% of it left at branch step 5000, 4.5e-5 at 10000: compare
+#   from branch step 10000 on). The unchanged branch is the control for all of that.
+#   twinL_leak2_br20k          control: twinL_leak2 itself, branched
+#   twinL_leak2_readL_br20k    H reads L alone instead of the twins' mean (twin_read=first): the copy difference
+#                              becomes visible to the read-out, hence the loss
+#   twinL_leak2_neumann_br20k  Neumann-series adjoint (k = 4 terms) on the differentiated recursion, only at
+#                              carried states that moved < 5% in it (near fixed points); DISABLE_COMPILE=1
+#   Prediction if the mechanism holds: control declines as twinL_leak2 did (copies split, test-time scaling lost by
+#   branch 30000); readL and neumann do not. Analyse all three with jobs/looped/twin_spectrum.slurm.
+#     sbatch --export=ALL,JOB_TAG=25939526 --time=24:00:00 --array=19-21 jobs/looped/sudoku_eqr.slurm
+#   (the neumann arm is ~2-3x slower; resubmit task 21 as is if it hits the limit: it resumes from its own
+#   checkpoints.) Matching baseline points at 30k and 50k for the comparison (training/evals are skipped as done):
+#     sbatch --export=ALL,JOB_TAG=25939526,MAX_STEPS=50000,SCALE_STEPS="30000 50000" --array=13 jobs/looped/sudoku_eqr.slurm
 #   NOTE (noise arms): EqR's in-training eval (the W&B all.* curves) runs at the TRAINING noise, so for the
 #   two noise-0.25 arms those curves are at sigma = 0.25 and not comparable with the other arms'. The
 #   evaluations below (evaluate.py, EVAL_NOISE = 0.01) and sudoku_scaling.slurm set the noise explicitly.
@@ -63,8 +81,9 @@
 #   relax3_learned  (relax rates learned from 3; the PDF's single-run row, and on the toy
 #                    tasks learned rates changed nothing -- HANDOFF.md §3, phase-4 update)
 #
-# 19 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default:
-#   sbatch jobs/looped/sudoku_eqr.slurm                                   # all 19 arms, seed 0
+# 22 arms x len(SEEDS) tasks; task ID = arm * len(SEEDS) + seed index. One seed (0) by default; the default
+# array (0-18) leaves out the round-five branch arms 19-21, which need twinL_leak2's step-20000 checkpoint:
+#   sbatch jobs/looped/sudoku_eqr.slurm                                   # arms 0-18, seed 0
 #   sbatch --export=ALL,SEEDS="0 1 2" --array=0-56 jobs/looped/sudoku_eqr.slurm   # 3 seeds
 # Round two, into round 1's run root (one summary table; W&B ids <arm>-s0-25939526):
 #   sbatch --export=ALL,JOB_TAG=25939526 --array=7-9 jobs/looped/sudoku_eqr.slurm
@@ -197,7 +216,8 @@ COUPLED="arch.name=coupled_eqr@CoupledEqRModel arch.short_name=Coupled"
 ARMS=(eqr kick_fixed kick_learned relax3 relax3_leak1 relax3_leak4 kick_pos
       relax3_leak1_injL kick_pos_injL relax3_leak2 relax3_leak1_injL_self
       relax3_leak3 twinL_leak1 twinL_leak2 innerL_self_leak1
-      twinL_leak2_noise25 eqr_noise25 twinL_leak3 twinL_leak10)
+      twinL_leak2_noise25 eqr_noise25 twinL_leak3 twinL_leak10
+      twinL_leak2_br20k twinL_leak2_readL_br20k twinL_leak2_neumann_br20k)
 TWIN="${COUPLED} ++arch.coupling=relax ++arch.rate=3.0 ++arch.inject_h=false ++arch.schedule=eqr ++arch.twin_l=true"
 ARM_ARGS=(
   ""
@@ -219,7 +239,14 @@ ARM_ARGS=(
   "++arch.noise_scale=0.25"
   "${TWIN} ++arch.leak=3.0"
   "${TWIN} ++arch.leak=10.0"
+  "${TWIN} ++arch.leak=2.0"
+  "${TWIN} ++arch.leak=2.0 ++arch.twin_read=first"
+  "${TWIN} ++arch.leak=2.0 ++arch.neumann_k=4 ++arch.neumann_tol=0.05"
 )
+# round five: arm -> the arm whose step-BRANCH_STEP checkpoint (same seed and job tag) it starts from
+declare -A BRANCH_FROM=([twinL_leak2_br20k]=twinL_leak2 [twinL_leak2_readL_br20k]=twinL_leak2
+                        [twinL_leak2_neumann_br20k]=twinL_leak2)
+BRANCH_STEP=${BRANCH_STEP:-20000}
 (( ${#ARMS[@]} == ${#ARM_ARGS[@]} )) || { echo "FATAL: ${#ARMS[@]} arm names but ${#ARM_ARGS[@]} argument sets"; exit 1; }
 
 ID=${SLURM_ARRAY_TASK_ID:?submit as an array: sbatch jobs/looped/sudoku_eqr.slurm}
@@ -229,6 +256,12 @@ if (( A >= ${#ARMS[@]} )); then echo "no arm for task ${ID}"; exit 1; fi
 ARM=${ARMS[$A]}
 NAME="${ARM}_s${SEED}"
 RUN_ID="${ARM//_/-}-s${SEED}-${TASK_TAG}${JOB}"
+BRANCH_SRC_ARM=${BRANCH_FROM[$ARM]:-}
+if [[ -n "${BRANCH_SRC_ARM}" ]]; then
+  MAX_STEPS=${BRANCH_STEPS:-30000}                 # steps after the branch point
+  SCALE_STEPS=${SCALE_STEPS:-"10000 30000"}        # = 30k and 50k of the original; EMA warm-up excludes 5000
+fi
+[[ "${ARM}" == *neumann* ]] && export DISABLE_COMPILE=1   # the Neumann adjoint runs autograd inside backward
 
 module load Anaconda3/2024.02-1
 eval "$(conda shell.bash hook)"
@@ -300,6 +333,19 @@ if [[ -z "$(final_ckpt)" ]]; then
   if [[ -n "${RESUME}" ]]; then
     log "resuming from ${RESUME} (to step ${MAX_STEPS})"
     RESUME_ARGS=("++load_checkpoint='${RESUME}'")    # quoted for Hydra's override grammar
+  elif [[ -n "${BRANCH_SRC_ARM}" ]]; then
+    SRC_ID="${BRANCH_SRC_ARM//_/-}-s${SEED}-${TASK_TAG}${JOB}"
+    SRC=$(ls ${RUN_ROOT}/outputs/${SRC_ID}/*/*/checkpoints/step_${BRANCH_STEP}_*.pth 2>/dev/null | head -1)
+    [[ -z "${SRC}" ]] && { log "FATAL: branch source ${SRC_ID} has no step_${BRANCH_STEP} checkpoint"; exit 1; }
+    WFILE=${RUN_ROOT}/branch/${RUN_ID}_from_step${BRANCH_STEP}.pt
+    mkdir -p "${RUN_ROOT}/branch"
+    if [[ ! -f "${WFILE}" ]]; then
+      # weights only (no "model" key): EqR loads them and starts a fresh run, with this arm's W&B id and directory
+      python -c "import sys, torch; ck = torch.load(sys.argv[1], map_location='cpu', weights_only=False); torch.save(ck['model'], sys.argv[2])" \
+        "${SRC}" "${WFILE}" || { log "FATAL: could not write ${WFILE}"; exit 1; }
+    fi
+    log "branching from ${SRC} (weights only: fresh optimiser, warmup, EMA from init; ${MAX_STEPS} more steps)"
+    RESUME_ARGS=("++load_checkpoint='${WFILE}'")
   fi
   # shellcheck disable=SC2086  (intentional word-splitting of ARM_ARGS)
   WANDB_RUN_ID=${RUN_ID} python pretrain.py --config-name train/eqr_${TASK} \

@@ -270,7 +270,10 @@ def test_eqr_schedule_self_read_formula():
 
 
 @pytest.mark.parametrize("kw", [dict(schedule="eqr", twin_l=True, leak=1.0, inject_h=False),
-                                dict(schedule="eqr", self_read=True, leak=1.0, inject_h=False)])
+                                dict(schedule="eqr", self_read=True, leak=1.0, inject_h=False),
+                                dict(schedule="eqr", twin_l=True, leak=2.0, inject_h=False, twin_read="first"),
+                                dict(schedule="eqr", twin_l=True, leak=2.0, inject_h=False, neumann_k=2,
+                                     neumann_tol=10.0)])
 def test_act_forward_and_gradients_new_schedules(kw):
     """Full ACT steps through EqR's loss head (carry, random reset, z_H/z_L metrics) for the round-three arms."""
     from models.losses import ACTLossHead
@@ -317,5 +320,93 @@ def test_config_validation():
                dict(coupling="kick", rate=0.04, rate_constraint="positive", rate_min=0.05),
                dict(rate_constraint="bounded", rate=3.0, rate_min=0.1, rate_max=2.0),
                dict(schedule="nope"), dict(twin_l=True), dict(schedule="eqr", half_steps=4)):
+        with pytest.raises(Exception):
+            _coupled(**kw)
+
+
+TWIN = dict(coupling="relax", rate=3.0, leak=2.0, inject_h=False, schedule="eqr", twin_l=True)
+
+
+def test_twin_read_first_makes_h_read_one_copy():
+    """twin_read='first': H <- bH + (1-b)(c L + B(L)) instead of the mean m; the twins' update is unchanged."""
+    torch.manual_seed(0)
+    mean = CoupledEqRModel(dict(_cfg(**TWIN), L_cycles=2))
+    torch.manual_seed(0)
+    first = CoupledEqRModel(dict(_cfg(twin_read="first", **TWIN), L_cycles=2))
+    torch.manual_seed(4)
+    H, L, M = (torch.randn(4, 9, 16, dtype=torch.float64) for _ in range(3))
+    b = _batch()
+    seq = {"cos_sin": None}
+    inner = first.inner
+    with torch.no_grad():
+        x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+        B = lambda u: inner.L_level(u, **seq)
+        g, a, c = inner.rates.gamma().double(), inner.rates.alpha().double(), inner.rates.c().double()
+        l = _relax(L, M, B(M + H + x), g, c)
+        mm = _relax(M, l, B(l + H + x), g, c)
+        h = _relax(H, l, B(l), a, c)                                                 # reads L only
+        H1, Z1 = inner.latent_recursion(H, torch.cat([L, M], dim=1), x, seq)
+        H2, _ = mean.inner.latent_recursion(H, torch.cat([L, M], dim=1), x, seq)
+        _, Z2 = mean.inner.latent_recursion(H, torch.cat([L, M], dim=1), x, seq)
+    assert (H1 - h).abs().max() < 1e-12 and (Z1 - torch.cat([l, mm], dim=1)).abs().max() < 1e-12
+    assert torch.equal(Z1, Z2) and (H1 - H2).abs().max() > 1e-6                     # only H's input differs
+
+
+def _grads(model):
+    return torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+
+
+def _deep_grad(model, H, Z, r):
+    inner = model.inner
+    model.zero_grad(set_to_none=True)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    h, _ = inner.deep_recursion(H, Z, x, {"cos_sin": None})
+    (h * r).sum().backward()
+    return _grads(model)
+
+
+def test_neumann_adjoint_hook_equals_explicit_series():
+    """neumann_k = 3 at converged states (tol huge): the parameter gradient is that of cotangent
+    v = g + J^T g + (J^T)^2 g + (J^T)^3 g on the differentiated recursion, J = d psi / d s; with no state
+    converged (tol tiny) it is EqR's truncated gradient."""
+    torch.manual_seed(0)
+    ref = CoupledEqRModel(dict(_cfg(**TWIN), L_cycles=2))
+    torch.manual_seed(0)
+    nm = CoupledEqRModel(dict(_cfg(neumann_k=3, neumann_tol=1e9, **TWIN), L_cycles=2))
+    torch.manual_seed(0)
+    off = CoupledEqRModel(dict(_cfg(neumann_k=3, neumann_tol=1e-30, **TWIN), L_cycles=2))
+    torch.manual_seed(7)
+    H, Z, r = torch.randn(4, 9, 16, dtype=torch.float64), torch.randn(4, 18, 16, dtype=torch.float64), \
+        torch.randn(4, 9, 16, dtype=torch.float64)
+    g_hook = _deep_grad(nm, H, Z, r)
+    g_off = _deep_grad(off, H, Z, r)
+    g_trunc = _deep_grad(ref, H, Z, r)
+    assert torch.allclose(g_off, g_trunc, atol=1e-12)
+    inner = ref.inner
+    ref.zero_grad(set_to_none=True)
+    b = _batch()
+    x = inner._input_embeddings(b["inputs"], b["puzzle_identifiers"])
+    seq = {"cos_sin": None}
+    with torch.no_grad():
+        h0, z0 = H, Z
+        for _ in range(ref.config.H_cycles - 1):
+            h0, z0 = inner.latent_recursion(h0, z0, x, seq)
+    s_in = torch.cat([h0, z0], dim=1).requires_grad_(True)
+    hh, zz = inner.latent_recursion(s_in[:, :9], s_in[:, 9:], x, seq)
+    s_out = torch.cat([hh, zz], dim=1)
+    (g,) = torch.autograd.grad((s_out[:, :9] * r).sum(), s_out, retain_graph=True)
+    v, w = g, g
+    for _ in range(3):
+        (w,) = torch.autograd.grad(s_out, s_in, grad_outputs=w, retain_graph=True)
+        v = v + w
+    torch.autograd.backward(s_out, v)
+    g_explicit = _grads(ref)
+    assert torch.allclose(g_hook, g_explicit, atol=1e-10)
+    assert (g_hook - g_trunc).norm() > 1e-6 * g_trunc.norm()
+
+
+def test_new_options_validated():
+    for kw in (dict(twin_read="first"), dict(TWIN, twin_read="nope"), dict(neumann_k=-1), dict(neumann_tol=0.0)):
         with pytest.raises(Exception):
             _coupled(**kw)

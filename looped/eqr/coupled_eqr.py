@@ -57,6 +57,23 @@ z_L, stacked along the sequence axis (z_L is [batch, 2 seq, hidden]), so EqR's c
 reset, evaluator and z_H/z_L metrics (which compare the first seq positions, i.e. H with L)
 need no changes.
 
+`twin_read="first"` (twin_l only) lets H read L alone instead of the mean m. With the mean, the
+copy difference L - L' does not reach H, hence not the loss, at first order, and EqR's truncated
+gradient never differentiates its evolution either; together with its neutrality at the flip
+(dB eigenvalue -1 - c) this makes the copy mode invisible to training (looped/dynlab/paper,
+Prop. 7). Reading one copy makes it visible.
+
+`neumann_k=k > 0` changes only the gradient. Per outer iteration EqR differentiates the last of
+H_cycles recursions psi from a detached state s (the truncated gradient: cotangent g on psi(s)).
+For carried states whose recursion moved them by less than `neumann_tol` (relative), the
+cotangent becomes v = g + J^T g + ... + (J^T)^k g, J = d psi / d s at s: the Neumann series of the
+implicit fixed-point gradient (I - J^T)^-1 g, which the truncated gradient weights by 1 - lambda
+per mode of J (looped/dynlab/paper, Prop. 5). Only near fixed points: at mid-search states the
+series diverges and training fails (dynlab E8). The forward pass is unchanged. The series is
+computed by an autograd function that, like reentrant checkpointing, recomputes the recursion
+(noise-free; EqR's noise is additive, so J is unchanged) inside the backward pass and runs the
+k vector-Jacobian products on that graph, so train with DISABLE_COMPILE=1.
+
 Schedule (the one free choice of the port). EqR's latent recursion updates
 z_L L_cycles times and then z_H once: L_cycles + 1 evaluations of B. Under a
 coupling the force on a stream does not depend on that stream, so repeated
@@ -122,6 +139,9 @@ class CoupledEqRConfig(EqRConfig):
     self_read: bool = False            # diagnostic: forces also read their own stream (NOT invertible)
     schedule: str = "alternate"        # 'alternate' (H,L,...,H) | 'eqr' (L x L_cycles, then H)
     twin_l: bool = False               # L doubled into L, L' that read each other (needs schedule='eqr')
+    twin_read: str = "mean"            # twin_l: H reads the twins' mean ('mean') or L alone ('first')
+    neumann_k: int = 0                 # > 0: Neumann-series adjoint of k terms at converged carried states
+    neumann_tol: float = 0.05          # relative change of the differentiated recursion below which it applies
     readout_norm: bool = True
     state_dtype: str = "float32"
     decay_rates: bool = False
@@ -149,6 +169,12 @@ class CoupledEqRConfig(EqRConfig):
             raise ValueError("half_steps applies to schedule='alternate'; 'eqr' runs L_cycles L updates + 1 H")
         if self.twin_l and self.schedule != "eqr":
             raise ValueError("twin_l needs schedule='eqr' (the twins' inner loop)")
+        if self.twin_read not in ("mean", "first"):
+            raise ValueError(f"twin_read={self.twin_read!r}; choices ('mean', 'first')")
+        if self.twin_read != "mean" and not self.twin_l:
+            raise ValueError("twin_read applies to twin_l=True")
+        if self.neumann_k < 0 or self.neumann_tol <= 0:
+            raise ValueError("neumann_k must be >= 0 and neumann_tol > 0")
         return self
 
 
@@ -162,6 +188,31 @@ def schedule_of(cfg: Any) -> Tuple[str, ...]:
         return tuple("M" if twin and i % 2 else "L" for i in range(n_l)) + ("H",)
     n = getattr(cfg, "half_steps", None) or (int(cfg.L_cycles) + 1)
     return tuple("H" if (n - 1 - i) % 2 == 0 else "L" for i in range(n))
+
+
+class _NeumannCotangent(torch.autograd.Function):
+    """Identity in the forward pass. In the backward pass the cotangent g of the recursion's output becomes
+    v = g + sum_{i=1..k} (J^T)^i (mask g), J = d psi / d s at the saved input s; psi is recomputed on a fresh
+    graph (the reentrant-checkpointing pattern; autograd inside a tensor hook is not supported)."""
+
+    @staticmethod
+    def forward(ctx, s_out, s_in, mask, psi, k):
+        ctx.save_for_backward(s_in, mask)
+        ctx.psi, ctx.k = psi, k
+        return s_out.view_as(s_out)
+
+    @staticmethod
+    def backward(ctx, g):
+        s_in, mask = ctx.saved_tensors
+        with torch.enable_grad():
+            s = s_in.detach().requires_grad_(True)
+            out = ctx.psi(s)
+            v, w = g, g * mask
+            for _ in range(ctx.k):
+                (w,) = torch.autograd.grad(out, s, grad_outputs=w, retain_graph=True)
+                w = w * mask                 # samples do not interact (B mixes tokens within a puzzle)
+                v = v + w
+        return v, None, None, None, None
 
 
 class CouplingRates(nn.Module):
@@ -245,6 +296,9 @@ class CoupledInnerNetwork(InnerNetwork):
         self.inject_h = bool(config.inject_h)
         self.self_read = bool(config.self_read)
         self.twin_l = bool(config.twin_l)
+        self.twin_read = str(config.twin_read)
+        self.neumann_k, self.neumann_tol = int(config.neumann_k), float(config.neumann_tol)
+        self._neumann_seen, self._neumann_conv = 0, 0.0
         self.noise_scale = float(config.noise_scale)   # evaluate.py's runtime override sets this attribute
         self.state_dtype = getattr(torch, config.state_dtype)
         self.schedule: Tuple[str, ...] = schedule_of(config)
@@ -336,7 +390,7 @@ class CoupledInnerNetwork(InnerNetwork):
                 elif stream == "M":
                     M = self.half_step_twin(M, L, z_H, x, seq)
                 else:
-                    z_H = self.half_step_H(z_H, 0.5 * (L + M), x, seq)
+                    z_H = self.half_step_H(z_H, 0.5 * (L + M) if self.twin_read == "mean" else L, x, seq)
             return z_H, torch.cat([L, M], dim=1)
         for stream in self.schedule:
             if stream == "L":
@@ -344,6 +398,44 @@ class CoupledInnerNetwork(InnerNetwork):
             else:
                 z_H = self.half_step_H(z_H, z_L, x, seq)
         return z_H, z_L
+
+    def deep_recursion(self, z_H, z_L, x, seq):
+        """EqR's deep recursion; with neumann_k > 0 (training only) the differentiated recursion's cotangent
+        is replaced by its k-term Neumann series at converged carried states (see the module docstring)."""
+        if self.neumann_k <= 0 or not torch.is_grad_enabled():
+            return super().deep_recursion(z_H, z_L, x, seq)
+        with torch.no_grad():
+            for _ in range(self.config.H_cycles - 1):
+                z_H, z_L = self.latent_recursion(z_H, z_L, x, seq)
+        n_h = z_H.shape[1]
+        s_in = torch.cat([z_H, z_L], dim=1).detach().requires_grad_(True)
+        h, l = self.latent_recursion(s_in[:, :n_h], s_in[:, n_h:], x, seq)
+        s_out = torch.cat([h, l], dim=1)
+        with torch.no_grad():
+            moved = (s_out - s_in).flatten(1).norm(dim=1) / s_in.flatten(1).norm(dim=1).clamp_min(1e-30)
+            conv = moved < self.neumann_tol
+        self._neumann_log(conv)
+        if bool(conv.any()):
+            mask = conv.view(-1, *([1] * (s_out.dim() - 1))).to(s_out.dtype)
+            xd = x.detach()
+
+            def psi(s: torch.Tensor) -> torch.Tensor:          # the differentiated recursion, noise-free
+                noise, self.noise_scale = self.noise_scale, 0.0
+                try:
+                    return torch.cat(self.latent_recursion(s[:, :n_h], s[:, n_h:], xd, seq), dim=1)
+                finally:
+                    self.noise_scale = noise
+
+            s_out = _NeumannCotangent.apply(s_out, s_in.detach(), mask, psi, self.neumann_k)
+        return s_out[:, :n_h], s_out[:, n_h:]
+
+    def _neumann_log(self, conv: torch.Tensor) -> None:
+        self._neumann_seen += 1
+        self._neumann_conv += float(conv.float().mean())
+        if self._neumann_seen % 500 == 0:
+            print(f"[coupled_eqr] neumann_k={self.neumann_k}: {self._neumann_conv / 500:.3f} of carried states "
+                  f"within tol {self.neumann_tol:g} (mean of the last 500 steps)", flush=True)
+            self._neumann_conv = 0.0
 
     def log_volume_per_recursion(self, n_tokens: int) -> torch.Tensor:
         """log|det| of one latent recursion on n_tokens positions (state-independent)."""
@@ -387,7 +479,8 @@ class CoupledEqRModel(EqRModel):
         self.inner = CoupledInnerNetwork(self.config)
         depth = self.inner.depth_per_outer_step()
         print(f"[coupled_eqr] coupling={self.config.coupling} inject_h={self.config.inject_h} "
-              f"self_read={self.config.self_read} twin_l={self.config.twin_l} "
+              f"self_read={self.config.self_read} twin_l={self.config.twin_l} twin_read={self.config.twin_read} "
+              f"neumann_k={self.config.neumann_k} "
               f"schedule={''.join(self.inner.schedule)} "
               f"visited={depth['visited_half_steps']} differentiated={depth['differentiated_half_steps']} "
               f"half-steps per outer iteration; learned rate params={len(self.inner.rate_parameters())}")

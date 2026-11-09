@@ -78,10 +78,11 @@ def _schedule(arch):
     return list(schedule_of(SimpleNamespace(**arch))) * int(arch["H_cycles"])
 
 
-def linear_radius(g, a, c, kick, schedule, twin=False):
+def linear_radius(g, a, c, kick, schedule, twin=False, twin_read="mean"):
     """Spectral radius of one outer iteration with the forces set to zero, max over channels.
     State (L, H) per channel, plus the twin L' when twin; relax half-steps: L <- aL + (1-a)c*H
-    (twin: c*L'), L' <- aL' + (1-a)c*L, H <- bH + (1-b)c*L (twin: c*(L + L')/2); kick: diagonal."""
+    (twin: c*L'), L' <- aL' + (1-a)c*L, H <- bH + (1-b)c*L (twin: c*(L + L')/2, or c*L for twin_read='first');
+    kick: diagonal."""
     g, a = torch.as_tensor(g, dtype=torch.float64).flatten(), torch.as_tensor(a, dtype=torch.float64).flatten()
     d = max(g.numel(), a.numel())
     g, a = g.expand(d), a.expand(d)
@@ -98,7 +99,10 @@ def linear_radius(g, a, c, kick, schedule, twin=False):
         if twin:
             ML[:, 0, 2] = (1 - kl) * c
             MM[:, 2, 0] = (1 - kl) * c
-            MH[:, 1, 0] = MH[:, 1, 2] = 0.5 * (1 - kh) * c
+            if twin_read == "first":
+                MH[:, 1, 0] = (1 - kh) * c
+            else:
+                MH[:, 1, 0] = MH[:, 1, 2] = 0.5 * (1 - kh) * c
         else:
             ML[:, 0, 1] = (1 - kl) * c
             MH[:, 1, 0] = (1 - kh) * c
@@ -131,7 +135,7 @@ def rates_of_checkpoint(path):
             "delta": None if c is None else stat(-torch.log(c)),
             "keep_L": float(torch.exp(-g).mean()), "keep_H": float(torch.exp(-a).mean()),
             "linear_radius": linear_radius(g, a, c, arch.get("coupling") == "kick", _schedule(arch),
-                                           twin=bool(arch.get("twin_l")))}
+                                           twin=bool(arch.get("twin_l")), twin_read=arch.get("twin_read") or "mean")}
 
 
 # ---------------------------------------------------------------------------------------- dynamics
