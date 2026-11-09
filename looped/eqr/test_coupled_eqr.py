@@ -406,6 +406,27 @@ def test_neumann_adjoint_hook_equals_explicit_series():
     assert (g_hook - g_trunc).norm() > 1e-6 * g_trunc.norm()
 
 
+def test_neumann_replays_the_training_noise():
+    """With noise on and no state converged, the recomputing path gives exactly the truncated gradient: the
+    backward pass replays the forward's RNG state, so the recomputed recursion sees the same noise."""
+    kw = dict(TWIN, noise_scale=0.05)
+    torch.manual_seed(0)
+    ref = CoupledEqRModel(dict(_cfg(**kw), L_cycles=2))
+    torch.manual_seed(0)
+    off = CoupledEqRModel(dict(_cfg(neumann_k=3, neumann_tol=1e-30, **kw), L_cycles=2))
+    torch.manual_seed(7)
+    H, Z, r = torch.randn(4, 9, 16, dtype=torch.float64), torch.randn(4, 18, 16, dtype=torch.float64), \
+        torch.randn(4, 9, 16, dtype=torch.float64)
+    torch.manual_seed(11)
+    g_ref = _deep_grad(ref, H, Z, r)
+    after_ref = torch.rand(1)
+    torch.manual_seed(11)
+    g_off = _deep_grad(off, H, Z, r)
+    after_off = torch.rand(1)
+    assert torch.allclose(g_ref, g_off, atol=1e-12)
+    assert torch.equal(after_ref, after_off)                   # the replay does not disturb later randomness
+
+
 def test_new_options_validated():
     for kw in (dict(twin_read="first"), dict(TWIN, twin_read="nope"), dict(neumann_k=-1), dict(neumann_tol=0.0)):
         with pytest.raises(Exception):

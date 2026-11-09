@@ -69,10 +69,11 @@ For carried states whose recursion moved them by less than `neumann_tol` (relati
 cotangent becomes v = g + J^T g + ... + (J^T)^k g, J = d psi / d s at s: the Neumann series of the
 implicit fixed-point gradient (I - J^T)^-1 g, which the truncated gradient weights by 1 - lambda
 per mode of J (looped/dynlab/paper, Prop. 5). Only near fixed points: at mid-search states the
-series diverges and training fails (dynlab E8). The forward pass is unchanged. The series is
-computed by an autograd function that, like reentrant checkpointing, recomputes the recursion
-(noise-free; EqR's noise is additive, so J is unchanged) inside the backward pass and runs the
-k vector-Jacobian products on that graph, so train with DISABLE_COMPILE=1.
+series diverges and training fails (dynlab E8). The forward values are unchanged. Like reentrant
+checkpointing, the differentiated recursion then runs without a graph and is recomputed once in the
+backward pass, with the forward's RNG state replayed (identical noise), so one graph serves both the
+k vector-Jacobian products and the parameter gradient: memory as in normal training, compute about
+1 extra recursion plus k backward passes per step. Train with DISABLE_COMPILE=1.
 
 Schedule (the one free choice of the port). EqR's latent recursion updates
 z_L L_cycles times and then z_H once: L_cycles + 1 evaluations of B. Under a
@@ -190,29 +191,50 @@ def schedule_of(cfg: Any) -> Tuple[str, ...]:
     return tuple("H" if (n - 1 - i) % 2 == 0 else "L" for i in range(n))
 
 
-class _NeumannCotangent(torch.autograd.Function):
-    """Identity in the forward pass. In the backward pass the cotangent g of the recursion's output becomes
-    v = g + sum_{i=1..k} (J^T)^i (mask g), J = d psi / d s at the saved input s; psi is recomputed on a fresh
-    graph (the reentrant-checkpointing pattern; autograd inside a tensor hook is not supported)."""
+class _NeumannRecursion(torch.autograd.Function):
+    """The differentiated recursion psi with a Neumann-series cotangent (reentrant-checkpoint pattern).
+
+    forward: psi(s) without a graph; marks the samples whose state moved less than neumann_tol (relative).
+    backward: recomputes psi(s) with the forward's RNG state (same noise), turns the cotangent g into
+    v = g + sum_{i=1..k} (J^T)^i (mask g), J = d psi / d s, and back-propagates v through the recomputed graph into
+    the parameters (accumulated in .grad) and the input injection x (returned). The carried state gets no gradient,
+    as in EqR."""
 
     @staticmethod
-    def forward(ctx, s_out, s_in, mask, psi, k):
-        ctx.save_for_backward(s_in, mask)
-        ctx.psi, ctx.k = psi, k
-        return s_out.view_as(s_out)
+    def forward(ctx, s_in, x, inner, n_h, seq):
+        ctx.inner, ctx.n_h, ctx.seq = inner, n_h, seq
+        ctx.devices = [s_in.device] if s_in.is_cuda else []
+        ctx.cpu_rng = torch.get_rng_state()
+        ctx.cuda_rng = [torch.cuda.get_rng_state(d) for d in ctx.devices]
+        with torch.no_grad():
+            out = torch.cat(inner.latent_recursion(s_in[:, :n_h], s_in[:, n_h:], x, seq), dim=1)
+            moved = (out - s_in).flatten(1).norm(dim=1) / s_in.flatten(1).norm(dim=1).clamp_min(1e-30)
+            conv = moved < inner.neumann_tol
+        inner._neumann_log(conv)
+        ctx.save_for_backward(s_in, x, conv.view(-1, *([1] * (out.dim() - 1))).to(out.dtype))
+        return out
 
     @staticmethod
     def backward(ctx, g):
-        s_in, mask = ctx.saved_tensors
-        with torch.enable_grad():
-            s = s_in.detach().requires_grad_(True)
-            out = ctx.psi(s)
-            v, w = g, g * mask
-            for _ in range(ctx.k):
+        s_in, x, mask = ctx.saved_tensors
+        inner = ctx.inner
+        with torch.random.fork_rng(devices=ctx.devices):
+            torch.set_rng_state(ctx.cpu_rng)
+            for d, st in zip(ctx.devices, ctx.cuda_rng):
+                torch.cuda.set_rng_state(st, d)
+            with torch.enable_grad():
+                s = s_in.detach().requires_grad_(True)
+                xr = x.detach().requires_grad_(True)
+                out = torch.cat(inner.latent_recursion(s[:, :ctx.n_h], s[:, ctx.n_h:], xr, ctx.seq), dim=1)
+        v = g
+        if bool(mask.any()):
+            w = g * mask
+            for _ in range(inner.neumann_k):
                 (w,) = torch.autograd.grad(out, s, grad_outputs=w, retain_graph=True)
                 w = w * mask                 # samples do not interact (B mixes tokens within a puzzle)
                 v = v + w
-        return v, None, None, None, None
+        torch.autograd.backward(out, v)      # parameters (.grad) and xr.grad
+        return None, xr.grad, None, None, None
 
 
 class CouplingRates(nn.Module):
@@ -407,26 +429,10 @@ class CoupledInnerNetwork(InnerNetwork):
         with torch.no_grad():
             for _ in range(self.config.H_cycles - 1):
                 z_H, z_L = self.latent_recursion(z_H, z_L, x, seq)
+        if not x.requires_grad:                          # nothing upstream to train through the function
+            return self.latent_recursion(z_H, z_L, x, seq)
         n_h = z_H.shape[1]
-        s_in = torch.cat([z_H, z_L], dim=1).detach().requires_grad_(True)
-        h, l = self.latent_recursion(s_in[:, :n_h], s_in[:, n_h:], x, seq)
-        s_out = torch.cat([h, l], dim=1)
-        with torch.no_grad():
-            moved = (s_out - s_in).flatten(1).norm(dim=1) / s_in.flatten(1).norm(dim=1).clamp_min(1e-30)
-            conv = moved < self.neumann_tol
-        self._neumann_log(conv)
-        if bool(conv.any()):
-            mask = conv.view(-1, *([1] * (s_out.dim() - 1))).to(s_out.dtype)
-            xd = x.detach()
-
-            def psi(s: torch.Tensor) -> torch.Tensor:          # the differentiated recursion, noise-free
-                noise, self.noise_scale = self.noise_scale, 0.0
-                try:
-                    return torch.cat(self.latent_recursion(s[:, :n_h], s[:, n_h:], xd, seq), dim=1)
-                finally:
-                    self.noise_scale = noise
-
-            s_out = _NeumannCotangent.apply(s_out, s_in.detach(), mask, psi, self.neumann_k)
+        s_out = _NeumannRecursion.apply(torch.cat([z_H, z_L], dim=1).detach(), x, self, n_h, seq)
         return s_out[:, :n_h], s_out[:, n_h:]
 
     def _neumann_log(self, conv: torch.Tensor) -> None:
